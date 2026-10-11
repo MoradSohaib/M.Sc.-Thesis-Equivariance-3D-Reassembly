@@ -1,7 +1,8 @@
 """
 ``--max_fragments``: only the break patterns of 2 to ``max_fragments`` pieces,
 for training, validation and ``--evaluate`` alike -- the benchmark's 2-20 is
-``--max_fragments 20``.
+``--max_fragments 20``. ``--min_fragments`` is the lower end, counted the same
+way, so ``--min_fragments 21 --max_fragments 0`` scores what 2-20 leaves out.
 
 Each property below fails without an error when broken: a limit applied after
 ``max_objects`` trains on fewer objects than asked for, one applied before the
@@ -12,6 +13,7 @@ still print plausible numbers.
 from __future__ import annotations
 
 import dataclasses
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -156,6 +158,23 @@ def test_max_objects_counts_objects_that_still_have_a_pattern(root):
     assert sorted(e.name for e in limited.catalog.objects) == ["b0", "c0"]
 
 
+def test_a_lower_limit_keeps_the_patterns_above_the_range(root):
+    """``limit_fragments(catalog, 21, None)`` is every pattern 2-20 drops,
+    here 5+ against 2-4: no pattern in both, and together every pattern of two
+    pieces or more."""
+    everything = BreakingBadScenes(_config(root), "train").catalog
+    above, report = limit_fragments(everything, HIGH + 1, None)
+    assert {e.name: [mode for _, mode in e.modes] for e in above.objects} == {
+        "b0": ["fractured_2"],                       # 6 pieces
+        "m0": ["fractured_0", "fractured_1"],        # 5 and 6
+    }
+    assert report.describe() == "3 of 7 break patterns (2 of 3 objects)"
+    within, _ = limit_fragments(everything, 2, HIGH)
+    pairs = lambda catalog: {pair for e in catalog.objects for pair in e.modes}  # noqa: E731
+    assert not pairs(within) & pairs(above)
+    assert pairs(within) | pairs(above) == {p for p in pairs(everything) if piece_count(*p) >= 2}
+
+
 def test_an_unreadable_label_file_is_kept_for_the_loader_to_report(root):
     catalog = BreakingBadScenes(_config(root), "train").catalog
     directory, mode = catalog.objects[0].modes[0]
@@ -180,6 +199,19 @@ def test_training_and_validation_only_see_patterns_in_range(root):
     assert sorted(sizes) == [2, 3, 3]
 
 
+@pytest.mark.parametrize("high", [HIGH, 5])     # 5 and 6 pieces: a cut between two patterns
+@pytest.mark.parametrize("split", ["train", "val"])
+def test_the_two_ranges_score_every_scene_exactly_once(root, split, high):
+    """``--max_fragments 20`` and ``--min_fragments 21 --max_fragments 0``,
+    scaled down: each scene of two pieces or more is in one of them."""
+    everything = _keys(BreakingBadScenes(_config(root), split))
+    within = BreakingBadScenes(_config(root, max_fragments=high), split)
+    above = BreakingBadScenes(_config(root, min_fragments=high + 1), split)
+    assert not _keys(within) & _keys(above)
+    assert _keys(within) | _keys(above) == {k for k in everything if _count(k, root) >= 2}
+    assert all(len(above.build(i).fragments) > high for i in range(len(above)))
+
+
 def test_a_scene_above_the_limit_is_skipped_when_built(root, monkeypatch):
     """The loaded count is checked too: were the label count ever to miss a
     pattern, the scene is skipped by name rather than trained on."""
@@ -189,6 +221,17 @@ def test_a_scene_above_the_limit_is_skipped_when_built(root, monkeypatch):
     skipped = [b for b in built if isinstance(b, Skipped)]
     assert {b.reason for b in skipped} >= {"6 fragments, above --max_fragments 4"}
     assert all(len(b.fragments) <= HIGH for b in built if not isinstance(b, Skipped))
+
+
+def test_a_scene_outside_the_range_is_still_found_by_name(root):
+    """``find_scene`` (``dump_prediction``, ``check_scene``) searches every
+    pattern, whatever range the run scores."""
+    keys = sorted(_keys(BreakingBadScenes(_config(root), "train")))
+    small = next(k for k in keys if _count(k, root) == 2)
+    large = next(k for k in keys if _count(k, root) == 6)
+    for key, limit in ((large, dict(max_fragments=HIGH)), (small, dict(min_fragments=HIGH + 1))):
+        dataset, index, split = training.find_scene(_config(root, **limit), key)
+        assert (dataset.key(index), split) == (key, "train")
 
 
 def test_the_banner_says_what_the_limit_removed(root):
@@ -203,6 +246,20 @@ def test_the_banner_says_what_the_limit_removed(root):
     lines = training._fragment_banner(config, BreakingBadScenes(config, "train"),
                                       BreakingBadScenes(config, "val"))
     assert "no upper limit" in "\n".join(lines)
+
+
+def test_the_banner_and_the_report_print_a_lower_limit(root):
+    config = _config(root, min_fragments=HIGH + 1)
+    val = BreakingBadScenes(config, "val")
+    text = "\n".join(training._fragment_banner(config, BreakingBadScenes(config, "train"), val))
+    assert "5+ per scene" in text
+    assert "train keeps 3 of 7 break patterns (2 of 3 objects)" in text
+    assert "val   keeps 2 of 3 break patterns (2 of 2 objects)" in text
+    assert training._fragment_line(config, val) == (
+        "  fragments: 5+ per scene, keeping 2 of 3 break patterns (2 of 2 objects)")
+    config = _config(root, min_fragments=3, max_fragments=HIGH)
+    assert training._fragment_line(config, BreakingBadScenes(config, "val")) == (
+        "  fragments: 3-4 per scene, keeping 1 of 3 break patterns (1 of 2 objects)")
 
 
 # --------------------------------------------------------------------------
@@ -224,6 +281,24 @@ def test_the_flag_parses_validates_and_round_trips():
     assert parse(flags).max_fragments == 20
 
 
+def test_the_lower_limit_parses_validates_and_round_trips():
+    from scripts.config_flags import config_flags
+    from scripts.train import build_parser, config_from_args
+
+    parse = lambda argv: config_from_args(build_parser().parse_args(argv))  # noqa: E731
+    above = parse(["--min_fragments", "21", "--max_fragments", "0"])
+    assert (above.min_fragments, above.max_fragments) == (21, None)
+    assert parse(["--min_fragments", "0"]).min_fragments is None     # 0 = no lower limit
+    assert parse([]).min_fragments is None
+    with pytest.raises(ValueError, match="min_fragments"):
+        Config(min_fragments=1)
+    with pytest.raises(ValueError, match="leaves no break pattern"):
+        Config(min_fragments=21, max_fragments=20)
+    flags = config_flags(Config(min_fragments=21))
+    assert flags[flags.index("--min_fragments") + 1] == "21"
+    assert parse(flags).min_fragments == 21
+
+
 def test_a_changed_limit_is_announced_on_resume_and_resets_the_best(capsys):
     assert "max_fragments" in training._DATA
     # A checkpoint from before the setting used every pattern.
@@ -235,6 +310,17 @@ def test_a_changed_limit_is_announced_on_resume_and_resets_the_best(capsys):
     old = {k: v for k, v in dataclasses.asdict(Config()).items() if k != "max_fragments"}
     training._check_resume_compatible(Config(max_fragments=20), old, announce=True)
     assert "max_fragments: None -> 20" in capsys.readouterr().out
+
+
+def test_a_changed_lower_limit_is_announced_on_resume_and_resets_the_best(capsys):
+    assert "min_fragments" in training._DATA
+    assert training._fragment_limit_changed({}, Config(min_fragments=21))
+    assert training._fragment_limit_changed({"min_fragments": 21}, Config())
+    assert not training._fragment_limit_changed({"min_fragments": 21}, Config(min_fragments=21))
+
+    old = {k: v for k, v in dataclasses.asdict(Config()).items() if k != "min_fragments"}
+    training._check_resume_compatible(Config(min_fragments=21), old, announce=True)
+    assert "min_fragments: None -> 21" in capsys.readouterr().out
 
 
 def test_evaluate_scores_any_checkpoint_on_the_range_asked_for(root, capsys):
@@ -260,3 +346,37 @@ def test_evaluate_scores_any_checkpoint_on_the_range_asked_for(root, capsys):
     out = capsys.readouterr().out
     assert "fragments: 2-4 per scene, keeping 1 of 3 break patterns" in out
     assert summary["fragments"] == 3 and summary["max_fragments"] == HIGH
+
+
+def test_evaluate_scores_the_patterns_above_a_range(root, capsys):
+    """An explicit --min_fragments wins over the checkpoint's as well: the
+    second half of a split set, from the same checkpoint."""
+    from reassembly.training import build_model, save_checkpoint
+
+    config = _config(root)
+    path = Path(config.out_dir) / "last.pt"
+    path.parent.mkdir(parents=True)
+    save_checkpoint(path, build_model(config), None, config, epoch=0, step=1,
+                    history=[], best=1.0)
+
+    above = dataclasses.replace(config, min_fragments=HIGH + 1)
+    capsys.readouterr()
+    summary = training.evaluate(above, checkpoint="last.pt", split="val", assemble=False,
+                                override=("min_fragments",))
+    out = capsys.readouterr().out
+    assert "fragments: 5+ per scene, keeping 2 of 3 break patterns (2 of 2 objects)" in out
+    assert summary["fragments"] == 6 + 6
+    assert (summary["min_fragments"], summary["max_fragments"]) == (HIGH + 1, None)
+
+
+def test_the_script_lets_an_explicit_range_override_the_checkpoint(monkeypatch):
+    import scripts.train as script
+
+    seen = {}
+    monkeypatch.setattr(script, "evaluate",
+                        lambda config, **kw: seen.update(config=config, **kw))
+    monkeypatch.setattr(sys, "argv", ["train.py", "--root_dir", "nowhere", "--evaluate",
+                                      "--min_fragments", "21", "--max_fragments", "0"])
+    script.main()
+    assert seen["override"] == ("max_fragments", "min_fragments")
+    assert (seen["config"].min_fragments, seen["config"].max_fragments) == (21, None)

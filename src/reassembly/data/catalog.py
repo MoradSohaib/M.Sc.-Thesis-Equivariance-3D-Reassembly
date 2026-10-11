@@ -422,7 +422,7 @@ class FragmentLimit:
     """What :func:`limit_fragments` kept of one split, for the banner."""
 
     minimum: int
-    maximum: int
+    maximum: Optional[int]     # None: no upper limit
     patterns: int              # break patterns before the limit
     patterns_kept: int
     objects: int
@@ -439,13 +439,14 @@ class FragmentLimit:
         return text
 
 
-def limit_fragments(catalog: Catalog, minimum: int, maximum: int,
+def limit_fragments(catalog: Catalog, minimum: int, maximum: Optional[int],
                     count: Optional[Callable[[Path, str], int]] = None,
                     workers: int = 16) -> Tuple[Catalog, FragmentLimit]:
     """
-    Only the break patterns of ``minimum`` to ``maximum`` pieces, and only the
-    objects left with at least one -- the benchmark's 2-20 is
-    ``limit_fragments(catalog, 2, 20)``.
+    Only the break patterns of ``minimum`` to ``maximum`` pieces (``None``: no
+    upper limit), and only the objects left with at least one -- the
+    benchmark's 2-20 is ``limit_fragments(catalog, 2, 20)``, and every pattern
+    above it ``limit_fragments(catalog, 21, None)``.
 
     Why on the catalogue rather than after a scene is loaded, where the
     single-fragment rule lives: a pattern rejected after loading costs a full
@@ -476,7 +477,8 @@ def limit_fragments(catalog: Catalog, minimum: int, maximum: int,
     kept = []
     for entry in catalog.objects:
         modes = tuple(pair for pair in entry.modes
-                      if counts[pair] is None or minimum <= counts[pair] <= maximum)
+                      if counts[pair] is None or (minimum <= counts[pair] and (
+                          maximum is None or counts[pair] <= maximum)))
         if modes:
             kept.append(dataclasses.replace(entry, modes=modes))
     report = FragmentLimit(

@@ -128,7 +128,7 @@ tests still pass and the network tests skip.
 git clone <this-repo> && cd <this-repo>
 python -m venv .venv && source .venv/bin/activate      # Windows: .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-python -m pytest                                        # 524 passed
+python -m pytest                                        # 535 passed
 ```
 
 Installing is optional — `pytest.ini` sets `pythonpath = src .` and each script
@@ -305,7 +305,7 @@ scripts/
 ├── tune_sharp_threshold.py        pick --sharp-threshold by F1
 └── visualize.py                   render or describe one scene
 
-tests/                             524 tests
+tests/                             535 tests
 ```
 
 Only `reassembly` is packaged; `scripts/` and `tests/` are entry points and
@@ -453,6 +453,17 @@ python -m scripts.train --root_dir data --evaluate --checkpoint path/to/best.pt 
   best-so-far, because validation is then a different set of scenes — start a
   fresh run instead. With `--evaluate`, an explicit `--max_fragments` wins over
   the checkpoint's value, so any model can be scored on 2–20 without retraining.
+* The patterns above the range: `--min_fragments 21 --max_fragments 0`. Both
+  ends are counted from the label file, so this run and the 2–20 one score
+  every pattern of two pieces or more exactly once — a pattern counted at 21
+  that loads fewer pieces (an empty label is dropped) stays in 21+. An explicit
+  `--min_fragments` also wins over the checkpoint's. The output files are named
+  by split, not by range: give each run its own `--checkpoint_dir`, and its own
+  `--predictions` folder.
+
+```bash
+python -m scripts.train --root_dir data --evaluate --checkpoint path/to/best.pt --split val --min_fragments 21 --max_fragments 0 --checkpoint_dir eval/21plus
+```
 
 ### One GPU, two, or more
 
@@ -778,8 +789,9 @@ on independently sampled points.
 
 `--evaluate --split all` scores every object of the `--data_subsets` given,
 whatever its split — for a checkpoint scored on subsets it was not trained on.
-An explicit `--data_subsets` (and `--max_fragments`) wins over the checkpoint's
-own; its labels, tokens and normalisation stay the checkpoint's.
+An explicit `--data_subsets` (and `--max_fragments`, `--min_fragments`) wins
+over the checkpoint's own; its labels, tokens and normalisation stay the
+checkpoint's.
 `--modes_per_scene 0` takes every break pattern:
 
 ```bash

@@ -11,7 +11,7 @@ implementing anything from it.
 
 | | |
 |---|---|
-| Pipeline | **built** — 524 tests, clean under `-W error` |
+| Pipeline | **built** — 535 tests, clean under `-W error` |
 | Dataset pass | 1,096,825 fragments across 1,442 objects |
 | Fracture surface | 10.6% of vertices, dataset-wide |
 | Model | **built and verified** — equivariance checked numerically in float64 |
@@ -29,6 +29,7 @@ implementing anything from it.
 | Hub mirror | optional `--hf_repo_id/--hf_local_dir/--hf_token`: files pushed every epoch, pulled into a fresh folder — see §14 |
 | Thesis v7 | matched rotations placed from the pair fits the chain agrees with, the anchor held, not one solve over every match; `--evaluate --jitter/--drop` without shared break vertices — see §17 |
 | Thesis v7, no head | the rotation head removed: trained on the embedding term alone, every rotation fitted from the matches, the four geometric terms scores only, `best.pt` on validation acc@5; `--split all`, `--predictions` — see §18 |
+| Above the benchmark range | `--min_fragments 21 --max_fragments 0` scores the patterns 2–20 leaves out; the two runs score every pattern once — see §19 |
 
 ---
 
@@ -1234,3 +1235,45 @@ Train the head-less model and its ablation (`--schedule intra intra intra intra
 intra`); probe both; evaluate both on Everyday val and on the whole
 volume-constrained Everyday, artifact and volume-constrained artifact subsets,
 with figures and every prediction.
+
+---
+
+## 19 · Thesis v7 — the patterns above 2–20, scored on their own (Oct 2026)
+
+**Why.** The results on the benchmark's 2–20 pieces and on the patterns above
+it are to be reported, and drawn, apart. `--max_fragments` (§13) has no lower
+end, so the second set could not be selected.
+
+**What changed.**
+
+- `Config.min_fragments` (`--min_fragments`, `0` = `None` = no lower limit, the
+  default). `limit_fragments` takes `maximum=None` for no upper end, and the
+  dataset applies the limit when either end is set: `--min_fragments 21
+  --max_fragments 0` keeps every pattern that `--max_fragments 20` drops.
+- Both ends are counted from the label file (`piece_count`), so the two runs
+  score each pattern of two pieces or more exactly once; a pattern counted at
+  21 that loads fewer pieces (an empty label is dropped) stays in 21+. For the
+  same reason the lower end has no build-time check, unlike the upper one: the
+  loaded count can be below the label count, and such a check would leave that
+  pattern out of both runs.
+- Validated: at least 2, and not above `max_fragments` — the message says that
+  `--max_fragments 0` is no upper limit. With `--evaluate` the checkpoint's
+  `max_fragments` applies unless the flag is given, so the 21+ run passes both.
+- In `_DATA`, and in `_DATA_BEFORE_IT_EXISTED` (a checkpoint without the key
+  reads as no lower limit); `_fragment_limit_changed` compares both ends. With
+  `--evaluate`, an explicit `--min_fragments` overrides the checkpoint's value
+  (`scripts/train.py`'s `override`). The banner and the report print the range
+  (`21+ per scene`), `<split>_metrics.json` records `min_fragments` beside
+  `max_fragments`, and `find_scene` still searches every pattern.
+- The output names do not carry the range (`<split>_metrics.json`,
+  `<split>_report.txt`, `<subsets>-<split>.zip`): each range is evaluated into
+  its own `--checkpoint_dir` and `--predictions` folder.
+
+**Verified.** 535 tests (524 before; `tests/test_fragment_limit.py`, 26).
+Mutation checks — the lower end ignored by the dataset, a lower end alone
+applying no limit, either end made exclusive, the best-so-far reset blind to
+the lower end, a legacy checkpoint's missing key not read as "no lower limit",
+the key left out of `_DATA`, the evaluate override ignoring `--min_fragments`,
+`--min_fragments 0` not meaning "no lower limit", `find_scene` held to the
+range, the report line or the metrics field without it — each fails a test.
+110 version markers.

@@ -95,6 +95,16 @@ class Config:
     Applied to the catalogue when the run starts, for training, validation and
     ``--evaluate`` alike (:func:`reassembly.data.catalog.limit_fragments`).
     """
+    min_fragments: Optional[int] = None
+    """
+    Smallest break pattern the run uses, in pieces; ``None`` (``0`` on the
+    command line) is no lower limit beyond the two every scene needs. Counted
+    like ``max_fragments``, from the label file, so ``--max_fragments 20`` and
+    ``--min_fragments 21 --max_fragments 0`` split a set in two with every
+    pattern in exactly one: the benchmark's 2-20 and everything above it. A
+    pattern counted at 21 can load with fewer pieces -- the loader drops the
+    labels that come out empty -- and stays in the 21+ part.
+    """
     split_by: str = "object"
     """
     What is held out: whole shapes (``"object"``) or break patterns
@@ -410,6 +420,14 @@ class Config:
         if self.max_fragments is not None and self.max_fragments < MIN_FRAGMENTS:
             raise ValueError(f"max_fragments must be >= {MIN_FRAGMENTS}, or None (0 on "
                              f"the command line) for no limit")
+        if self.min_fragments is not None and self.min_fragments < MIN_FRAGMENTS:
+            raise ValueError(f"min_fragments must be >= {MIN_FRAGMENTS}, or None (0 on "
+                             f"the command line) for no lower limit")
+        if (self.min_fragments is not None and self.max_fragments is not None
+                and self.min_fragments > self.max_fragments):
+            raise ValueError(f"min_fragments {self.min_fragments} is above max_fragments "
+                             f"{self.max_fragments}, which leaves no break pattern "
+                             f"(--max_fragments 0 is no upper limit)")
         if self.accumulate < 1:
             raise ValueError("accumulate must be >= 1")
         if self.split_source not in ("auto", "official", "hash"):
@@ -613,13 +631,13 @@ class BreakingBadScenes:
         # and before `max_objects`, which then strides over objects that still
         # have a pattern to draw.
         self.fragment_limit = None
-        if config.max_fragments is not None:
+        if config.min_fragments is not None or config.max_fragments is not None:
             self.catalog, self.fragment_limit = limit_fragments(
-                self.catalog, MIN_FRAGMENTS, config.max_fragments)
+                self.catalog, config.min_fragments or MIN_FRAGMENTS, config.max_fragments)
             if not self.catalog.objects:
                 raise FileNotFoundError(
-                    f"no break pattern of {MIN_FRAGMENTS} to {config.max_fragments} "
-                    f"pieces in split {split!r}. Raise --max_fragments, or pass 0 "
+                    f"no break pattern of {_piece_range(config)} pieces in split "
+                    f"{split!r}. Widen --min_fragments / --max_fragments, or pass 0 "
                     f"for no limit.")
         if split == "train" and config.max_objects:
             objects = list(self.catalog.objects)
@@ -801,7 +819,10 @@ class BreakingBadScenes:
         if config.max_fragments is not None and len(meshes) > config.max_fragments:
             # The catalogue has already dropped these by their label count,
             # which the loaded count can only be below -- so this holds for a
-            # pattern whose label file could not be read there.
+            # pattern whose label file could not be read there. --min_fragments
+            # has no such check: a pattern counted in range can load fewer
+            # pieces (the empty labels are dropped), and skipping it here would
+            # leave it out of both 2-20 and 21+.
             return Skipped(key, f"{len(meshes)} fragments, above --max_fragments "
                                 f"{config.max_fragments}")
 
@@ -2026,10 +2047,11 @@ _DATA = ("label_method", "sharp_threshold", "tokens_per_scene", "token_mode",
          "max_objects",
          # A different limit is a different set of training AND validation
          # scenes. A resume onto one also resets the best-so-far (`train`).
-         "max_fragments")
+         "max_fragments", "min_fragments")
 # Data fields added after checkpoints were first written, read as what those
-# runs did: a checkpoint without `max_fragments` used every break pattern.
-_DATA_BEFORE_IT_EXISTED = {"max_fragments": None}
+# runs did: a checkpoint without `max_fragments` or `min_fragments` used every
+# break pattern.
+_DATA_BEFORE_IT_EXISTED = {"max_fragments": None, "min_fragments": None}
 
 
 def _resume_path(config: Config, default: Path) -> Optional[Path]:
@@ -2101,10 +2123,13 @@ def _check_resume_compatible(config: Config, saved: Dict, announce: bool) -> Non
 def _fragment_limit_changed(saved: Dict, config: Config) -> bool:
     """
     Whether validation is a different set of scenes from the one the
-    checkpoint's best was measured on, because ``max_fragments`` differs. A
-    checkpoint from before the setting existed used every break pattern.
+    checkpoint's best was measured on, because ``max_fragments`` or
+    ``min_fragments`` differs. A checkpoint from before the settings existed
+    used every break pattern.
     """
-    return {**_DATA_BEFORE_IT_EXISTED, **saved}.get("max_fragments") != config.max_fragments
+    saved = {**_DATA_BEFORE_IT_EXISTED, **saved}
+    return any(saved.get(name) != getattr(config, name)
+               for name in ("max_fragments", "min_fragments"))
 
 
 def _differs(a, b) -> bool:
@@ -2529,8 +2554,8 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
             # or discard best.pt for no reason.
             best = float("-inf")
             if main:
-                print("[resume] --max_fragments changed: validation is a different "
-                      "set of scenes, so the best-so-far is reset")
+                print("[resume] --max_fragments or --min_fragments changed: validation "
+                      "is a different set of scenes, so the best-so-far is reset")
         if main and load_path.resolve() != last_path.resolve():
             # Copy the resume point into *this* run's out_dir straight away.
             # Two failures otherwise break the chain: a session killed during
@@ -2852,14 +2877,20 @@ def _epoch_lines(config, items: int, world: int, per_epoch: int) -> List[str]:
     return lines
 
 
+def _piece_range(config: Config) -> str:
+    """The pieces per scene a run uses, as printed: ``2-20``, or ``21+``."""
+    low = config.min_fragments or MIN_FRAGMENTS
+    return f"{low}+" if config.max_fragments is None else f"{low}-{config.max_fragments}"
+
+
 def _fragment_banner(config: Config, train_set, val_set) -> List[str]:
     """The pieces-per-scene range, and what the limit removed from each split."""
-    if config.max_fragments is None:
+    if config.min_fragments is None and config.max_fragments is None:
         return [f"  fragments     {MIN_FRAGMENTS}+ per scene, no upper limit "
                 f"(--max_fragments 20 is the benchmark's 2-20)"]
     train, val = train_set.fragment_limit, val_set.fragment_limit
     return [
-        f"  fragments     {MIN_FRAGMENTS}-{config.max_fragments} per scene "
+        f"  fragments     {_piece_range(config)} per scene "
         f"(counted in {train.seconds + val.seconds:.1f} s)",
         f"                train keeps {train.describe()}",
         f"                val   keeps {val.describe()}",
@@ -3076,6 +3107,7 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
     summary.pop("failures", None)
     summary.pop("most_repaired", None)
     summary["max_fragments"] = config.max_fragments
+    summary["min_fragments"] = config.min_fragments
     # Read back by viz/results.py: every rotation here was fitted from the
     # matches, and there is no head to compare with.
     summary["rotations"] = "matched"
@@ -3405,7 +3437,8 @@ def find_scene(config: Config, key: str, splits=("train", "val", "test")):
     when there is no such scene.
     """
     searched = dataclasses.replace(config, modes_per_scene=None, limit_train=None,
-                                   limit_val=None, max_objects=None, max_fragments=None)
+                                   limit_val=None, max_objects=None, max_fragments=None,
+                                   min_fragments=None)
     names: List[str] = []
     for split in splits:
         try:
@@ -3482,10 +3515,10 @@ def _trained_shapes(dataset, stored: Dict, config: Config) -> Optional[int]:
 
 def _fragment_line(config: Config, dataset) -> str:
     """The range an evaluation scored, and what the limit kept of the split."""
-    if config.max_fragments is None:
+    if config.min_fragments is None and config.max_fragments is None:
         return (f"  fragments: {MIN_FRAGMENTS}+ per scene, no upper limit "
                 f"(--max_fragments 20 for the benchmark's 2-20)")
-    return (f"  fragments: {MIN_FRAGMENTS}-{config.max_fragments} per scene, keeping "
+    return (f"  fragments: {_piece_range(config)} per scene, keeping "
             f"{dataset.fragment_limit.describe()}")
 
 

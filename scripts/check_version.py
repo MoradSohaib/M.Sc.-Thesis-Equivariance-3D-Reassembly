@@ -141,7 +141,7 @@ MARKERS = [
     ("a resume onto another limit resets the best-so-far", "src/reassembly/training.py",
      'if _fragment_limit_changed(state.get("config") or {}, config):'),
     ("--evaluate --max_fragments overrides the checkpoint", "scripts/train.py",
-     'override = tuple(name for name in ("max_fragments", "subsets")'),
+     'override = tuple(name for name in ("max_fragments", "min_fragments", "subsets")'),
     # -- Thesis v6: the optional Hugging Face Hub mirror -------------------------
     ("hub mirror off unless all three --hf_* are given", "src/reassembly/hub.py",
      "return bool(self.repo_id and self.local_dir and self._token)"),
@@ -240,6 +240,11 @@ MARKERS = [
      "def plot_accuracy(history"),
     ("the learning test reaches the rotations through the matches", "tests/test_training.py",
      "def _broken(seed: int, pieces: int):"),
+    # -- Thesis v7: the patterns above 2-20, scored on their own ------------------
+    ("--min_fragments (0 = no lower limit)", "src/reassembly/training.py",
+     "min_fragments: Optional[int] = None"),
+    ("a piece range with no upper end", "src/reassembly/data/catalog.py",
+     "maximum is None or counts[pair] <= maximum"),
 ]
 
 

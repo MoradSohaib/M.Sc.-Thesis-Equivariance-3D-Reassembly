@@ -11,6 +11,7 @@ Train, resume, or evaluate the V-GAT reassembly model.
     python -m scripts.train --root_dir ... --num_gpus 2        # both GPUs (the default: all)
     python -m scripts.train --root_dir ... --num_gpus 1        # one GPU
     python -m scripts.train --root_dir ... --max_fragments 20  # the benchmark's 2-20 pieces
+    python -m scripts.train --root_dir ... --evaluate --min_fragments 21 --max_fragments 0  # above it
 
 The flags are Thesis 1's wherever the two projects share a setting, with
 Thesis 1's meaning (``scripts/config_flags.py`` lists the conversions):
@@ -164,8 +165,8 @@ def build_parser() -> argparse.ArgumentParser:
              "every object of --data_subsets whatever its split, for a subset "
              "the checkpoint was not trained on; the report counts the objects "
              "that are shapes it was trained on. With --evaluate an explicit "
-             "--data_subsets (and --max_fragments) wins over the checkpoint's; "
-             "--modes_per_scene 0 scores every break pattern.")
+             "--data_subsets (and --max_fragments, --min_fragments) wins over "
+             "the checkpoint's; --modes_per_scene 0 scores every break pattern.")
     parser.add_argument("--predictions", default="", metavar="FOLDER",
                         help="with --evaluate: also write every scored scene's prediction "
                              "(the dump_prediction format) into one zip in FOLDER: "
@@ -205,12 +206,13 @@ def main() -> None:
         except ValueError as error:
             parser.error(str(error))
         # The rest of the data definition stays the checkpoint's unless
-        # --data_from_flags, but an explicit --max_fragments wins -- how a model
-        # does on the benchmark's 2-20 pieces is a fair question whatever range
-        # it was trained on -- and so does an explicit --data_subsets: scoring
-        # on another subset keeps the labels, tokens and normalisation the
-        # model was trained with.
-        override = tuple(name for name in ("max_fragments", "subsets")
+        # --data_from_flags, but an explicit --max_fragments or --min_fragments
+        # wins -- how a model does on the benchmark's 2-20 pieces, or on the
+        # patterns above it, is a fair question whatever range it was trained
+        # on -- and so does an explicit --data_subsets: scoring on another
+        # subset keeps the labels, tokens and normalisation the model was
+        # trained with.
+        override = tuple(name for name in ("max_fragments", "min_fragments", "subsets")
                          if getattr(args, name) is not None)
         evaluate(config, checkpoint=args.checkpoint, split=args.split,
                  assemble=args.assemble, collision=args.collision,

@@ -76,6 +76,10 @@ HELP = {
     "max_fragments": "only break patterns of 2 to this many pieces, for "
                      "training, validation and --evaluate; 20 = the "
                      "benchmark's 2-20 (GARF); 0 = no limit",
+    "min_fragments": "only break patterns of at least this many pieces, "
+                     "counted as --max_fragments counts them; 21 with "
+                     "--max_fragments 0 = every pattern above the benchmark's "
+                     "2-20; 0 = no lower limit",
     "score_train": "also fit the rotations on every training batch, so the "
                    "training line reports the four geometric scores too "
                    "(slower: it matches every training scene); validation "
@@ -153,7 +157,8 @@ class _Refused(argparse.Action):
 
 
 # Integer settings whose default is None, "no limit" -- 0 on the command line.
-_OPTIONAL_INTS = ("modes_per_scene", "limit_train", "max_objects", "max_fragments")
+_OPTIONAL_INTS = ("modes_per_scene", "limit_train", "max_objects", "max_fragments",
+                  "min_fragments")
 
 
 def add_config_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
