@@ -115,6 +115,9 @@ edge the model never sees while a spurious one is only noise.
   are on PyPI anyway)
 - `pandas` for the summary tables and figures; `matplotlib` for the figures;
   `pillow` for the reassembly GIFs; `pyglet<2` only for an on-screen viewer window
+- `h5py` and `fast-simplification` only to convert other datasets
+  (`scripts.convert_external`): the first reads Fractura's `.hdf5`, the second
+  thins the meshes
 - The Breaking Bad dataset (not redistributable — [download it here](https://breaking-bad-dataset.github.io/))
 
 **The test suite does not need `libigl`.** It builds its meshes in
@@ -128,7 +131,7 @@ tests still pass and the network tests skip.
 git clone <this-repo> && cd <this-repo>
 python -m venv .venv && source .venv/bin/activate      # Windows: .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-python -m pytest                                        # 535 passed
+python -m pytest                                        # 557 passed
 ```
 
 Installing is optional — `pytest.ini` sets `pythonpath = src .` and each script
@@ -255,12 +258,15 @@ src/reassembly/
 │   ├── orientation.py             canonical edge face-normal ordering
 │   ├── patches.py                 fracture-surface patches for cross-attention
 │   ├── correspondence.py          cross-fragment coincidence matching
+│   ├── clean.py                   other datasets' pieces as one closed surface each
+│   ├── decimate.py                thinned to the training density, one budget per object
 │   └── shell.py                   ray-cast visibility (unused; kept for figures)
 ├── data/
 │   ├── paths.py                   scene discovery, subsets, official splits
 │   ├── catalog.py             ★   one shape is one shape; split modes; balancing
 │   ├── sampling.py                weighted + distributed + reproducible sampler
-│   ├── scene.py                   SceneReader — caches the intact mesh across modes
+│   ├── scene.py                   SceneReader — caches the intact mesh across modes; write_scene
+│   ├── external.py                Fractura (GARF's HDF5) and Fantastic Breaks, read and prepared
 │   ├── transforms.py              SE(3) perturbation, centring, normalisation
 │   └── features.py                meshes → tensors, and the batch collate
 ├── training.py                 ★  config, dataset, loops, checkpoints, metrics
@@ -289,6 +295,7 @@ src/reassembly/
 
 scripts/
 ├── train.py                       train, resume, preflight, evaluate
+├── convert_external.py            Fractura and Fantastic Breaks in Breaking Bad's layout
 ├── report_metrics.py              an evaluation's report, again, from its metrics file
 ├── make_figures.py                figures and tables from histories and evaluations
 ├── config_flags.py                one flag per Config field, shared by the tools
@@ -305,7 +312,7 @@ scripts/
 ├── tune_sharp_threshold.py        pick --sharp-threshold by F1
 └── visualize.py                   render or describe one scene
 
-tests/                             535 tests
+tests/                             557 tests
 ```
 
 Only `reassembly` is packaged; `scripts/` and `tests/` are entry points and
@@ -811,6 +818,66 @@ zip, `DIR/<subsets>-<split>.zip`, laid out as the data is:
 reached, part accuracy, RMSE(T), Chamfer, matches). The zip is written as it
 goes (`.zip.part` until it is complete), and each scene's meshes are rebuilt
 to be written, which adds to the evaluation's time.
+
+### Other datasets: Fractura and Fantastic Breaks (`scripts.convert_external`)
+
+The model reads Breaking Bad's layout, so another dataset is converted into it
+once and then evaluated, drawn and viewed as Breaking Bad is. A GARF-format
+`.hdf5` (Fractura) or a Fantastic Breaks folder is one source, and each source
+becomes one subset named after the file or folder:
+
+```bash
+pip install h5py fast-simplification
+python -m scripts.convert_external Fractura/bone_real.hdf5 path/to/fantastic_breaks --out external --reference data
+python -m scripts.convert_external Fractura/<synthetic>.hdf5 --split val --out external --reference data
+python -m scripts.train --root_dir external --evaluate --checkpoint path/to/best.pt --data_subsets bone_real --split all --modes_per_scene 0 --max_fragments 20 --checkpoint_dir eval/bone_real --predictions results/bone_real
+```
+
+Every assembly is read in its assembled pose and then (`data/external.py`):
+
+1. **cleaned**, each piece to one closed surface (`mesh/clean.py`). Fractura's
+   real bones store a vertex per face corner: one piece reached the model as
+   518,631 vertices in 168,427 separate patches, so no mesh edges between its
+   faces; merged within 1e-6 of the piece's size it is 90,179 vertices on one
+   closed surface. Its synthetic pieces store the walls between cells twice,
+   facing opposite ways — the "patterns inside" — and they cancel exactly, by
+   the rule the Breaking Bad reader applies. Every real bone piece checked
+   also holds a separate 2 × 2 × 2 cube of 12 faces at the origin (Blender's
+   default cube), dropped. An object whose pieces are one mesh stored twice
+   (`pig_bone_15`) is skipped and named;
+2. **scaled** so the object's largest side is 1, as Breaking Bad's objects are
+   (`--scale piece`: GARF's loader's convention). Part accuracy's 0.01 is in
+   these units; the real bones are in millimetres;
+3. **thinned** to Breaking Bad's density (`mesh/decimate.py`): quadric edge
+   collapse with one face budget per object, split over its pieces by area,
+   so every piece ends at the same density. The density is the median edge
+   over the object's largest side; `--reference data` measures it on your
+   Breaking Bad scenes, or give `--edge`, `--faces` or `--no_thinning`.
+   An object within a factor of 2 (`--tolerance`) is left as it is.
+
+The model computes its normals and fracture labels from the vertices and faces,
+on every dataset, Breaking Bad's included; the readers pass it nothing else.
+Each run writes `<out>/<subset>.csv`, a row per assembly, and prints what
+cleaning removed, the density before and after, how many objects have pieces
+that share vertices, and the share of faces the dihedral test flags (with
+recall and precision where the dataset marks its break faces).
+
+Measured on ten Fractura objects, rebuilt in this format from prediction dumps
+of them (the meshes as a run had loaded them), against seven Breaking Bad
+scenes:
+
+| | real bones (3) | other real (4) | synthetic (3) | Breaking Bad (7) |
+|---|---|---|---|---|
+| median edge / largest side, cleaned | 0.0015–0.0038 | 0.0022–0.0052 | 0.0092–0.0118 | 0.0064–0.0230 |
+| thinned to (`--edge 0.0145`) | 0.0143–0.0146 | 0.0142–0.0147 | not thinned | — |
+| faces the dihedral test flags, cleaned → written | 1–9% → 36–51% | 2–4% → 29–34% | 5–51% | 8–55% |
+| objects whose pieces share vertices | 0 | 0 | 3 | 7 |
+
+Thinning moved no kept vertex more than half a target edge from an original
+vertex on the seven real objects, and the object's size by at most 0.21%.
+Where pieces share no vertex — real scans — there is no embedding loss to
+report and every match rests on the embeddings alone, so the Breaking Bad run
+to set beside them is `--jitter/--drop`'s, not the clean one.
 
 ### Reports and figures from saved results
 

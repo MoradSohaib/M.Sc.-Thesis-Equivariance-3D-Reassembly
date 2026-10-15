@@ -27,5 +27,11 @@ matplotlib>=3.7
 pillow>=10.0
 # pyglet<2
 
+# Other datasets (scripts/convert_external.py). Optional: h5py reads Fractura's
+# (GARF's) .hdf5 files, fast-simplification thins the meshes. Tested with
+# h5py 3.16 and fast-simplification 0.2.0; its tests skip without them.
+h5py
+fast-simplification>=0.2.0
+
 # Tests.
 pytest>=7.4

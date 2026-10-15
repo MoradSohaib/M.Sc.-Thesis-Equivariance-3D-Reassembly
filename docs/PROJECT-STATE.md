@@ -11,7 +11,7 @@ implementing anything from it.
 
 | | |
 |---|---|
-| Pipeline | **built** — 535 tests, clean under `-W error` |
+| Pipeline | **built** — 557 tests, clean under `-W error` |
 | Dataset pass | 1,096,825 fragments across 1,442 objects |
 | Fracture surface | 10.6% of vertices, dataset-wide |
 | Model | **built and verified** — equivariance checked numerically in float64 |
@@ -30,6 +30,7 @@ implementing anything from it.
 | Thesis v7 | matched rotations placed from the pair fits the chain agrees with, the anchor held, not one solve over every match; `--evaluate --jitter/--drop` without shared break vertices — see §17 |
 | Thesis v7, no head | the rotation head removed: trained on the embedding term alone, every rotation fitted from the matches, the four geometric terms scores only, `best.pt` on validation acc@5; `--split all`, `--predictions` — see §18 |
 | Above the benchmark range | `--min_fragments 21 --max_fragments 0` scores the patterns 2–20 leaves out; the two runs score every pattern once — see §19 |
+| Other datasets | Fractura and Fantastic Breaks converted into Breaking Bad's layout — cleaned, scaled, thinned to the training density — and evaluated unchanged — see §20 |
 
 ---
 
@@ -1277,3 +1278,87 @@ the key left out of `_DATA`, the evaluate override ignoring `--min_fragments`,
 `--min_fragments 0` not meaning "no lower limit", `find_scene` held to the
 range, the report line or the metrics field without it — each fails a test.
 110 version markers.
+
+## 20 · Thesis v7 — other datasets in Breaking Bad's place (Oct 2026)
+
+**Why.** v7 is to be scored on Fractura (GARF's HDF5 files) and Fantastic
+Breaks. A first attempt — readers inside `scene.py`/`training.py`, decimation
+in the loader — gave an embedding term of 0.0000 and wrong poses everywhere but
+the synthetic bones. Measured on its prediction dumps, the causes were in the
+data as the model received it, not in the model:
+
+- Fractura's real bones store a vertex per face corner: one piece reached the
+  model as 518,631 vertices in 168,427 patches, with no mesh edge between its
+  faces. Every piece checked also holds a separate 2 × 2 × 2 cube of 12 faces
+  at the origin (Blender's default cube). They are in millimetres, so part
+  accuracy (0.01 in object units) was 0 throughout, and `pig_bone_15` is one
+  mesh stored twice.
+- The synthetic bones store the walls between cells twice, facing opposite
+  ways (1,142 and 2,270 pairs in one scene's two pieces), which leaves 2,173
+  and 4,268 edges with more than two faces.
+- No real set has a vertex shared between pieces: no coincidence cluster, so
+  no embedding term (the 0.0000), and every match comes from the embeddings
+  alone. After cleaning, their edges are 1.2 to 9.9 times shorter than
+  Breaking Bad's median.
+- The pieces "centralising" in the viewer: in the nine failed scenes the
+  placed pieces' centroids were 0.06 to 0.23 as far apart as the true ones,
+  0.96 in the good one — a least-squares fit to wrong matches pulls the
+  matched sets onto each other.
+
+**What changed.**
+
+- `scripts/convert_external.py` converts once, offline, into Breaking Bad's
+  layout, so `--evaluate`, the figures, the dumps and the Visualizer run on the
+  result unchanged. A CSV per subset records, per assembly, what was done, the
+  density before and after, the shared vertices (found as training finds
+  them), and the faces the dihedral test flags — with recall and precision
+  where the dataset marks its break faces.
+- `data/external.py`: readers for GARF's HDF5 (`data_split` lists, pieces in
+  numeric order, `shared_faces` as the marked break) and Fantastic Breaks
+  (`model_b_<k>`, `model_r_<k>`, `meta_<k>['mask']` per vertex or per face);
+  `prepare` cleans, scales (largest side 1; `--scale piece` is GARF's loader's
+  convention), thins, tidies what the collapse leaves, and reports.
+- `mesh/clean.py`: vertices within 1e-6 of the piece's diagonal merged;
+  opposite duplicates cancelled by the Breaking Bad reader's rule; separate
+  components of at most 12 faces, or under 1% of the area of the largest
+  component with more, dropped; a closed surface wound inward turned outward.
+- `mesh/decimate.py`: quadric edge collapse (`fast-simplification`) with one
+  face budget per object, split over its pieces by area; the budget from the
+  target density (median edge over the largest side), corrected by secant
+  steps until within 5%. An object within a factor of 2 of the target is not
+  touched, so the synthetic sets keep the vertices their pieces share.
+- `data/scene.py`: `write_scene`, one fracture mode in the layout
+  `SceneReader` reads.
+- Not used: a ray-cast shell (`mesh/shell.py`, unchanged). On a synthetic
+  piece it kept exactly the faces the cancellation keeps, in 60.6 s against
+  23 ms; on Breaking Bad's vase it deleted 14.1% of the largest piece's area,
+  all of it real surface.
+
+**Measured** — ten Fractura objects rebuilt in GARF's format from the dumps,
+against seven Breaking Bad scenes:
+
+| | real bones (3) | other real (4) | synthetic (3) | Breaking Bad (7) |
+|---|---|---|---|---|
+| median edge / largest side, cleaned | 0.0015–0.0038 | 0.0022–0.0052 | 0.0092–0.0118 | 0.0064–0.0230 |
+| after `--edge 0.0145` | 0.0143–0.0146 | 0.0142–0.0147 | not thinned | — |
+| faces flagged by the dihedral test, cleaned → written | 1–9% → 36–51% | 2–4% → 29–34% | 5–51% | 8–55% |
+| objects whose pieces share vertices | 0 | 0 | 3 | 7 |
+
+A fixed 99% reduction, split by area, would have left the seven real objects
+at 1.00 to 3.66 times Breaking Bad's median edge; the density target leaves
+them at 0.98 to 1.02. Thinning kept every vertex within half a target edge of
+an original one and the object's size within 0.21%. On the synthetic set,
+against break faces marked as GARF's script marks them (all three vertices
+coincide with another piece's), the dihedral test's recall is 0.89 and its
+precision 0.06 to 0.49.
+
+**Verified.** 557 tests (535 before; `tests/test_external.py`, 22, the script
+and `evaluate` end to end among them). Of 32 mutations of the new code, 31
+fail a test; the one that does not keeps the last thinning pass instead of the
+closest, which on the seven real objects made no difference (two passes each,
+the second within 1.6%). 116 version markers. The converted samples evaluate
+end to end (`--split all --predictions`, a random-weight model).
+
+**Next.** The trained checkpoints on the converted sets: the real ones at
+`--max_fragments 20`, the synthetic one with `--split val`, Fantastic Breaks,
+and Breaking Bad's `--jitter/--drop` run beside the real ones.

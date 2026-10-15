@@ -40,7 +40,11 @@ torch = ["torch>=2.2"]
 # The reassembly GIFs and figures (scripts.render_gif). An on-screen viewer
 # window (scripts.visualize_reassembly) additionally needs "pyglet<2".
 figures = ["matplotlib>=3.7", "pillow>=10.0"]
-dev = ["pytest>=7.4", "pandas>=2.0", "torch>=2.2", "matplotlib>=3.7", "pillow>=10.0"]
+# Other datasets (scripts.convert_external): h5py reads Fractura's .hdf5,
+# fast-simplification thins the meshes.
+external = ["h5py", "fast-simplification>=0.2.0"]
+dev = ["pytest>=7.4", "pandas>=2.0", "torch>=2.2", "matplotlib>=3.7", "pillow>=10.0",
+       "h5py", "fast-simplification>=0.2.0"]
 
 [tool.setuptools]
 package-dir = { "" = "src" }

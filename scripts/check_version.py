@@ -245,6 +245,19 @@ MARKERS = [
      "min_fragments: Optional[int] = None"),
     ("a piece range with no upper end", "src/reassembly/data/catalog.py",
      "maximum is None or counts[pair] <= maximum"),
+    # -- Thesis v7: other datasets in Breaking Bad's place ---------------------
+    ("other datasets in Breaking Bad's layout", "scripts/convert_external.py",
+     "def _summary(subset: str, rows: list)"),
+    ("each piece one closed surface", "src/reassembly/mesh/clean.py",
+     "def merge_close_vertices("),
+    ("one face budget per object, split by area", "src/reassembly/mesh/decimate.py",
+     "def area_budget("),
+    ("assemblies cleaned, scaled and thinned", "src/reassembly/data/external.py",
+     "def prepare(assembly: Assembly"),
+    ("a scene written as SceneReader reads it", "src/reassembly/data/scene.py",
+     "def write_scene("),
+    ("conversion tests", "tests/test_external.py",
+     "def test_the_script_converts_and_the_model_evaluates_the_result"),
 ]
 
 

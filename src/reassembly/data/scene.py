@@ -210,3 +210,34 @@ def load_scene(scene_dir: str | Path, mode: Optional[str] = None,
             RuntimeWarning, stacklevel=2,
         )
     return result.fragments
+
+
+def write_scene(scene_dir: str | Path, pieces: Sequence,
+                mode: str = "fractured_0") -> Path:
+    """
+    One fracture mode, written in the layout :class:`SceneReader` reads:
+    ``pieces`` (``(vertices, faces)`` each, in the assembled pose) as one
+    ``compressed_mesh.obj``, an identity cell matrix -- every vertex its own
+    cell -- and each vertex's piece as the label. The pieces share no vertex in
+    the file, so :meth:`SceneReader.load_mode` gives them back one per label,
+    in order. This is how another dataset enters the same evaluation as
+    Breaking Bad (``scripts/convert_external.py``).
+
+    Coordinates are written to 9 significant digits, so vertices two pieces
+    hold at the same point stay at the same point.
+    """
+    from scipy.sparse import identity, save_npz
+
+    scene_dir = Path(scene_dir)
+    (scene_dir / mode).mkdir(parents=True, exist_ok=True)
+    vertices = [np.asarray(v, dtype=np.float64) for v, _ in pieces]
+    offsets = np.cumsum([0] + [len(v) for v in vertices])
+    faces = np.concatenate([np.asarray(f, dtype=np.int64) + offset
+                            for (_, f), offset in zip(pieces, offsets[:-1])])
+    with open(scene_dir / MESH_FILE, "w") as out:
+        np.savetxt(out, np.concatenate(vertices), fmt="v %.9g %.9g %.9g")
+        np.savetxt(out, faces + 1, fmt="f %d %d %d")
+    save_npz(scene_dir / CELL_MATRIX_FILE, identity(int(offsets[-1]), format="csr"))
+    np.save(scene_dir / mode / FRACTURE_FILE,
+            np.repeat(np.arange(len(pieces), dtype=np.int64), np.diff(offsets)))
+    return scene_dir
