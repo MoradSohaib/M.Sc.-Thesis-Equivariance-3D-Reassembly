@@ -193,6 +193,35 @@ class Config:
     """Compute coincidence clusters for the embedding loss. Costs a KD-tree
     pass per sample; without it there is nothing to train on (training
     refuses to start), though a checkpoint can still be evaluated."""
+    contact_radius: float = 0.0
+    """
+    The embedding term's positives by distance instead of by coincidence: a
+    vertex's positives are the vertices of OTHER pieces within this distance
+    in the assembled pose, in world units (an object's largest side is 1), and
+    only vertices with one are anchors (:func:`reassembly.nn.losses.proximity_loss`).
+    0, the default, is the coincidence clusters v7 was trained on: one
+    positive per vertex, its exact twin -- which scanned pieces, meshed each on
+    its own, never have; Fractura's real bones and Fantastic Breaks reached
+    chance that way. 0.015 is about one Breaking Bad median edge (0.0162).
+    """
+    contact_band: float = 2.0
+    """With ``contact_radius``: out to this many radii, a vertex that is not
+    a positive -- the other side's just beyond the radius, the anchor's own
+    neighbours -- is neither a positive nor a negative."""
+    remesh: Optional[Sequence[float]] = None
+    """
+    ``--remesh LOW HIGH``: each piece of every TRAINING scene remeshed on its
+    own whenever it is loaded, keeping a share of its faces drawn uniformly
+    from [LOW, HIGH] (:mod:`reassembly.data.remesh`), so the two sides of a
+    break are tessellated independently, as two scans are. ``None``, the
+    default: the pieces as stored, sharing their break vertices. Validation
+    is never remeshed by it, so its numbers stay comparable; ``--evaluate
+    --remesh`` scores remeshed scenes. Needs ``fast-simplification``.
+    """
+    remesh_jitter: float = 0.0
+    """With ``remesh``: Gaussian noise of this standard deviation on every
+    vertex after remeshing, in world units, so no vertex is left exactly where
+    its twin was (0.001: none of seven Breaking Bad scenes kept one). 0: none."""
     # No translation setting, and that is deliberate rather than an omission.
     # `build_scene` applies rotation only, then centres every fragment at its
     # own centroid -- which removes any translation that had been applied. A
@@ -358,6 +387,15 @@ class Config:
     cover a session that is cut off without one.
     """
     resume: bool = True
+    init_from: Optional[str] = None
+    """
+    A checkpoint whose weights a NEW run starts from -- fine-tuning. Only the
+    weights are taken: the optimizer, the schedule, the epoch count and the
+    history start fresh, and the data and loss settings are this run's. The
+    architecture must be the checkpoint's (checked, with the flags to pass
+    named). Ignored when the run resumes from a checkpoint of its own, so an
+    interrupted fine-tuning run continues where it stopped.
+    """
     resume_from: Optional[str] = None
     """
     Where to *load* a checkpoint from, when that differs from where this run
@@ -439,6 +477,19 @@ class Config:
                              "implemented here" if self.lr_schedule == "plateau" else ""))
         if self.save_every < 1:
             raise ValueError("save_every must be >= 1")
+        if self.contact_radius < 0:
+            raise ValueError("contact_radius must be >= 0 (0 = the coincidence clusters)")
+        if self.contact_band < 1:
+            raise ValueError("contact_band must be >= 1: it is counted in radii")
+        if self.remesh is not None:
+            from .data.remesh import check_remesh
+
+            if len(self.remesh) != 2:
+                raise ValueError(f"remesh is two numbers, LOW HIGH, got {self.remesh!r}")
+            self.remesh = tuple(float(value) for value in self.remesh)
+            check_remesh(*self.remesh, self.remesh_jitter)
+        elif self.remesh_jitter:
+            raise ValueError("remesh_jitter applies to remeshed pieces: give --remesh LOW HIGH")
         from .data.catalog import BALANCE_SCHEMES, SPLIT_MODES
 
         if self.split_by not in SPLIT_MODES:
@@ -581,14 +632,24 @@ class BreakingBadScenes:
     """
 
     def __init__(self, config: Config, split: str, epoch_seed: int = 0,
-                 cache_size: int = 4):
+                 cache_size: int = 4, remesh=None):
         from .data.catalog import Catalog, build_catalog, limit_fragments, split_catalog
         from .data.paths import find_scenes
+        from .data.remesh import Remesh
 
         self.config = config
         self.split = split
         self.epoch_seed = epoch_seed
         self.cache_size = cache_size
+        # Each piece remeshed on its own (`data/remesh.py`): the training
+        # split's augmentation, or what an evaluation asks for (`remesh`, a
+        # `Remesh`). Validation is never remeshed by the training settings.
+        if remesh is None and split == "train" and config.remesh is not None:
+            remesh = Remesh(*config.remesh, config.remesh_jitter)
+        if remesh is not None and config.label_method == "coincidence":
+            raise ValueError("--label_method coincidence finds a break by its coincident "
+                             "vertices, which remeshing removes: use dihedral with --remesh")
+        self.remesh = remesh
 
         scenes = find_scenes(config.root, config.subsets)
         if not scenes:
@@ -798,6 +859,22 @@ class BreakingBadScenes:
         per_fragment, _ = compute_scene_correspondence(meshes)
         return np.concatenate(per_fragment) if per_fragment else None
 
+    def contact(self, meshes) -> Optional[np.ndarray]:
+        """
+        Per vertex, whether a vertex of another piece lies within
+        ``contact_radius`` -- the anchors of the distance-based embedding term
+        -- in the ASSEMBLED frame, like the clusters; ``None`` unless that term
+        is on.
+        """
+        from .mesh.correspondence import contact_vertices
+
+        config = self.config
+        if not (config.supervise_embedding and config.contact_radius > 0):
+            return None
+        masks = contact_vertices([np.asarray(m.vertices, dtype=np.float64) for m in meshes],
+                                 config.contact_radius)
+        return np.concatenate(masks) if masks else None
+
     def build(self, i: int, *, rotations=None, seed=None, perturb=None):
         """
         Item ``i`` as the loop sees it, with the perturbation overridable:
@@ -836,6 +913,10 @@ class BreakingBadScenes:
             return Skipped(key, "non-finite vertex coordinates")
 
         draw = stable_seed(key, self.epoch_seed, config.seed) if seed is None else seed
+        if self.remesh is not None:
+            meshes = self._remeshed(key, vertices, faces)
+            vertices = [m.vertices for m in meshes]
+            faces = [m.faces for m in meshes]
         return build_scene(
             vertices, faces, self.labels(meshes),
             category=self.catalog.objects[scene_index].category or "(uncategorised)",
@@ -849,10 +930,39 @@ class BreakingBadScenes:
             cluster=self.clusters(meshes),
             key=key,
             perturb=(not config.perturb_on_device) if perturb is None else perturb,
+            contact=self.contact(meshes),
         )
 
     def __getitem__(self, i: int):
         return self.build(i)
+
+    def _remeshed(self, key: str, vertices, faces) -> list:
+        """
+        The pieces remeshed by ``self.remesh``, from their own stream -- so
+        the perturbation and the tokens draw what they would have -- and per
+        epoch like them: every epoch remeshes a training scene afresh, and
+        one epoch the same way every time it is asked.
+        """
+        from .data.remesh import remesh_pieces
+
+        rng = np.random.default_rng(stable_seed(key, self.epoch_seed, self.config.seed,
+                                                "remesh"))
+        vertices, faces = remesh_pieces(vertices, faces, rng, self.remesh)
+        return [_Mesh(v, f) for v, f in zip(vertices, faces)]
+
+    def pieces(self, i: int) -> list:
+        """
+        Item ``i``'s fragments as :meth:`build` gives them to the model, in
+        the ASSEMBLED frame: remeshed when this dataset remeshes, else
+        :meth:`meshes`. What a dump of the scene has to hold.
+        """
+        meshes = self.meshes(i)
+        if self.remesh is None or len(meshes) < MIN_FRAGMENTS:
+            return meshes
+        vertices = [np.asarray(m.vertices, dtype=np.float64) for m in meshes]
+        if not all(np.isfinite(v).all() for v in vertices):
+            return meshes
+        return self._remeshed(self.key(i), vertices, [np.asarray(m.faces) for m in meshes])
 
 
 def stable_seed(*parts) -> int:
@@ -877,6 +987,12 @@ class Skipped(NamedTuple):
     """A sample the dataset could not build, carrying why."""
     key: str
     reason: str
+
+
+class _Mesh(NamedTuple):
+    """A remeshed piece, as the labelling reads a loaded one."""
+    vertices: np.ndarray
+    faces: np.ndarray
 
 
 def _assert_splits_disjoint(catalog, config: Config, official: Dict) -> None:
@@ -1052,7 +1168,8 @@ def _forward(model, batch, criterion, config, keep=None, score=None, drop=0.0):
 
     Returns ``(loss, report, R)``. ``loss`` is the one trained term, the
     contrastive embedding term (``nn/losses.py``); with no coincidence cluster
-    in the batch it is a constant 0 with no gradient. ``R`` is the
+    in the batch -- with ``contact_radius``, no vertex in contact -- it is a
+    constant 0 with no gradient. ``R`` is the
     ``(F, 3, 3)`` rotations fitted from the embedding matches
     (:func:`reassembly.assembly.rotation.match_batch`) -- each scene's root at
     the identity, as the method has them, before the anchor protocol aligns
@@ -1094,7 +1211,19 @@ def _forward(model, batch, criterion, config, keep=None, score=None, drop=0.0):
 
     embeddings = cluster = None
     clusters = 0
-    if batch.num_clusters:
+    near = {}
+    if config.contact_radius > 0:
+        # Positives by distance (`proximity_loss`): the anchors are the
+        # vertices with another piece's vertex within the radius, compared in
+        # the assembled pose, in world units.
+        if batch.contact is not None and bool(batch.contact.any()):
+            chosen = batch.contact
+            fragment = batch.vertex_fragment[chosen]
+            embeddings = prediction.vertex_embedding[chosen]
+            near = dict(positions=batch.target_vertices[chosen] * batch.unit[fragment, None]
+                        + batch.centroid[fragment],
+                        groups=fragment, scenes=batch.fragment_scene[fragment])
+    elif batch.num_clusters:
         chosen, renumbered, clusters = clustered_vertices(batch.cluster)
         if clusters:
             embeddings, cluster = prediction.vertex_embedding[chosen], renumbered
@@ -1124,7 +1253,7 @@ def _forward(model, batch, criterion, config, keep=None, score=None, drop=0.0):
     total, report, fragments = criterion(
         compared, batch.target_rotation if score else None,
         **scored_inputs,
-        embeddings=embeddings, cluster=cluster, num_clusters=clusters,
+        embeddings=embeddings, cluster=cluster, num_clusters=clusters, **near,
         keep=scored, return_fragments=True,
     )
     if keep is not None:
@@ -2047,11 +2176,20 @@ _DATA = ("label_method", "sharp_threshold", "tokens_per_scene", "token_mode",
          "max_objects",
          # A different limit is a different set of training AND validation
          # scenes. A resume onto one also resets the best-so-far (`train`).
-         "max_fragments", "min_fragments")
+         "max_fragments", "min_fragments",
+         # What the embedding term is and what the training scenes look like.
+         "contact_radius", "contact_band", "remesh", "remesh_jitter")
 # Data fields added after checkpoints were first written, read as what those
 # runs did: a checkpoint without `max_fragments` or `min_fragments` used every
-# break pattern.
-_DATA_BEFORE_IT_EXISTED = {"max_fragments": None, "min_fragments": None}
+# break pattern, and one without the rest trained on coincidence clusters,
+# with the pieces as stored.
+_DATA_BEFORE_IT_EXISTED = {"max_fragments": None, "min_fragments": None,
+                           "contact_radius": 0.0, "contact_band": 2.0,
+                           "remesh": None, "remesh_jitter": 0.0}
+# Data fields that shape the TRAINING scenes only: a resume onto a change is
+# announced like any other, but an evaluation does not take them from the
+# checkpoint -- it is remeshed only when it is asked to be (`evaluate`).
+_TRAINING_ONLY = ("remesh", "remesh_jitter")
 
 
 def _resume_path(config: Config, default: Path) -> Optional[Path]:
@@ -2267,7 +2405,49 @@ def build_model(config: Config):
 def build_criterion(config: Config):
     from .nn.losses import ReassemblyLoss
 
-    return ReassemblyLoss(embedding=config.w_embedding)
+    return ReassemblyLoss(embedding=config.w_embedding, contact_radius=config.contact_radius,
+                          contact_band=config.contact_band)
+
+
+def _start_from(model, config: Config, device, announce: bool) -> None:
+    """
+    ``config.init_from``'s weights in a NEW run's model -- the weights alone:
+    the optimizer, the schedule and the history are the new run's. The
+    architecture must be the checkpoint's, and a mismatch is refused naming the
+    flags that match it; a checkpoint from before v7 removed the rotation head
+    gives its backbone and embedding, the head left behind as evaluation
+    leaves it. A directory means its ``best.pt`` (else ``last.pt``).
+    """
+    import torch
+
+    path = Path(config.init_from)
+    if path.is_dir():
+        path = next((path / name for name in ("best.pt", "last.pt") if (path / name).exists()),
+                    path / "best.pt")
+    if not path.exists():
+        raise FileNotFoundError(f"--init_from {config.init_from}: no checkpoint there")
+    state = torch.load(path, map_location=device, weights_only=False)
+    stored, current = state.get("config") or {}, asdict(config)
+    different = [(key, stored[key], current[key]) for key in _ARCHITECTURE
+                 if key in stored and _differs(stored[key], current[key])]
+    if different:
+        def spelled(value):
+            return " ".join(map(str, value)) if isinstance(value, (list, tuple)) else str(value)
+
+        raise ValueError(
+            f"--init_from {path}: its architecture differs from the flags ("
+            + "; ".join(f"{flag(k)} {spelled(a)} in the checkpoint, {spelled(b)} in the flags"
+                        for k, a, b in different)
+            + "). Pass " + " ".join(f"{flag(k)} {spelled(a)}" for k, a, _ in different) + ".")
+    weights = state["model"]
+    head = _head_keys(weights)
+    if head:
+        weights = {key: value for key, value in weights.items() if key not in head}
+    model.load_state_dict(weights)
+    if announce:
+        print(f"started from the weights of {path} (epoch {int(state.get('epoch', -1)) + 1})"
+              + (f", leaving the rotation head it carries ({len(head)} tensors)" if head else "")
+              + "; the optimizer, the schedule and the history start fresh")
 
 
 def _seed_everything(seed: int) -> None:
@@ -2482,6 +2662,12 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
     if not config.supervise_embedding:
         raise ValueError("supervise_embedding=False leaves nothing to train: the embedding "
                          "term is the only one, and it needs the coincidence clusters")
+    if config.remesh_jitter and not config.contact_radius:
+        # Measured: jitter 0.001 left no coincident vertex in seven Breaking Bad
+        # scenes, and coincidence is all the term reads without --contact_radius.
+        raise ValueError("--remesh_jitter leaves no vertex where its twin was, and the "
+                         "coincidence term (--contact_radius 0) has nothing else to train on: "
+                         "give --contact_radius")
     _seed_everything(config.seed + rank)
     out_dir = Path(config.out_dir)
     if main:
@@ -2501,6 +2687,7 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
     offenders: Dict[str, Dict] = {}
     last_path, best_path = out_dir / "last.pt", out_dir / "best.pt"
     load_path = _resume_path(config, last_path)
+    warm = False                         # started from --init_from's weights
 
     if config.resume and load_path is not None:
         state = torch.load(load_path, map_location=device, weights_only=False)
@@ -2541,6 +2728,8 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
             print(f"resumed from {load_path}")
             print(f"  epoch {start_epoch}, step {step}, "
                   f"{_hms(elapsed)} trained so far{partial}")
+            if config.init_from:
+                print(f"  (--init_from {config.init_from} applies to a fresh start only)")
             if chosen_by != BEST_METRIC:
                 print(f"  [resume] best.pt was chosen by val {chosen_by.replace('deg', '')}; "
                       f"it is now chosen by val {_BEST_NAME}, so the best-so-far is the "
@@ -2570,11 +2759,17 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
                             epoch_step=state.get("epoch_step"),
                             offenders=offenders)
             print(f"  carried the resume point into {last_path}")
-    elif main and config.resume:
-        # Announced, because "starting from scratch" is one line in a long log
-        # and costs a whole session when missed.
+    else:
         looked = load_path or config.resume_from or last_path
-        print(f"no checkpoint at {looked} -- starting from scratch")
+        if config.init_from:
+            if main and config.resume:
+                print(f"no checkpoint at {looked} -- starting from --init_from's weights")
+            _start_from(model, config, device, announce=main)
+            warm = True
+        elif main and config.resume:
+            # Announced, because "starting from scratch" is one line in a long
+            # log and costs a whole session when missed.
+            print(f"no checkpoint at {looked} -- starting from scratch")
 
     # Each rank initialised from its own seed. From here on the replicas stay
     # identical by construction; this is where they become identical.
@@ -2650,7 +2845,9 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
         repaired = {"train": train_summary.pop("most_repaired", []),
                     "val": val_summary.pop("most_repaired", [])}
 
-        if epoch == start_epoch and main and config.check_init and not history:
+        # Not after --init_from: trained weights are not at chance, which is
+        # what the check reads them against.
+        if epoch == start_epoch and main and config.check_init and not history and not warm:
             for complaint in check_initial_losses(train_summary):
                 print(f"  [check] {complaint}")
 
@@ -2918,6 +3115,7 @@ def _banner(config, train_set, val_set, parameters, device, world, per_epoch) ->
         f"  tokens        {config.tokens_per_scene}/scene, {config.token_mode}"
         f" by {config.token_metric} distance",
         f"  precision     {'AMP' if config.amp else 'fp32'}",
+        *_contact_banner(config),
         "  loss          the embedding term alone; the rotations come from its matches",
         "                (stage two), scored with rotation/position/normal/face on "
         + ("every batch" if config.score_train else
@@ -2938,6 +3136,24 @@ def _banner(config, train_set, val_set, parameters, device, world, per_epoch) ->
         "=" * 74,
     ]
     return "\n".join(lines)
+
+
+def _contact_banner(config: Config) -> List[str]:
+    """What the embedding term's positives are, and what the training scenes look like."""
+    if config.contact_radius > 0:
+        lines = [f"  positives     another piece's vertices within {config.contact_radius:g} "
+                 f"(world units); out to {config.contact_band:g} radii neither"]
+    else:
+        lines = ["  positives     the coincident vertices across each break (exact twins)"]
+    if config.remesh is not None:
+        low, high = config.remesh
+        lines.append(f"  remeshed      each training piece on its own: {low:.0%}-{high:.0%} of its "
+                     f"faces kept" + (f", jitter {config.remesh_jitter:g}"
+                                      if config.remesh_jitter else "")
+                     + "; validation as stored")
+    if config.init_from:
+        lines.append(f"  init from     {config.init_from} (weights only)")
+    return lines
 
 
 def _final_report(history: List[dict]) -> None:
@@ -2987,7 +3203,9 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
              override: Sequence[str] = (),
              placement: Optional[str] = None,
              jitter: float = 0.0, drop: float = 0.0,
-             predictions: Optional[str] = None) -> Dict[str, float]:
+             predictions: Optional[str] = None,
+             remesh: Optional[Sequence[float]] = None,
+             remesh_jitter: float = 0.0) -> Dict[str, float]:
     """
     Score a saved checkpoint on a held-out split: the rotations stage two fits
     from its embedding matches, their four geometric scores, and -- with
@@ -3025,6 +3243,14 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
     inputs'; the assembly scores apply the predicted poses to the clean
     fragments. The draws are tied to each scene and ``config.seed``.
 
+    ``remesh`` (``LOW, HIGH``) scores every scene with each piece remeshed on
+    its own, as training does with ``--remesh`` (:mod:`reassembly.data.remesh`),
+    and ``remesh_jitter`` adds its noise: breaks whose sides no longer share
+    their vertices, on the geometry the scenes have. The draws are fixed per
+    scene and ``config.seed``; the assembly is scored on the remeshed pieces.
+    A checkpoint's own ``--remesh``, the training augmentation, never applies
+    here.
+
     ``predictions``, a folder: every scored scene's prediction is written too,
     in ``scripts/dump_prediction.py``'s format, into one zip there --
     ``<folder>/<subsets>-<split>.zip`` holding
@@ -3052,17 +3278,27 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
     per-fragment numbers figures need (``scripts/make_figures.py``) -- and the
     printed report as ``<split>_report.txt``. ``placement="global"`` adds
     ``_global`` to both names, and noise its settings:
-    ``<split>_metrics_jitter0.01_drop0.5.json``.
+    ``<split>_metrics_jitter0.01_drop0.5.json``; remeshing adds
+    ``_remesh0.5-0.9`` (and ``j0.001`` for its jitter).
     """
     import torch
 
     from .assembly import check_placement, mean_over_scenes, score_batch
+    from .data.remesh import Remesh, check_remesh
     from .evaluation.noise import check_noise, jitter_inputs, noise_suffix
 
     if split not in EVALUATION_SPLITS:
         raise ValueError(f"split must be one of {EVALUATION_SPLITS}, got {split!r}")
     placement = check_placement(placement)
     check_noise(jitter, drop)
+    spec = None
+    if remesh is not None:
+        if len(remesh) != 2:
+            raise ValueError(f"remesh is two numbers, LOW HIGH, got {remesh!r}")
+        check_remesh(float(remesh[0]), float(remesh[1]), remesh_jitter)
+        spec = Remesh(float(remesh[0]), float(remesh[1]), float(remesh_jitter))
+    elif remesh_jitter:
+        raise ValueError("remesh_jitter applies to remeshed pieces: give remesh LOW HIGH")
     if predictions and not assemble:
         raise ValueError("predictions are placed scenes: they need the assembly, so not "
                          "with --no_assemble")
@@ -3071,11 +3307,14 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
         checkpoint, config, device, data_from_checkpoint=data_from_checkpoint,
         override=override)
 
-    dataset = BreakingBadScenes(config, split, epoch_seed=0)
+    dataset = BreakingBadScenes(config, split, epoch_seed=0, remesh=spec)
+    if spec is None:
+        dataset.remesh = None            # a --split train evaluation: as stored
     loader = _loader(dataset, config, False, 0, 1, 0,
                      pairs_in_worker=not device.startswith("cuda"))
     scenes: List[Dict] = []
-    suffix = ("" if placement == "checked" else f"_{placement}") + noise_suffix(jitter, drop)
+    suffix = (("" if placement == "checked" else f"_{placement}") + noise_suffix(jitter, drop)
+              + _remesh_suffix(spec))
     writer = None
     if predictions:
         subsets = "+".join(config.subsets) if config.subsets else "all-subsets"
@@ -3115,6 +3354,8 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
     summary["placement"] = placement
     if jitter or drop:
         summary["noise"] = {"jitter": jitter, "drop": drop}
+    if spec is not None:
+        summary["remesh"] = {"low": spec.low, "high": spec.high, "jitter": spec.jitter}
     # What was scored, and with what: the report's header, kept in the file so
     # a report rebuilt from it (scripts/report_metrics.py) reads the same.
     summary["evaluation"] = {
@@ -3188,7 +3429,7 @@ class _PredictionWriter:
         fragment_ptr = batch.fragment_ptr.tolist()
         for scene, (key, score) in enumerate(zip(batch.scene_keys, scores)):
             index = self.index.get(key)
-            meshes = self.dataset.meshes(index) if index is not None else []
+            meshes = self.dataset.pieces(index) if index is not None else []
             f0, f1 = fragment_ptr[scene], fragment_ptr[scene + 1]
             if len(meshes) != f1 - f0:
                 self.skipped.append(key)
@@ -3283,6 +3524,8 @@ def format_evaluation(summary: Dict) -> str:
                      + (f" -- {shown}" if shown else "") + (f"; +{more} more" if more > 0 else ""))
     if summary.get("noise"):
         lines.append(_noise_line(summary["noise"]))
+    if summary.get("remesh"):
+        lines.append(_remesh_line(summary["remesh"]))
     if summary.get("rotation_head", True):
         lines.append("  (written before v7 removed the rotation head: the four terms below "
                      "were its losses)")
@@ -3467,7 +3710,8 @@ def _adopt_checkpoint_settings(config: Config, stored: Dict, data: bool,
     import dataclasses
 
     names = {field.name for field in dataclasses.fields(Config)}
-    keys = _ARCHITECTURE + (tuple(k for k in _DATA if k not in override) if data else ())
+    keys = _ARCHITECTURE + (tuple(k for k in _DATA if k not in override
+                                  and k not in _TRAINING_ONLY) if data else ())
     changes = {key: stored[key] for key in keys
                if key in stored and key in names and _differs(stored[key], getattr(config, key))}
     for key, value in changes.items():
@@ -3534,6 +3778,21 @@ def _noise_line(noise: Dict[str, float]) -> str:
                      f"of the matching")
     parts.append("the assembly is scored on the clean fragments")
     return "  perturbed inputs  " + indent.join(parts)
+
+
+def _remesh_suffix(spec) -> str:
+    """``_remesh0.5-0.9`` (``j0.001`` for a jitter) for output file names; empty without."""
+    if spec is None:
+        return ""
+    return f"_remesh{spec.low:g}-{spec.high:g}" + (f"j{spec.jitter:g}" if spec.jitter else "")
+
+
+def _remesh_line(remesh: Dict[str, float]) -> str:
+    """The report's line for an evaluation on remeshed scenes."""
+    return (f"  remeshed          each piece on its own, {remesh['low']:.0%}-{remesh['high']:.0%} "
+            f"of its faces kept" + (f", jitter {remesh['jitter']:g}" if remesh.get("jitter") else "")
+            + "\n                    (data/remesh.py): the breaks no longer share their "
+              "vertices; scored on the remeshed pieces")
 
 
 _PLACEMENT_LINES = {
@@ -4108,7 +4367,9 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
         problems.append(f"loss at init: {complaint}")
     if "embedding" not in report:
         problems.append("no embedding term -- these scenes produced no "
-                        "coincidence clusters, so there is nothing to train on "
+                        + ("vertex within --contact_radius of another piece's"
+                           if config.contact_radius > 0 else "coincidence clusters")
+                        + ", so there is nothing to train on "
                         "and stage two has nothing to match on")
 
     # -- 7. speed ----------------------------------------------------------

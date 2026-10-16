@@ -262,6 +262,27 @@ MARKERS = [
      "def write_scene("),
     ("conversion tests", "tests/test_external.py",
      "def test_the_script_converts_and_the_model_evaluates_the_result"),
+    # -- Thesis v7: breaks whose two sides do not share their vertices -----------
+    ("the embedding term's positives by distance", "src/reassembly/nn/losses.py",
+     "def proximity_loss("),
+    ("which vertices another piece touches", "src/reassembly/mesh/correspondence.py",
+     "def contact_vertices("),
+    ("each training piece remeshed on its own", "src/reassembly/data/remesh.py",
+     "def remesh_pieces("),
+    ("the contact mask carried into the batch", "src/reassembly/data/features.py",
+     "contact=None if contacts is None else cat(contacts, torch.bool)"),
+    ("the term trained on the contact vertices", "src/reassembly/training.py",
+     "near = dict(positions=batch.target_vertices[chosen] * batch.unit[fragment, None]"),
+    ("a new run from another run's weights (--init_from)", "src/reassembly/training.py",
+     "def _start_from("),
+    ("an evaluation remeshed only when asked", "src/reassembly/training.py",
+     '_TRAINING_ONLY = ("remesh", "remesh_jitter")'),
+    ("--remesh LOW HIGH on the command line", "scripts/config_flags.py",
+     'elif name == "remesh":'),
+    ("dumps hold the pieces as the model saw them", "scripts/dump_prediction.py",
+     "meshes = dataset.pieces(index)"),
+    ("contact tests", "tests/test_contact.py",
+     "def test_the_model_learns_breaks_that_share_no_vertex"),
 ]
 
 

@@ -64,7 +64,7 @@ def dump(dataset, index, model, config, device, seed: int, out: Path,
         raise ValueError(f"rotations {rotations!r}: since v7 every rotation is fitted from "
                          f"the embedding matches, so only 'matched' exists")
     method = check_placement(placement)
-    meshes = dataset.meshes(index)
+    meshes = dataset.pieces(index)          # remeshed when the dataset remeshes
     count = len(meshes)
     if seed >= 0:
         scatter = random_rotations(count, np.random.default_rng(seed))

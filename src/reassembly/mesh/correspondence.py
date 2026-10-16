@@ -155,6 +155,30 @@ def find_shared_points(
     return clusters
 
 
+def contact_vertices(points_list: Sequence[np.ndarray], radius: float) -> List[np.ndarray]:
+    """
+    Per fragment, whether a vertex of ANOTHER fragment lies within ``radius``
+    of each vertex -- the anchors of the distance-based embedding term
+    (:func:`reassembly.nn.losses.proximity_loss`), whose positives are exactly
+    these pairs. The fragments must be in one frame, the assembled pose, as for
+    :func:`find_shared_points`; coincident vertices are within any radius.
+    """
+    sizes = [len(np.asarray(p)) for p in points_list]
+    if len(sizes) < 2 or sum(sizes) == 0 or radius <= 0:
+        return [np.zeros(s, dtype=bool) for s in sizes]
+    coords = np.concatenate(
+        [np.asarray(p, dtype=np.float64).reshape(-1, 3) for p in points_list], axis=0)
+    owner = np.repeat(np.arange(len(sizes), dtype=np.int64), sizes)
+    touching = np.zeros(len(coords), dtype=bool)
+    pairs = cKDTree(coords).query_pairs(r=radius, output_type="ndarray")
+    if pairs.size:
+        a, b = pairs[:, 0], pairs[:, 1]
+        cross = owner[a] != owner[b]
+        touching[a[cross]] = True
+        touching[b[cross]] = True
+    return list(np.split(touching, np.cumsum(sizes)[:-1]))
+
+
 def _cluster_ids(clusters, sizes) -> List[np.ndarray]:
     out = [np.full(int(s), -1, dtype=np.int64) for s in sizes]
     for cid, members in enumerate(clusters):

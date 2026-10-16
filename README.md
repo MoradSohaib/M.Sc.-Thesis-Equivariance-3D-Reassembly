@@ -131,7 +131,7 @@ tests still pass and the network tests skip.
 git clone <this-repo> && cd <this-repo>
 python -m venv .venv && source .venv/bin/activate      # Windows: .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-python -m pytest                                        # 564 passed
+python -m pytest                                        # 588 passed
 ```
 
 Installing is optional — `pytest.ini` sets `pythonpath = src .` and each script
@@ -257,7 +257,7 @@ src/reassembly/
 │   ├── fracture.py            ★   fracture-surface extraction, both methods
 │   ├── orientation.py             canonical edge face-normal ordering
 │   ├── patches.py                 fracture-surface patches for cross-attention
-│   ├── correspondence.py          cross-fragment coincidence matching
+│   ├── correspondence.py          cross-fragment coincidence matching; contact within a radius
 │   ├── clean.py                   other datasets' pieces as one closed surface each
 │   ├── decimate.py                thinned to the training density, one budget per object
 │   └── shell.py                   ray-cast visibility (unused; kept for figures)
@@ -267,6 +267,7 @@ src/reassembly/
 │   ├── sampling.py                weighted + distributed + reproducible sampler
 │   ├── scene.py                   SceneReader — caches the intact mesh across modes; write_scene
 │   ├── external.py                Fractura (GARF's HDF5) and Fantastic Breaks, read and prepared
+│   ├── remesh.py                  each training piece remeshed on its own: breaks that share no vertex
 │   ├── transforms.py              SE(3) perturbation, centring, normalisation
 │   └── features.py                meshes → tensors, and the batch collate
 ├── training.py                 ★  config, dataset, loops, checkpoints, metrics
@@ -312,7 +313,7 @@ scripts/
 ├── tune_sharp_threshold.py        pick --sharp-threshold by F1
 └── visualize.py                   render or describe one scene
 
-tests/                             564 tests
+tests/                             588 tests
 ```
 
 Only `reassembly` is packaged; `scripts/` and `tests/` are entry points and
@@ -366,6 +367,7 @@ Thesis 1's meaning, so one set of habits drives both:
 | `--placement checked\|global` | this version's (below): with `--evaluate`, place the pieces from the verified pair fits (default) or by v6's single solve |
 | `--jitter`, `--drop` | this version's (below): with `--evaluate`, noise on every input vertex and a share of the break vertices left out of the matching, so no two sides of a break coincide (off by default) |
 | `--split all`, `--predictions DIR` | this version's (below): with `--evaluate`, every object of the subsets whatever its split; and every scene's prediction, zipped |
+| `--contact_radius`, `--remesh`, `--init_from` | this version's (below): for breaks that share no vertex, the embedding term's positives by distance, each training piece remeshed on its own, a new run from another run's weights (all off by default) |
 
 Settings only this project has keep their own names in the same style
 (`--tokens_per_scene`, `--modes_per_scene`, `--max_objects`, `--schedule`, ...);
@@ -887,7 +889,64 @@ Thinning moved no kept vertex more than half a target edge from an original
 vertex on the seven real objects, and the object's size by at most 0.21%.
 Where pieces share no vertex — real scans — there is no embedding loss to
 report and every match rests on the embeddings alone, so the Breaking Bad run
-to set beside them is `--jitter/--drop`'s, not the clean one.
+to set beside them is `--jitter/--drop`'s, not the clean one. (A checkpoint
+trained with `--contact_radius`, below, reports its term there too.)
+
+### Breaks that share no vertex: training for scans (`--contact_radius`, `--remesh`, `--init_from`)
+
+v7's embedding term (`correspondence_loss`) has one positive per vertex, its
+exact twin across the break, and every other break vertex is a negative — the
+one an edge away included. Scanned pieces are meshed each on its own and share
+no vertex, and a checkpoint trained that way matches them at chance: on
+`bone_real`, `fractura_real` and Fantastic Breaks, 0 to 3 of a scene's 221 to
+545 matches end in a verified fit; Fractura's synthetic bones with each piece
+thinned on its own fell from part accuracy 0.659 to 0.047 (29 scenes); Breaking
+Bad's validation scenes under `--jitter 0.01 --drop 0.5` from acc@5 0.740 to
+0.164.
+
+Three settings, off by default, train for that:
+
+- `--contact_radius R`: the term's positives are the vertices of *other* pieces
+  within `R` in the assembled pose, in world units (an object's largest side is
+  1). Out to `--contact_band B` radii (default 2) a vertex that is not a
+  positive is neither a positive nor a negative, and only vertices with a
+  positive are anchors (`proximity_loss` in `nn/losses.py`, the anchors from
+  `contact_vertices` in `mesh/correspondence.py`). 0 is v7's term; 0.015 is
+  about one Breaking Bad median edge (0.0162 over 200 scenes).
+- `--remesh LOW HIGH`: each piece of every *training* scene is remeshed on its
+  own whenever it is loaded — quadric edge collapse keeping a share of its
+  faces drawn from `[LOW, HIGH]` (`data/remesh.py`) — and `--remesh_jitter S`
+  then moves every vertex by Gaussian noise of `S`, so no vertex is left where
+  its twin was. Validation is never remeshed by it. Needs `fast-simplification`.
+- `--init_from CHECKPOINT`: a new run starts from that checkpoint's weights;
+  the optimizer, the schedule, the epochs and the history start fresh. The
+  architecture flags must be the checkpoint's (a mismatch is refused, naming
+  the flags to pass). A run that finds its own `last.pt` resumes from it and
+  ignores `--init_from`, so an interrupted run continues where it stopped.
+
+Measured on seven Breaking Bad scenes, three draws each, at `--remesh 0.5 0.9
+--remesh_jitter 0.001`: no vertex is left where its twin was (18–46% are,
+without the jitter); the median edge grows ×1.18–1.48; a scene takes 22–102 ms;
+a vertex of another piece within 0.015 finds 96–100% of each scene's break, and
+66–96% of the vertices it finds lie on it. On slabs whose breaks share no
+vertex but their corners (`tests/test_contact.py`), a model trained on this
+term places 8 of 9 scored pieces within 5°; on v7's term, 2 of 9.
+
+```bash
+pip install fast-simplification
+python -m scripts.train --root_dir data --checkpoint_dir checkpoint-contact --init_from checkpoint-final/best.pt --hidden_channels 128 --contact_radius 0.015 --remesh 0.5 0.9 --remesh_jitter 0.001
+python -m scripts.train --root_dir data --evaluate --checkpoint checkpoint-contact/best.pt --split val --remesh 0.5 0.9 --remesh_jitter 0.001
+python -m scripts.train --root_dir external --evaluate --checkpoint checkpoint-contact/best.pt --data_subsets bone_real --split all --modes_per_scene 0 --max_fragments 0 --checkpoint_dir eval/contact-bone_real
+```
+
+The first line takes the run's other usual flags as well. `--evaluate --remesh
+LOW HIGH [--remesh_jitter S]` scores the scenes remeshed that way — fixed per
+scene and `--seed`; the assembly scored, and dumped, on the remeshed pieces —
+and the files carry it: `val_metrics_remesh0.5-0.9j0.001.json`. A checkpoint's
+own `--remesh` never applies to an evaluation. Training refuses
+`--remesh_jitter` without `--contact_radius` (no vertex would coincide, and
+coincidence is all v7's term reads) and `--remesh` with `--label_method
+coincidence`.
 
 ### Reports and figures from saved results
 

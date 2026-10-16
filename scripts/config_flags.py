@@ -84,6 +84,21 @@ HELP = {
                    "training line reports the four geometric scores too "
                    "(slower: it matches every training scene); validation "
                    "always scores",
+    "contact_radius": "the embedding term's positives by distance: the vertices of "
+                      "other pieces within this distance in the assembled pose, in "
+                      "world units (an object's largest side is 1); 0 = the "
+                      "coincident vertices, v7's exact twins",
+    "contact_band": "with --contact_radius: out to this many radii, a vertex that "
+                    "is not a positive is neither a positive nor a negative",
+    "remesh": "remesh each TRAINING piece on its own whenever it is loaded, "
+              "keeping a share of its faces drawn from [LOW, HIGH], so the two "
+              "sides of a break no longer share their vertices; with --evaluate, "
+              "score remeshed scenes. Needs fast-simplification",
+    "remesh_jitter": "with --remesh: Gaussian noise of this standard deviation on "
+                     "every vertex after remeshing, in world units",
+    "init_from": "start a NEW run from this checkpoint's weights (fine-tuning): the "
+                 "optimizer, the schedule and the history start fresh; ignored when "
+                 "the run resumes from its own checkpoint",
 }
 
 # Config fields that only the converted flags below set.
@@ -182,6 +197,9 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         elif name == "subsets":
             parser.add_argument(option, dest=name, nargs="+", default=None,
                                 metavar=metavar, help=text)
+        elif name == "remesh":
+            parser.add_argument(option, dest=name, nargs=2, type=float, default=None,
+                                metavar=("LOW", "HIGH"), help=text + "; default off")
         elif name in CHOICES:
             parser.add_argument(option, dest=name, choices=CHOICES[name], default=None,
                                 help=(text + "; " if text else "") + f"default {current}")
@@ -190,7 +208,8 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
                                 help=(text + "; " if text else "") + f"default {current}")
         elif isinstance(current, float):
             parser.add_argument(option, dest=name, type=float, default=None,
-                                metavar=metavar, help=f"default {current}")
+                                metavar=metavar,
+                                help=(text + "; " if text else "") + f"default {current}")
         else:
             parser.add_argument(option, dest=name, type=str, default=None, metavar=metavar,
                                 help=(text + "; " if text else "") + f"default {current!r}")

@@ -6,6 +6,9 @@ Train, resume, or evaluate the V-GAT reassembly model.
     python -m scripts.train --root_dir ... --evaluate          # score best.pt, assembled
     python -m scripts.train --root_dir ... --evaluate --placement global   # v6's placement
     python -m scripts.train --root_dir ... --evaluate --jitter 0.01 --drop 0.5   # no shared break vertices
+    python -m scripts.train --root_dir ... --evaluate --remesh 0.5 0.9 --remesh_jitter 0.001   # each piece remeshed on its own
+    python -m scripts.train --root_dir ... --init_from path/to/best.pt --contact_radius 0.015 \\
+        --remesh 0.5 0.9 --remesh_jitter 0.001   # fine-tune for breaks that do not share their vertices
     python -m scripts.train --root_dir ... --evaluate --data_subsets artifact_compressed --split all \\
         --modes_per_scene 0 --predictions predictions   # a whole unseen subset, every prediction zipped
     python -m scripts.train --root_dir ... --num_gpus 2        # both GPUs (the default: all)
@@ -214,11 +217,14 @@ def main() -> None:
         # trained with.
         override = tuple(name for name in ("max_fragments", "min_fragments", "subsets")
                          if getattr(args, name) is not None)
+        # --remesh with --evaluate scores remeshed scenes; a checkpoint's own
+        # --remesh, the training augmentation, never applies to an evaluation.
         evaluate(config, checkpoint=args.checkpoint, split=args.split,
                  assemble=args.assemble, collision=args.collision,
                  data_from_checkpoint=not args.data_from_flags, override=override,
                  placement=args.placement, jitter=args.jitter, drop=args.drop,
-                 predictions=args.predictions or None)
+                 predictions=args.predictions or None,
+                 remesh=args.remesh, remesh_jitter=args.remesh_jitter or 0.0)
     else:
         # Not Config fields: the token must not reach a checkpoint, and the
         # checkpoints are what gets uploaded.

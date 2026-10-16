@@ -3,10 +3,12 @@ The training loss, the four geometric scores, and the reference values every
 one of them is checked against.
 
 Since v7 the network is trained on one term: the contrastive embedding term
-(:func:`correspondence_loss`). The four geometric terms -- rotation, position,
-normal, face -- are *scores*: they measure the rotations stage two fits from
-the embedding matches (``assembly/rotation.py``), are computed without a
-gradient, and never enter the total. :class:`ReassemblyLoss` returns both.
+(:func:`correspondence_loss`; :func:`proximity_loss` with ``--contact_radius``,
+for breaks whose two sides do not share their vertices). The four geometric
+terms -- rotation, position, normal, face -- are *scores*: they measure the
+rotations stage two fits from the embedding matches (``assembly/rotation.py``),
+are computed without a gradient, and never enter the total.
+:class:`ReassemblyLoss` returns both.
 
 A geometric term that is silently wrong still reads like a number. The defence
 is to know what each reads at chance, when the rotation is random, and to
@@ -388,6 +390,83 @@ def correspondence_loss(
     return loss, accuracy
 
 
+def proximity_loss(
+    embeddings: Tensor,
+    positions: Tensor,
+    groups: Tensor,
+    scenes: Tensor,
+    radius: float,
+    band: float = 2.0,
+    temperature: float = 0.1,
+    max_anchors: int = 1024,
+    generator: Optional[torch.Generator] = None,
+    return_accuracy: bool = False,
+):
+    """
+    InfoNCE with the positives by distance -- for breaks whose two sides do
+    not share their vertices.
+
+    ``positions`` are the anchors' coordinates in the assembled pose, in world
+    units; ``groups`` their fragment and ``scenes`` their scene. An anchor's
+    positives are the vertices of OTHER fragments of its scene within
+    ``radius``; every other vertex of its scene within ``band * radius`` --
+    the other side's just beyond the radius, the anchor's own neighbours -- is
+    neither a positive nor a negative; every other anchor is a negative::
+
+        L = -mean_i  log[ sum_{p in pos(i)} exp(s_ip / T)
+                          / sum_{k not in ign(i), k != i} exp(s_ik / T) ]
+
+    :func:`correspondence_loss` is the case of exact twins: one positive, the
+    vertex at the same place, and the vertex an edge away a negative, so the
+    embedding learns to name single vertices -- which scanned pieces, meshed
+    each on its own, do not share. Here a vertex has to match what lies within
+    ``radius`` across the break and is not pushed away from what lies just
+    beyond it, so the embedding is asked for the scale of the band, not of one
+    vertex.
+
+    Anchors are subsampled to ``max_anchors`` as there, and an anchor none of
+    whose positives was drawn is left out. With ``return_accuracy``, also the
+    share of anchors whose nearest neighbour in embedding space, the ignored
+    ones excluded, is a positive -- stage two's question, read as ``match@1``.
+    """
+    empty = embeddings.new_zeros(())
+    count = embeddings.shape[0]
+    if count < 2:
+        return (empty, empty) if return_accuracy else empty
+    index = torch.arange(count, device=embeddings.device)
+    if count > max_anchors:
+        index = torch.randperm(count, device=embeddings.device,
+                               generator=generator)[:max_anchors]
+
+    with torch.no_grad():
+        where = positions[index].to(torch.float64)
+        distance = (where[:, None, :] - where[None, :, :]).norm(dim=-1)
+        group, scene = groups[index], scenes[index]
+        identity = torch.eye(len(index), dtype=torch.bool, device=embeddings.device)
+        same_scene = scene[:, None] == scene[None, :]
+        positive = (same_scene & (group[:, None] != group[None, :])
+                    & (distance <= radius) & ~identity)
+        excluded = identity | (same_scene & (distance <= band * radius) & ~positive)
+        keep = positive.any(dim=1)
+    if not bool(keep.any()):
+        return (empty, empty) if return_accuracy else empty
+
+    z = torch.nn.functional.normalize(embeddings[index], dim=-1)
+    similarity = (z @ z.t()) / temperature
+    candidates = similarity.masked_fill(excluded, float("-inf"))
+    denominator = torch.logsumexp(candidates, dim=1)
+    numerator = torch.logsumexp(similarity.masked_fill(~positive, float("-inf")), dim=1)
+    loss = (denominator - numerator)[keep].mean()
+    if not return_accuracy:
+        return loss
+
+    with torch.no_grad():
+        nearest = candidates.argmax(dim=1)
+        hit = positive[torch.arange(len(index), device=z.device), nearest]
+        accuracy = hit[keep].to(loss.dtype).mean()
+    return loss, accuracy
+
+
 SCORE_TERMS = ("rotation", "position", "normal", "face")
 """The four geometric terms: scores of a rotation, never trained on (since v7)."""
 
@@ -406,15 +485,21 @@ class ReassemblyLoss(torch.nn.Module):
     that is random relative to its true one.
 
     ``embedding`` scales the one term that is trained; it is 1.0 and there is
-    nothing to balance it against.
+    nothing to balance it against. ``contact_radius`` above 0 makes that term
+    :func:`proximity_loss` -- positives by distance, within the radius, with
+    ``contact_band`` radii neither positive nor negative -- whenever the batch
+    supplies the anchors' positions; 0 keeps :func:`correspondence_loss`.
     """
 
     def __init__(self, embedding: float = 1.0, temperature: float = 0.1,
-                 max_anchors: int = 1024) -> None:
+                 max_anchors: int = 1024, contact_radius: float = 0.0,
+                 contact_band: float = 2.0) -> None:
         super().__init__()
         self.weights = {"embedding": embedding}
         self.temperature = temperature
         self.max_anchors = max_anchors
+        self.contact_radius = contact_radius
+        self.contact_band = contact_band
 
     def forward(
         self,
@@ -432,14 +517,17 @@ class ReassemblyLoss(torch.nn.Module):
         embeddings: Optional[Tensor] = None,
         cluster: Optional[Tensor] = None,
         num_clusters: int = 0,
+        positions: Optional[Tensor] = None,
+        groups: Optional[Tensor] = None,
+        scenes: Optional[Tensor] = None,
         keep: Optional[Tensor] = None,
         return_fragments: bool = False,
     ):
         """
         ``(total, report)``: the trained total -- the embedding term times its
         weight, or a constant 0 with no gradient when the batch has no
-        coincidence cluster to train on -- and every term as a float, the
-        scores included.
+        coincidence cluster to train on (with ``contact_radius``, no vertex in
+        contact) -- and every term as a float, the scores included.
 
         The scores need ``predicted_rotation`` and ``target_rotation``, and
         each of the other three its own pair of inputs; a term whose inputs
@@ -454,6 +542,11 @@ class ReassemblyLoss(torch.nn.Module):
         breakdowns by category. Per fragment needs the segment index of the
         term (``vertex_batch``, ``edge_batch``); without it the term is left
         out of the per-fragment values.
+
+        ``positions``, ``groups`` and ``scenes`` -- the anchors' assembled
+        coordinates, fragments and scenes -- make the embedding term
+        :func:`proximity_loss` (with ``contact_radius`` set); ``cluster`` and
+        ``num_clusters`` make it :func:`correspondence_loss`.
         """
         terms, fragments = {}, {}
         with torch.no_grad():
@@ -495,7 +588,15 @@ class ReassemblyLoss(torch.nn.Module):
 
         match_top1 = None
         total = None
-        if embeddings is not None and cluster is not None:
+        if embeddings is not None and positions is not None and self.contact_radius > 0:
+            embedding, match_top1 = proximity_loss(
+                embeddings, positions, groups, scenes, self.contact_radius,
+                band=self.contact_band, temperature=self.temperature,
+                max_anchors=self.max_anchors, return_accuracy=True,
+            )
+            terms["embedding"] = embedding
+            total = self.weights["embedding"] * embedding
+        elif embeddings is not None and cluster is not None:
             embedding, match_top1 = correspondence_loss(
                 embeddings, cluster, num_clusters,
                 temperature=self.temperature, max_anchors=self.max_anchors,

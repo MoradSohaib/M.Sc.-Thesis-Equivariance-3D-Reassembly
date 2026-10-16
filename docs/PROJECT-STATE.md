@@ -11,7 +11,7 @@ implementing anything from it.
 
 | | |
 |---|---|
-| Pipeline | **built** — 564 tests, clean under `-W error` |
+| Pipeline | **built** — 588 tests, clean under `-W error` |
 | Dataset pass | 1,096,825 fragments across 1,442 objects |
 | Fracture surface | 10.6% of vertices, dataset-wide |
 | Model | **built and verified** — equivariance checked numerically in float64 |
@@ -31,6 +31,7 @@ implementing anything from it.
 | Thesis v7, no head | the rotation head removed: trained on the embedding term alone, every rotation fitted from the matches, the four geometric terms scores only, `best.pt` on validation acc@5; `--split all`, `--predictions` — see §18 |
 | Above the benchmark range | `--min_fragments 21 --max_fragments 0` scores the patterns 2–20 leaves out; the two runs score every pattern once — see §19 |
 | Other datasets | Fractura and Fantastic Breaks converted into Breaking Bad's layout — cleaned, scaled, thinned to the training density unless the pieces share their breaks — and evaluated unchanged — see §20 |
+| Breaks that share no vertex | the embedding term's positives by distance (`--contact_radius`), each training piece remeshed on its own (`--remesh`), a new run from a checkpoint's weights (`--init_from`), `--evaluate --remesh`; not yet trained — see §21 |
 
 ---
 
@@ -1454,3 +1455,115 @@ decimal), and the embedding term is 0.0000, as on `bone_real`.
 
 **Next.** Breaking Bad's `--jitter/--drop` run beside the scanned sets, whose
 pieces share no break vertex.
+
+## 21 · Thesis v7 — breaks whose two sides do not share their vertices (Oct 2026)
+
+**Why.** v7 places Breaking Bad's pieces and Fractura's synthetic bones, and
+none of the scanned sets. Measured before any change:
+
+- The trained term, `correspondence_loss`, is InfoNCE over the coincidence
+  clusters `find_shared_points` finds (1e-5): one positive per vertex, its
+  exact twin across the break, and every other break vertex a negative — the
+  one an edge away included. What it teaches is to name single vertices.
+- Scanned pieces share no vertex. On the converted meshes the model saw, the
+  median gap to the nearest vertex of another piece (among vertices within 0.02
+  of one) is 0.0095 on `bone_real`, 0.0111 on `fractura_real` and 0.0055 on
+  Fantastic Breaks, against Breaking Bad's median edge of 0.0162; none
+  coincides.
+- Take the twins away and the model fails on Breaking Bad's own geometry: the
+  29 synthetic scenes the first conversion thinned piece by piece fell from part
+  accuracy 0.659 to 0.047, and Everyday's validation scenes (2+ pieces) under
+  `--jitter 0.01 --drop 0.5` went from 29.41° to 87.74°, acc@5 0.740 to 0.164,
+  reached 77.8% to 33.6%. On the scanned sets 0 to 3 of a scene's 221 to 545
+  matches end in a verified fit; after §20's fix `fractura_real` is at part
+  accuracy 0.000 (129.57°), and the embedding term reads 0.0000 there because
+  nothing coincides.
+- GARF, the reference (zero-shot on Fantastic Breaks: 10.62°, part accuracy
+  91.00%), samples its points on each fragment on its own (Poisson disk), so
+  the two sides of a break never share a point in its training either.
+
+**What changed.** Everything is off by default; with it off, v7 trains,
+evaluates and resumes as before.
+
+- `nn/losses.py`: `proximity_loss`, InfoNCE whose positives are the vertices
+  of other pieces of the same scene within `radius` in the assembled pose, in
+  world units; every other vertex of the scene within `band × radius` — the
+  other side just beyond the radius, the anchor's own neighbours — is neither a
+  positive nor a negative. Anchors are subsampled as in `correspondence_loss`,
+  and one whose positives all fell outside the sample is left out; match@1 is
+  the share whose nearest candidate is a positive. With exact twins, a radius
+  below their spacing and a band of 1 it is `correspondence_loss` (tested).
+  `ReassemblyLoss(contact_radius, contact_band)` takes it whenever the batch
+  supplies the anchors' positions.
+- `mesh/correspondence.py`: `contact_vertices`, per piece, the vertices with
+  another piece's vertex within the radius — the anchors. The loader computes
+  them on the CPU in the assembled frame (`BreakingBadScenes.contact`); they
+  travel as `SceneSample.contact` and `Batch.contact`.
+- `training.py`, `_forward`: with `--contact_radius`, the anchors' positions
+  are `target_vertices × unit + centroid` (world units), their groups the
+  batch's fragment numbers and their scenes its scene numbers. A batch with no
+  vertex in contact has no term, as one with no cluster.
+- `data/remesh.py`: `remesh_pieces` draws each piece's share of faces from
+  `[low, high]` first, collapses it (quadric edge collapse, `mesh/decimate.py`),
+  tidies the result as the converter does (`clean_piece`: vertices merged,
+  collapsed and repeated faces removed, every component kept, the winding
+  kept), then adds the jitter. `--remesh LOW HIGH` and `--remesh_jitter S`
+  apply it to the training split only, whenever a scene is loaded, per scene,
+  epoch and seed (`_remeshed`); `pieces(i)` gives the meshes as the model got
+  them, for the dumps.
+- `--init_from CHECKPOINT`: `_start_from` loads the weights alone into a new
+  run — a folder means its `best.pt`, else its `last.pt` — refusing an
+  architecture that differs (naming the flags) and leaving a pre-v7 head
+  behind. A run that resumes from its own checkpoint ignores it, and the
+  first epoch's check against chance is skipped after it.
+- `--evaluate --remesh LOW HIGH [--remesh_jitter S]` scores remeshed scenes
+  (`_remesh0.5-0.9j0.001` in the file names, a report line,
+  `summary["remesh"]`); the writer and `scripts/dump_prediction.py` dump the
+  remeshed pieces. `remesh` and `remesh_jitter` are data settings of the
+  training split only (`_TRAINING_ONLY`): an evaluation never takes them from
+  its checkpoint.
+- Refused: `--remesh_jitter` without `--contact_radius` (training: nothing
+  would coincide, and coincidence is all v7's term reads); `--remesh` with
+  `--label_method coincidence` (it finds a break by its coincident vertices);
+  shares outside `0 < LOW <= HIGH <= 1`; `--contact_band` below 1.
+- Kept: the coincidence clusters are still computed, so `probe_val`'s contact
+  matrix reads as before.
+
+**Measured** — `remesh_pieces` on seven Breaking Bad scenes (8,924–31,792
+faces, 3–50 pieces), three draws each, at `0.5 0.9` and jitter 0.001:
+
+| | |
+|---|---|
+| coincident vertices left | none (18–46% without the jitter) |
+| median edge | ×1.18–1.48 |
+| time a scene | 22–102 ms |
+| within 0.015 of another piece: share of the break found / share found on it | 96–100% / 66–96% |
+| within 0.01 | 91–100% / 74–97% |
+
+The break is carried over: a remeshed vertex is on it when its nearest original
+vertex of its own piece had a twin. On those scenes' 96 pieces the raw collapse
+left no degenerate face, but 436 vertex pairs within 1e-6 of a piece's
+diagonal (1e-8 to 1.3e-6 apart), which the tidy merges (868 faces dropped); no
+piece was wound inward, before or after.
+
+On slabs whose breaks share no vertex but their four corners — six stacks of
+two or three, sampled on 9 × 9 and 10 × 10 grids by turns, the nearest vertex
+across a break about 0.085 away on grids 0.22–0.25 apart — a model fitted for
+120 epochs on the distance-based term (radius 0.15, band 2) placed 8 of the 9
+scored pieces within 5° (mean 20.8°; untrained 146.4°). On v7's term the same
+run matched the corner twins (match@1 0.89) and left 7 of the 9 wrong (96.8°).
+That run is `test_the_model_learns_breaks_that_share_no_vertex`.
+
+**Verified.** 588 tests (564 before; `tests/test_contact.py`, 24), clean
+under `-W error`; each of 49 mutations of the new code fails a test; 128
+version markers.
+
+**Not yet measured.** No network has been trained with these settings: the
+numbers above are of the data and of a toy, not of a result on the scanned
+sets. The radius, band and range were set from these measurements, not tuned
+on a run.
+
+**Next.** Fine-tune from `checkpoint-final/best.pt` with `--contact_radius
+0.015 --remesh 0.5 0.9 --remesh_jitter 0.001`; score it on Everyday's
+validation scenes as stored and remeshed, on `bone_synthetic`, and on
+`bone_real`, `fractura_real` and Fantastic Breaks.

@@ -115,6 +115,11 @@ class SceneSample(NamedTuple):
     key: str = ""
     """``<object>/<mode>`` -- so a batch that fails can say which scenes were in it."""
     repairs: Repairs = Repairs()
+    contact: Optional[np.ndarray] = None
+    """``(sum V,)`` bool: a vertex of another fragment lies within the contact
+    radius, in the assembled pose -- the anchors of the distance-based
+    embedding term (``nn/losses.py``, ``proximity_loss``); ``None`` when that
+    term is not used."""
 
 
 def _scene_token_sets(vertices, faces, masks, *, mode, metric, total, max_per_fragment):
@@ -207,14 +212,17 @@ def build_scene(
     category: str = "",
     key: str = "",
     perturb: bool = True,
+    contact: Optional[np.ndarray] = None,
 ) -> SceneSample:
     """
     Build one scene's arrays.
 
     ``vertices`` and ``faces`` are the fragments **in their assembled frame** --
     which is also the only frame where the coincidence labels mean anything, so
-    if ``cluster`` is being computed it must already have happened. ``rotations``
-    supplies the per-fragment perturbation; omitted, it is drawn from ``rng``.
+    if ``cluster`` is being computed it must already have happened, and so must
+    ``contact`` (per vertex, the fragments in order: :class:`SceneSample`).
+    ``rotations`` supplies the per-fragment perturbation; omitted, it is drawn
+    from ``rng``.
 
     ``perturb=False`` leaves the perturbed copy out: the rotation that makes it
     is carried as the label anyway, so :func:`perturb_on_device` can produce it
@@ -332,8 +340,12 @@ def build_scene(
     total = sum(len(v) for v in vertices)
     if cluster is None:
         cluster = np.full(total, -1, np.int64)
+    if contact is not None:
+        contact = np.asarray(contact, dtype=bool)
+        if contact.shape != (total,):
+            raise ValueError(f"contact has {contact.shape[0]} entries for {total} vertices")
     return SceneSample(fragments, np.asarray(cluster, dtype=np.int64), category,
-                       key, Repairs(degenerate, zero_normals))
+                       key, Repairs(degenerate, zero_normals), contact)
 
 
 # --------------------------------------------------------------------------
@@ -381,6 +393,8 @@ class Batch(NamedTuple):
     # -- for naming what failed ------------------------------------------------
     scene_keys: Tuple[str, ...] = ()      # (S,) "<object>/<mode>"
     repairs: Tuple[Repairs, ...] = ()     # (S,) what build_scene had to repair
+    # -- the distance-based embedding term -------------------------------------
+    contact: "object" = None      # (N,) bool: another fragment's vertex within the radius
 
 
 def collate(samples: Sequence[SceneSample], device=None, dtype=None,
@@ -416,6 +430,9 @@ def collate(samples: Sequence[SceneSample], device=None, dtype=None,
     tokens, clusters = [], []
     vertex_counts, fragment_counts = [], []
     units, centroids, fracture = [], [], []
+    # A scene without the mask contributes no anchors; a batch with none of
+    # them carries none.
+    contacts = [] if any(sample.contact is not None for sample in samples) else None
 
     vertex_offset = 0
     fragment_offset = 0
@@ -458,6 +475,9 @@ def collate(samples: Sequence[SceneSample], device=None, dtype=None,
         assert vertex_offset - scene_start == sum(
             f.target_vertices.shape[0] for f in sample.fragments
         )
+        if contacts is not None:
+            contacts.append(np.zeros(vertex_offset - scene_start, bool)
+                            if sample.contact is None else sample.contact)
 
     def cat(parts, kind=dtype):
         if not parts:
@@ -519,6 +539,7 @@ def collate(samples: Sequence[SceneSample], device=None, dtype=None,
         fracture=cat(fracture, torch.bool),
         scene_keys=tuple(sample.key for sample in samples),
         repairs=tuple(sample.repairs for sample in samples),
+        contact=None if contacts is None else cat(contacts, torch.bool),
     )
 
 
