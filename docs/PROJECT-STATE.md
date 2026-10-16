@@ -11,7 +11,7 @@ implementing anything from it.
 
 | | |
 |---|---|
-| Pipeline | **built** — 557 tests, clean under `-W error` |
+| Pipeline | **built** — 564 tests, clean under `-W error` |
 | Dataset pass | 1,096,825 fragments across 1,442 objects |
 | Fracture surface | 10.6% of vertices, dataset-wide |
 | Model | **built and verified** — equivariance checked numerically in float64 |
@@ -30,7 +30,7 @@ implementing anything from it.
 | Thesis v7 | matched rotations placed from the pair fits the chain agrees with, the anchor held, not one solve over every match; `--evaluate --jitter/--drop` without shared break vertices — see §17 |
 | Thesis v7, no head | the rotation head removed: trained on the embedding term alone, every rotation fitted from the matches, the four geometric terms scores only, `best.pt` on validation acc@5; `--split all`, `--predictions` — see §18 |
 | Above the benchmark range | `--min_fragments 21 --max_fragments 0` scores the patterns 2–20 leaves out; the two runs score every pattern once — see §19 |
-| Other datasets | Fractura and Fantastic Breaks converted into Breaking Bad's layout — cleaned, scaled, thinned to the training density — and evaluated unchanged — see §20 |
+| Other datasets | Fractura and Fantastic Breaks converted into Breaking Bad's layout — cleaned, scaled, thinned to the training density unless the pieces share their breaks — and evaluated unchanged — see §20 |
 
 ---
 
@@ -1326,7 +1326,8 @@ data as the model received it, not in the model:
   face budget per object, split over its pieces by area; the budget from the
   target density (median edge over the largest side), corrected by secant
   steps until within 5%. An object within a factor of 2 of the target is not
-  touched, so the synthetic sets keep the vertices their pieces share.
+  touched — which did not keep every synthetic object's shared vertices: see
+  the correction below.
 - `data/scene.py`: `write_scene`, one fracture mode in the layout
   `SceneReader` reads.
 - Not used: a ray-cast shell (`mesh/shell.py`, unchanged). On a synthetic
@@ -1362,3 +1363,67 @@ end to end (`--split all --predictions`, a random-weight model).
 **Next.** The trained checkpoints on the converted sets: the real ones at
 `--max_fragments 20`, the synthetic one with `--split val`, Fantastic Breaks,
 and Breaking Bad's `--jitter/--drop` run beside the real ones.
+
+### Correction (Oct 16): the synthetic breaks pulled apart, and two false successes
+
+The first evaluation on the converted sets (`checkpoint-final`, epoch 117),
+compared dump by dump with the run on the unconverted files — the same
+checkpoint, the same matched rotations and placement:
+
+| | scenes | part accuracy | geodesic, scored pieces |
+|---|---|---|---|
+| synthetic, thinned (4 objects) | 29 | 0.659 → 0.047 | 55.9° → 124.0° |
+| synthetic, left alone (7 objects) | 64 | 0.607 → 0.800 | 53.5° → 29.7° |
+| real bones | 17 | 0.000 → 0.059 | 137.1° → 131.5° |
+| Fractura real | 26 | 0.000 → 0.038 | 123.8° → 124.0° |
+| Fantastic Breaks | 150 | 0.020 → 0.020 | 128.3° → 132.1° |
+
+- **Thinning pulled the synthetic breaks apart.** Four objects (leg 1248,
+  pig 6, pig 7, rib 6889; cleaned median edge 0.0071–0.0080) were under half
+  the target, 0.0162 on 200 Breaking Bad scenes, and were thinned one piece at
+  a time: 13,834–23,924 faces became 2,706–4,682, the 44,138 vertices their
+  pieces shared became 959, and a small piece kept as little as 0.21 of its
+  area (one below 0.9 in 7 of the 29 scenes). Matches fell from 1,308 to 200 a
+  scene, and the scores to chance. The four were no denser than Breaking Bad:
+  against the surface (median edge over √area) all eleven synthetic objects,
+  0.0087–0.0134, lie inside the seven Breaking Bad scenes, 0.0080–0.0152, and
+  by the largest side Breaking Bad's own spoon is 0.0064. The 64 scenes left
+  alone gained from the interior walls' cancellation alone.
+- **The two real successes are not reassemblies.** `vert8`'s second piece
+  (78,622 faces) is also stored inside its first, as one of its two
+  components, in place and facing the same way — the 55% of its vertices that
+  looked shared — so its 0.08° is a piece matched to its own copy.
+  `pig_bone_27`'s scored piece is 177.9° off (179.6° before); its part
+  Chamfer, 0.0052, passes 0.01, and the 220.7 mm² before is 0.0077 in object
+  units: it failed only in millimetres.
+- **Fantastic Breaks** is at chance both times. Ten objects stay denser than
+  half the target after thinning (median edge 0.0007–0.0073, up to 291,117
+  faces): their restorations are sliver meshes the collapse barely reduces.
+
+**What changed.**
+
+- `data/external.py`: an assembly whose pieces share at least 1% of their
+  vertices (`SHARED_BREAKS`) is not thinned. Measured at full resolution:
+  3.2–56% in 91 of the 93 synthetic scenes (none in the other two) and
+  4.4–54% in seven Breaking Bad scenes, every coincident face facing its
+  twin; none in the 36 real Fractura objects once vert8's copy is gone. The
+  decision leaves debris out: the scans' cubes coincide from piece to piece.
+- `mesh/clean.py`: `clean_piece(drop_debris=False)` keeps every component;
+  debris goes only from pieces that do not share their breaks — on the
+  synthetic pieces it was their own geometry (105 islands of 4–58 faces in 18
+  scenes). `copies_of_pieces` finds a piece stored again inside another, and
+  `prepare` removes the copy (vert8 alone, of the 36 real and 93 synthetic
+  assemblies checked).
+- The script's summary counts both; each row carries `shares_breaks`,
+  `shared_full`, `copies_removed` and `copy_faces`.
+
+**Verified.** Files rebuilt from the dumps, converted at `--edge 0.0162`: the
+five synthetic scenes (the four objects and a hip) keep every face and every
+shared vertex (1,142–4,787); vert8 loses the copy, shares nothing and is
+thinned like the other scans (287,176 faces stored, 22,414 written); three
+real bones are thinned with their cubes dropped. 564 tests, clean under
+`-W error`; of 47 mutations of the conversion code, 46 fail a test (the
+survivor is the one above); 118 version markers.
+
+**Next.** Convert `bone_synthetic` and `fractura_real` again and evaluate
+them; the trained model's numbers above are from the first conversion.

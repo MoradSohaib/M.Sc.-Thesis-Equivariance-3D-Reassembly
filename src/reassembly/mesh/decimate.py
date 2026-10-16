@@ -35,8 +35,9 @@ import numpy as np
 
 # Thinning starts only below this fraction of the target edge -- Breaking Bad's
 # own scenes span a factor of 3.6 in median edge, so a mesh within a factor of
-# two of the target is left alone (and keeps any vertices it shares with its
-# neighbours, which thinning would take away).
+# two of the target is left alone. Pieces are thinned one by one, so the two
+# sides of a break stop coinciding; reassembly.data.external therefore never
+# thins an assembly whose pieces share their breaks.
 TOLERANCE = 2.0
 # No piece is thinned below this many faces.
 MIN_FACES = 20

@@ -20,8 +20,10 @@ Every assembly is read with its pieces in the assembled pose, then
 
 1. cleaned to one closed surface per piece -- vertices within 1e-6 of the
    piece's size merged, the doubled interior walls of simulated pieces
-   cancelled, separate debris dropped (Blender's default cube, in every real
-   bone piece checked), surfaces wound inward turned outward;
+   cancelled, a copy of another piece stored inside a piece removed (Fractura's
+   vert8), surfaces wound inward turned outward, and, where the pieces do not
+   share their breaks (scans), separate debris dropped (Blender's default
+   cube, in every real bone piece checked);
 2. scaled so the object's largest side is 1, as Breaking Bad's objects are
    (``--scale piece``: GARF's loader instead, scaled down until the largest
    piece is at most 1);
@@ -30,8 +32,11 @@ Every assembly is read with its pieces in the assembled pose, then
    measures it on your Breaking Bad scenes (the median edge over the object's
    largest side); ``--edge E`` sets it, ``--faces N`` fixes the budget
    instead, ``--no_thinning`` keeps every mesh as it is. An object within a
-   factor of ``--tolerance`` (2) of the density is left alone, so simulated
-   sets that already match keep the vertices their pieces share.
+   factor of ``--tolerance`` (2) of the density is left alone, and so is one
+   whose pieces share their breaks (at least 1% of their vertices in a
+   coincidence cluster: simulated sets such as Fractura's synthetic bones):
+   thinning each piece on its own would pull the two sides of every break
+   apart, and the model's matches rest on them.
 
 Each scene is one folder, ``<out>/<subset>/<category>/<object>/fractured_0``;
 ``<out>/<subset>.csv`` records, per assembly, what was done and the faces the
@@ -159,11 +164,16 @@ def _summary(subset: str, rows: list) -> str:
             f"  merged vertices {sum(int(r['merged_vertices']) for r in ok):,}, interior and "
             f"repeated faces removed {sum(int(r['duplicate_faces']) for r in ok):,}, debris "
             f"components dropped {sum(int(r['dropped_components']) for r in ok)}",
+            f"  copies of another piece removed from a piece: "
+            f"{sum(int(r['copies_removed']) for r in ok)} "
+            f"({sum(int(r['copy_faces']) for r in ok):,} faces)",
             f"  edges left with one face {sum(int(r['boundary_edges']) for r in ok):,}, with "
             f"more than two {sum(int(r['nonmanifold_edges']) for r in ok):,} (in "
             f"{sum(int(r['nonmanifold_edges']) > 0 for r in ok)} of {len(ok)} objects)",
             f"  objects whose pieces share vertices (so with an embedding loss): "
-            f"{sum(int(r['shared_vertices']) > 0 for r in ok)} of {len(ok)}",
+            f"{sum(int(r['shared_vertices']) > 0 for r in ok)} of {len(ok)}; not thinned "
+            f"because their pieces share their breaks: "
+            f"{sum(str(r.get('shares_breaks')) == 'True' for r in ok)}",
             f"  faces the dihedral test flags (median share): {middle('flagged_full')} before "
             f"thinning, {middle('flagged')} after",
         ]

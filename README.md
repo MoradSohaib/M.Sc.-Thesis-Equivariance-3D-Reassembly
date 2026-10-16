@@ -131,7 +131,7 @@ tests still pass and the network tests skip.
 git clone <this-repo> && cd <this-repo>
 python -m venv .venv && source .venv/bin/activate      # Windows: .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-python -m pytest                                        # 557 passed
+python -m pytest                                        # 564 passed
 ```
 
 Installing is optional — `pytest.ini` sets `pythonpath = src .` and each script
@@ -312,7 +312,7 @@ scripts/
 ├── tune_sharp_threshold.py        pick --sharp-threshold by F1
 └── visualize.py                   render or describe one scene
 
-tests/                             557 tests
+tests/                             564 tests
 ```
 
 Only `reassembly` is packaged; `scripts/` and `tests/` are entry points and
@@ -843,8 +843,13 @@ Every assembly is read in its assembled pose and then (`data/external.py`):
    facing opposite ways — the "patterns inside" — and they cancel exactly, by
    the rule the Breaking Bad reader applies. Every real bone piece checked
    also holds a separate 2 × 2 × 2 cube of 12 faces at the origin (Blender's
-   default cube), dropped. An object whose pieces are one mesh stored twice
-   (`pig_bone_15`) is skipped and named;
+   default cube), dropped — loose parts are dropped only from pieces that do
+   not share their breaks, so simulated pieces keep every part of their own,
+   as the Breaking Bad reader keeps them. An object whose pieces are one mesh
+   stored twice (`pig_bone_15`) is skipped and named, and a copy of one piece
+   stored inside another is removed from it (`vert8`'s second piece is also
+   one of its first piece's two parts, which the model would match to each
+   other);
 2. **scaled** so the object's largest side is 1, as Breaking Bad's objects are
    (`--scale piece`: GARF's loader's convention). Part accuracy's 0.01 is in
    these units; the real bones are in millimetres;
@@ -853,7 +858,12 @@ Every assembly is read in its assembled pose and then (`data/external.py`):
    so every piece ends at the same density. The density is the median edge
    over the object's largest side; `--reference data` measures it on your
    Breaking Bad scenes, or give `--edge`, `--faces` or `--no_thinning`.
-   An object within a factor of 2 (`--tolerance`) is left as it is.
+   An object within a factor of 2 (`--tolerance`) is left as it is, and so is
+   one whose pieces share their breaks (at least 1% of their vertices
+   coincide with another piece's): each piece is thinned on its own, which
+   pulls the two sides of a break apart. In 91 of the 93 Fractura synthetic
+   scenes checked, 3% to 56% of the vertices coincide with another piece's,
+   so those keep their resolution.
 
 The model computes its normals and fracture labels from the vertices and faces,
 on every dataset, Breaking Bad's included; the readers pass it nothing else.

@@ -25,6 +25,9 @@ elsewhere arrive without that, and each of these was found in Fractura:
 * **Debris.** Every real bone piece also carries Blender's default cube -- a
   separate 2 x 2 x 2 box, 12 triangles, centred on the world origin, where all
   the pieces' cubes coincide in the assembled pose.
+* **A piece stored twice.** ``pig_bone_15``'s two pieces are one mesh, and
+  ``vert8``'s second piece is also a component of its first
+  (:func:`identical_pieces`, :func:`copies_of_pieces`).
 
 Not a ray-cast "shell" (:mod:`reassembly.mesh.shell`): visibility from outside
 would also delete real surface no outside ray reaches -- the inside of a
@@ -145,7 +148,8 @@ def edge_counts(faces: np.ndarray) -> Tuple[int, int]:
 def clean_piece(vertices, faces, face_labels=None, *,
                 merge_tolerance: float = MERGE_TOLERANCE,
                 max_debris_faces: int = MAX_DEBRIS_FACES,
-                min_component_share: float = MIN_COMPONENT_SHARE) -> CleanPiece:
+                min_component_share: float = MIN_COMPONENT_SHARE,
+                drop_debris: bool = True) -> CleanPiece:
     """
     One piece as one closed surface, in this order -- the duplicates only
     become duplicates once their vertices are shared:
@@ -158,7 +162,9 @@ def clean_piece(vertices, faces, face_labels=None, *,
     3. keep the largest component by area of those with more than
        ``max_debris_faces`` faces, and every other one that is not debris
        (more than ``max_debris_faces`` faces and at least
-       ``min_component_share`` of that one's area);
+       ``min_component_share`` of that one's area) -- skipped with
+       ``drop_debris=False``, which keeps every component, as the Breaking
+       Bad reader does;
     4. a closed surface wound inward is turned outward.
 
     ``face_labels`` (per input face, e.g. Fractura's break faces) come back for
@@ -186,7 +192,7 @@ def clean_piece(vertices, faces, face_labels=None, *,
 
     dropped = []
     components, component = face_components(faces, len(vertices))
-    if components > 1:
+    if drop_debris and components > 1:
         area = np.bincount(component, weights=face_areas(vertices, faces),
                            minlength=components)
         size = np.bincount(component, minlength=components)
@@ -235,3 +241,55 @@ def identical_pieces(pieces: Sequence) -> list:
     """Every pair ``(i, j)`` of ``(vertices, faces)`` pieces that are the same mesh."""
     return [(i, j) for i in range(len(pieces)) for j in range(i + 1, len(pieces))
             if same_mesh(pieces[i][0], pieces[i][1], pieces[j][0], pieces[j][1])]
+
+
+def copies_of_pieces(pieces: Sequence, max_debris_faces: int = MAX_DEBRIS_FACES,
+                     components: Optional[Sequence[int]] = None) -> list:
+    """
+    ``(i, mask, j)`` for every component of a piece ``i`` that is piece ``j``'s
+    surface stored again -- ``mask`` the component's faces in ``i``. A piece's
+    surface is its largest component by area of those with more than
+    ``max_debris_faces`` faces, as in :func:`clean_piece`, and only pieces with
+    at least two such components are searched: debris is never taken for a
+    copy, and the piece that was copied keeps its surface. Fractura's ``vert8``
+    is one: its second piece (78,622 faces) is also one of its first piece's
+    two components, in place and facing the same way.
+
+    ``components``, each piece's count when it is known (:class:`CleanReport`),
+    spares labelling the pieces that are one component.
+    """
+    parts = []
+    for k, (vertices, faces) in enumerate(pieces):
+        vertices, faces = np.asarray(vertices), np.asarray(faces)
+        if components is not None and components[k] == 1 and len(faces):
+            count, component = 1, np.zeros(len(faces), dtype=np.int64)
+        else:
+            count, component = face_components(faces, len(vertices))
+        size = np.bincount(component, minlength=count)
+        sized = np.flatnonzero(size > max_debris_faces)
+        candidates = sized if len(sized) else np.arange(count)
+        if len(candidates) > 1:
+            area = np.bincount(component, weights=face_areas(vertices, faces), minlength=count)
+            main = int(candidates[np.argmax(area[candidates])])
+        else:
+            main = int(candidates[0]) if len(candidates) else -1
+        parts.append((vertices, faces, component, sized, main, int(size[main]) if count else 0))
+
+    def surface(k, c):
+        vertices, faces, component = parts[k][:3]
+        mask = component == c
+        return vertices[np.unique(faces[mask])], faces[mask], mask
+
+    found = []
+    for i, (_, _, _, sized, _, _) in enumerate(parts):
+        if len(sized) < 2:
+            continue
+        for c in sized:
+            vertices, faces, mask = surface(i, c)
+            for j, (_, _, _, _, main, main_faces) in enumerate(parts):
+                if j == i or main < 0 or main_faces != len(faces):
+                    continue
+                if same_mesh(vertices, faces, *surface(j, main)[:2]):
+                    found.append((i, mask, j))
+                    break
+    return found

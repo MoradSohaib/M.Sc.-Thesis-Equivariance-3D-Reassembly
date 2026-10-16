@@ -33,19 +33,31 @@ from __future__ import annotations
 
 import os
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ..mesh.clean import MERGE_TOLERANCE, clean_piece, edge_counts, identical_pieces
+from ..mesh.clean import MERGE_TOLERANCE, clean_piece, copies_of_pieces, edge_counts, \
+    identical_pieces
 from ..mesh.decimate import TOLERANCE, median_edge, object_extent, thin_assembly, \
     transfer_face_labels
 
 SCALES = ("object", "piece")
 MODE = "fractured_0"
 _MODE_PREFIXES = ("fractured", "mode")
+# An assembly's pieces share their breaks when at least this share of their
+# vertices lies in a coincidence cluster, and then it is never thinned: each
+# piece is thinned on its own, so the two sides of a break stop coinciding --
+# on the four synthetic objects first converted that way, 97.8% of the shared
+# vertices went, and part accuracy fell from 0.66 to 0.05 over their 29 scenes.
+# Measured at full resolution: 3.2% to 56% in 91 of Fractura's 93 synthetic
+# scenes (none in the other two) and 4.4% to 54% in seven Breaking Bad scenes,
+# each coincident face facing its twin; none in the 36 real Fractura objects
+# checked once vert8's stored copy is gone (copies_of_pieces). Fantastic
+# Breaks was not measured at full resolution.
+SHARED_BREAKS = 0.01
 
 
 @dataclass
@@ -207,6 +219,12 @@ def shared_vertices(pieces: Sequence) -> int:
     return sum(len(cluster) for cluster in find_shared_points([v for v, _ in pieces]))
 
 
+def shares_breaks(pieces: Sequence) -> Tuple[int, bool]:
+    """``(shared vertices, whether they are at least SHARED_BREAKS of all the vertices)``."""
+    count = shared_vertices(pieces)
+    return count, bool(count >= SHARED_BREAKS * sum(len(v) for v, _ in pieces))
+
+
 def _flagged(pieces: Sequence, threshold: float = 0.9) -> List[np.ndarray]:
     """The dihedral fracture faces -- the labels the model's checkpoint uses at test time."""
     from ..mesh.fracture import fracture_face_mask
@@ -229,31 +247,78 @@ def _agreement(flagged: Sequence, breaks: Sequence) -> Tuple[float, float, float
     return (marked / total, hit / chosen if chosen else float("nan"), hit / marked)
 
 
+def _without_debris(piece, merge_tolerance: float):
+    """
+    ``piece`` cleaned again, its debris dropped. A piece of one component has
+    none, and the pass would change nothing: it comes back as it is, its
+    report saying that nothing more was done.
+    """
+    if piece.report.components <= 1:
+        return piece._replace(report=replace(piece.report, merged_vertices=0,
+                                             collapsed_faces=0, duplicate_faces=0,
+                                             dropped=(), flipped=False))
+    return clean_piece(piece.vertices, piece.faces, piece.face_labels,
+                       merge_tolerance=merge_tolerance)
+
+
 def prepare(assembly: Assembly, settings: Preparation = Preparation()):
     """
     ``(pieces, row)``: the assembly cleaned, scaled and thinned, and what was
     done to it; ``pieces`` is ``None`` when it cannot be used (``row["status"]``
     says why) -- fewer than two pieces left, or two pieces that are one mesh
-    stored twice.
+    stored twice. A piece stored again inside another is removed from it
+    (:func:`~reassembly.mesh.clean.copies_of_pieces`), and pieces that share
+    their breaks (:data:`SHARED_BREAKS`) are not thinned.
     """
     row: Dict[str, object] = dict(
         entry=assembly.entry, scene=f"{assembly.category}/{assembly.name}".strip("/"),
         split=assembly.split, pieces=len(assembly.pieces),
         faces_stored=sum(len(f) for _, f in assembly.pieces))
-    cleaned, breaks = [], []
-    merged = duplicates = dropped = flipped = 0
-    for (vertices, faces), marked in zip(assembly.pieces, assembly.breaks):
-        piece = clean_piece(vertices, faces, marked, merge_tolerance=settings.merge_tolerance)
-        merged += piece.report.merged_vertices
-        duplicates += piece.report.duplicate_faces
-        dropped += len(piece.report.dropped)
-        flipped += piece.report.flipped
-        if len(piece.faces):
-            cleaned.append((piece.vertices, piece.faces))
-            breaks.append(piece.face_labels)
+    # Every component kept first, as the Breaking Bad reader keeps them; the
+    # debris goes in a second pass, used only for pieces that do not share
+    # their breaks -- on simulated pieces the "debris" is the object's own
+    # geometry (105 islands of 4 to 58 faces in 18 of Fractura's synthetic
+    # scenes, in three of them one with 8 vertices of a break), on scanned
+    # ones it is the scan's (Blender's cube in every real bone piece).
+    whole = [clean_piece(vertices, faces, marked, merge_tolerance=settings.merge_tolerance,
+                         drop_debris=False)
+             for (vertices, faces), marked in zip(assembly.pieces, assembly.breaks)]
+    merged = sum(p.report.merged_vertices for p in whole)
+    duplicates = sum(p.report.duplicate_faces for p in whole)
+    turned = [p.report.flipped for p in whole]
+    # A copy of another piece is not this piece's surface: every vertex of it
+    # coincides with that piece's, as a break's do, but each face points the
+    # same way as its twin instead of against it, and kept, the model would
+    # match the piece to its own copy.
+    copies = copies_of_pieces([(p.vertices, p.faces) for p in whole],
+                              components=[p.report.components for p in whole])
+    removed: Dict[int, np.ndarray] = {}
+    for i, mask, _ in copies:
+        removed[i] = removed.get(i, np.zeros(len(mask), dtype=bool)) | mask
+    for i, mask in removed.items():
+        piece = whole[i]
+        labels = None if piece.face_labels is None else piece.face_labels[~mask]
+        whole[i] = clean_piece(piece.vertices, piece.faces[~mask], labels,
+                               merge_tolerance=settings.merge_tolerance, drop_debris=False)
+        merged += whole[i].report.merged_vertices
+        duplicates += whole[i].report.duplicate_faces
+        turned[i] ^= whole[i].report.flipped
+    tidy = [_without_debris(p, settings.merge_tolerance) for p in whole]
+    usable = [(w, t) for w, t in zip(whole, tidy) if len(t.faces)]
+    if usable:
+        extent = object_extent([(t.vertices, t.faces) for _, t in usable])
+        _, keep = shares_breaks([(t.vertices / extent, t.faces) for _, t in usable])
+    else:
+        keep = False
+    chosen = [w if keep else t for w, t in usable]
     row.update(merged_vertices=merged, duplicate_faces=duplicates,
-               dropped_components=dropped, flipped=flipped,
-               faces_clean=sum(len(f) for _, f in cleaned))
+               copies_removed=len(copies), copy_faces=sum(int(m.sum()) for _, m, _ in copies),
+               dropped_components=0 if keep else sum(len(t.report.dropped) for t in tidy),
+               flipped=sum(was != (t.report.flipped and not keep)
+                           for was, t in zip(turned, tidy)),
+               faces_clean=sum(len(p.faces) for p in chosen))
+    cleaned = [(p.vertices, p.faces) for p in chosen]
+    breaks = [p.face_labels for p in chosen]
     if len(cleaned) < 2:
         row["status"] = f"skipped: {len(cleaned)} piece(s) after cleaning"
         return None, row
@@ -276,8 +341,12 @@ def prepare(assembly: Assembly, settings: Preparation = Preparation()):
     row.update(break_share=share, flagged_full=float(np.mean(np.concatenate(flagged))),
                precision_full=precision, recall_full=recall)
 
-    thinned, report = thin_assembly(cleaned, edge=settings.edge, faces=settings.faces,
-                                    tolerance=settings.tolerance)
+    row.update(shared_full=shared_vertices(cleaned), shares_breaks=keep)
+    if keep:                             # no target: measured, returned as it is
+        thinned, report = thin_assembly(cleaned)
+    else:
+        thinned, report = thin_assembly(cleaned, edge=settings.edge, faces=settings.faces,
+                                        tolerance=settings.tolerance)
     tidied = 0
     if report.thinned:
         # Edge collapse can leave a face twice or a sliver; the Breaking Bad

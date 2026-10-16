@@ -21,11 +21,11 @@ trimesh = pytest.importorskip("trimesh")
 
 from reassembly.data.external import (Assembly, Preparation, fantastic_breaks_entries,  # noqa: E402
                                       garf_entries, place, prepare, read_fantastic_breaks,
-                                      read_garf, reference_edge, write)
+                                      read_garf, reference_edge, shares_breaks, write)
 from reassembly.data.paths import find_scenes  # noqa: E402
 from reassembly.data.scene import SceneReader, write_scene  # noqa: E402
-from reassembly.mesh.clean import (clean_piece, edge_counts, face_components,  # noqa: E402
-                                   identical_pieces)
+from reassembly.mesh.clean import (clean_piece, copies_of_pieces, edge_counts,  # noqa: E402
+                                   face_components, identical_pieces)
 from reassembly.mesh.decimate import (median_edge, object_extent, surface_area,  # noqa: E402
                                       thin_assembly, transfer_face_labels)
 
@@ -126,9 +126,13 @@ def thinning():
 
 @pytest.fixture
 def real_like():
-    """Two tube pieces stored as the real bones are, finer than Breaking Bad."""
+    """Two tube pieces stored as the real bones are, finer than Breaking Bad.
+    The second is moved a little: scanned separately, the two sides of a
+    break do not coincide (no shared vertex in 35 of Fractura's 36 real
+    objects checked)."""
     rng = np.random.default_rng(0)
     pieces, breaks = tube_pieces([0.4], sections=48, rings=80)
+    pieces[1] = (pieces[1][0] + [2e-3, 0.0, 0.0], pieces[1][1])
     stored, marked = [], []
     for (v, f), b in zip(pieces, breaks):
         sv, sf = as_scan(v, f, rng)
@@ -214,6 +218,30 @@ def test_a_piece_stored_twice_is_found():
     assert identical_pieces(pieces) == []
     shuffled = pieces[0][0][::-1].copy()
     assert identical_pieces([pieces[0], (shuffled, pieces[0][1]), pieces[1]]) == [(0, 1)]
+
+
+def _with_copy(piece, copied):
+    """``piece`` with ``copied`` stored again inside it, as a second component."""
+    (v, f), (cv, cf) = piece, copied
+    return np.vstack([v, cv]), np.vstack([f, cf + len(v)])
+
+
+def test_a_piece_stored_again_inside_another_is_found():
+    pieces, _ = tube_pieces([0.4])
+    apart = [pieces[0], (pieces[1][0] + [2e-3, 0.0, 0.0], pieces[1][1])]
+    assert copies_of_pieces(apart) == []
+    (i, mask, j), = copies_of_pieces([_with_copy(apart[0], apart[1]), apart[1]])
+    assert (i, j) == (0, 1) and mask.sum() == len(apart[1][1])
+    assert not mask[:len(apart[0][1])].any()                 # the piece's own faces stay
+    nudged = (apart[1][0] + [1e-4, 0.0, 0.0], apart[1][1])   # near it, not it
+    assert copies_of_pieces([_with_copy(apart[0], nudged), apart[1]]) == []
+    # The cubes of a scan coincide from piece to piece but are debris, and the
+    # copied piece's own cube does not hide the copy.
+    cube = (CUBE_VERTICES, CUBE_FACES)
+    scans = [_with_copy(apart[0], cube), _with_copy(apart[1], cube)]
+    assert copies_of_pieces(scans) == []
+    (i, mask, j), = copies_of_pieces([_with_copy(scans[0], apart[1]), scans[1]])
+    assert (i, j) == (0, 1) and mask.sum() == len(apart[1][1])
 
 
 # --------------------------------------------------------------------------
@@ -353,6 +381,105 @@ def test_simulated_pieces_keep_the_vertices_they_share():
     assert row["recall_full"] == row["recall"]
 
 
+@pytest.mark.usefixtures("thinning")
+def test_pieces_that_share_their_breaks_are_never_thinned():
+    pieces, breaks = _dense()                          # the caps coincide, as simulated
+    target = 4 * median_edge(pieces) / object_extent(pieces)   # far denser than the target
+    prepared, row = prepare(_assembly(pieces, breaks), Preparation(edge=target))
+    assert row["shares_breaks"] and not row["thinned"]
+    assert row["faces"] == row["faces_clean"]
+    assert row["shared_vertices"] == row["shared_full"] > 0
+    # The same pieces with the break pulled apart, as in a scan, but for the
+    # centre of the caps: thinned, and the count is the thinned pieces'.
+    v1 = pieces[1][0].copy()
+    centre = np.flatnonzero(np.all(np.isclose(v1, [0.0, 0.0, 0.4 * 30]), axis=1))
+    moved = np.ones(len(v1), bool)
+    moved[centre] = False
+    v1[moved] += [0.06, 0.0, 0.0]
+    apart = [pieces[0], (v1, pieces[1][1])]
+    thinned, row = prepare(_assembly(apart, breaks), Preparation(edge=target))
+    assert not row["shares_breaks"] and row["shared_full"] == 2 and row["thinned"]
+    assert row["shared_vertices"] == shares_breaks(thinned)[0] == 0
+
+
+def test_islands_stay_on_simulated_pieces_and_go_from_scans():
+    pieces, breaks = tube_pieces([0.4])
+    ball = trimesh.creation.icosphere(subdivisions=0)            # 20 faces, 0.1% of the area
+    island = np.asarray(ball.vertices) * 0.05 + [5.0, 0.0, 0.0]
+    with_island = [(np.vstack([pieces[0][0], island]),
+                    np.vstack([pieces[0][1], np.asarray(ball.faces) + len(pieces[0][0])])),
+                   pieces[1]]
+    marks = [np.concatenate([breaks[0], np.full(len(ball.faces), -1)]), breaks[1]]
+    _, row = prepare(_assembly(with_island, marks), Preparation())
+    assert row["shares_breaks"] and row["dropped_components"] == 0
+    assert row["faces_clean"] == sum(len(f) for _, f in with_island)
+    scanned = [with_island[0], (pieces[1][0] + [0.01, 0.0, 0.0], pieces[1][1])]
+    _, row = prepare(_assembly(scanned, marks), Preparation())
+    assert not row["shares_breaks"] and row["dropped_components"] == 1
+    assert row["faces_clean"] == sum(len(f) for _, f in pieces)
+
+
+def test_debris_shared_by_every_piece_is_not_a_shared_break():
+    """Small scanned pieces, each with the cube at the origin: the cubes
+    coincide, and are a large share of so few vertices -- the decision is
+    taken without them. One piece is wound inward and holds less volume than
+    the cube, so only the pass without the cube turns it."""
+    rng = np.random.default_rng(2)
+    pieces, breaks = tube_pieces([0.4], sections=8, rings=6)
+    pieces[1] = (pieces[1][0] + [0.01, 0.0, 0.0], pieces[1][1])
+    pieces[0] = (pieces[0][0], pieces[0][1][:, ::-1])
+    stored = [as_scan(v, f, rng, scale=0.5) for v, f in pieces]
+    with_cube = sum(len(np.unique(np.round(v, 6), axis=0)) for v, _ in stored)
+    assert 2 * 8 > 0.01 * with_cube                    # the cubes alone would pass the test
+    marks = [np.concatenate([b, np.full(12, -1)]) for b in breaks]
+    _, row = prepare(_assembly(stored, marks), Preparation())
+    assert not row["shares_breaks"] and row["dropped_components"] == 2
+    assert row["flipped"] == 1 and row["shared_vertices"] == 0
+
+
+def test_a_piece_turned_outward_is_counted_once():
+    """A closed piece of one component wound inward, in an assembly that
+    shares its breaks and in one that does not: one turn either way."""
+    pieces, breaks = tube_pieces([0.4])
+    inward = [(pieces[0][0], pieces[0][1][:, ::-1]), pieces[1]]
+    _, row = prepare(_assembly(inward, breaks), Preparation())
+    assert row["shares_breaks"] and row["flipped"] == 1
+    apart = [inward[0], (pieces[1][0] + [0.01, 0.0, 0.0], pieces[1][1])]
+    _, row = prepare(_assembly(apart, breaks), Preparation())
+    assert not row["shares_breaks"] and row["flipped"] == 1
+
+
+def test_a_few_coincident_vertices_are_not_a_shared_break():
+    pieces, _ = tube_pieces([0.4])
+    apart = [pieces[0], (pieces[1][0] + [0.01, 0.0, 0.0], pieces[1][1])]
+    assert shares_breaks(apart) == (0, False)
+    touching = [apart[0], (apart[1][0].copy(), apart[1][1])]
+    touching[1][0][:2] = apart[0][0][:2]               # two vertices in the same place
+    count, shared = shares_breaks(touching)
+    assert count == 4 and not shared                   # 2 pairs, under 1% of the vertices
+    assert shares_breaks(pieces) == (2 * 25, True)     # the cap's 24 + centre, both sides
+
+
+def test_a_copy_of_another_piece_is_removed_and_is_not_a_shared_break():
+    """Fractura's vert8: scanned pieces, the second also stored inside the
+    first. The copy coincides with the second piece vertex for vertex, so
+    kept it would pass for a shared break. Here the first piece is also wound
+    inward and holds less volume than the copy: only the pass without the
+    copy turns it."""
+    pieces, breaks = tube_pieces([-0.5])
+    own = (pieces[0][0], pieces[0][1][:, ::-1])
+    second = (pieces[1][0] + [2e-3, 0.0, 0.0], pieces[1][1])
+    stored = [_with_copy(own, second), second]
+    assert shares_breaks(stored)[1]                    # what the copy looks like
+    marks = [np.concatenate([breaks[0], np.full(len(second[1]), -1)]), breaks[1]]
+    prepared, row = prepare(_assembly(stored, marks), Preparation())
+    assert row["status"] == "ok" and row["copies_removed"] == 1
+    assert row["copy_faces"] == len(second[1])
+    assert not row["shares_breaks"] and row["shared_vertices"] == 0
+    assert [len(f) for _, f in prepared] == [len(pieces[0][1]), len(pieces[1][1])]
+    assert row["flipped"] == 1
+
+
 def test_unusable_assemblies_are_named(real_like):
     stored, marked = real_like
     _, row = prepare(_assembly([stored[0], stored[0]], [marked[0], marked[0]]), Preparation())
@@ -417,6 +544,8 @@ def test_the_script_converts_and_the_model_evaluates_the_result(tmp_path, real_l
     stored, marked = real_like
     garf = write_garf(tmp_path / "bone_real.hdf5", {
         "pig_bone/pig_bone_1": (stored, marked),
+        "pig_bone/pig_bone_8": ([_with_copy(stored[0], stored[1]), stored[1]],
+                                [np.concatenate(marked), marked[1]]),
         "pig_bone/pig_bone_15": ([stored[0], stored[0]], [marked[0], marked[0]])})
     fb = tmp_path / "FB_v1" / "00" / "00002"
     fb.mkdir(parents=True)
@@ -428,12 +557,15 @@ def test_the_script_converts_and_the_model_evaluates_the_result(tmp_path, real_l
     assert main([str(garf), str(tmp_path / "FB_v1"), "--out", str(tmp_path / "external"),
                  "--edge", "0.05"]) == 0
     out = capsys.readouterr().out
-    assert "bone_real: 1 of 2 assemblies converted" in out
+    assert "bone_real: 2 of 3 assemblies converted" in out
     assert "1 skipped: pieces 0 and 1 are the same mesh" in out
+    assert "copies of another piece removed from a piece: 1 (" in out
     assert "FB_v1: 1 of 1 assemblies converted" in out
     with open(tmp_path / "external" / "bone_real.csv", newline="") as handle:
         rows = list(csv.DictReader(handle))
-    assert [r["status"] for r in rows] == ["ok", "skipped: pieces 0 and 1 are the same mesh"]
+    assert [r["status"] for r in rows] == ["ok", "ok",
+                                           "skipped: pieces 0 and 1 are the same mesh"]
+    assert [r["copies_removed"] for r in rows[:2]] == ["0", "1"]
 
     config = Config(root=str(tmp_path / "external"), subsets=["bone_real"],
                     out_dir=str(tmp_path / "out"), channels=16, heads=4, head_dim=4,
@@ -446,6 +578,6 @@ def test_the_script_converts_and_the_model_evaluates_the_result(tmp_path, real_l
                     best=1.0)
     summary = training.evaluate(config, checkpoint="last.pt", split="all",
                                 predictions=str(tmp_path / "predictions"))
-    assert summary["evaluation"]["samples"] == 1 and summary["fragments"] == 2
-    assert len(summary["assembly_scenes"]) == 1
+    assert summary["evaluation"]["samples"] == 2 and summary["fragments"] == 4
+    assert len(summary["assembly_scenes"]) == 2
     assert list((tmp_path / "predictions").glob("*.zip"))
