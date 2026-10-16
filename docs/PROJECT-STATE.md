@@ -1425,5 +1425,32 @@ real bones are thinned with their cubes dropped. 564 tests, clean under
 `-W error`; of 47 mutations of the conversion code, 46 fail a test (the
 survivor is the one above); 118 version markers.
 
-**Next.** Convert `bone_synthetic` and `fractura_real` again and evaluate
-them; the trained model's numbers above are from the first conversion.
+**Measured after the fix (Oct 16).** `bone_synthetic` and `fractura_real`
+converted again and evaluated (`checkpoint-final`, epoch 117, `--split all
+--modes_per_scene 0 --max_fragments 0`). Part accuracy per scene on
+`bone_synthetic`:
+
+| | scenes | unconverted | first conversion | fixed |
+|---|---|---|---|---|
+| hip | 14 | 0.421 | 0.820 | 0.813 |
+| leg | 6 | 0.716 | 0.000 | 0.883 |
+| pig | 45 | 0.725 | 0.595 | 0.876 |
+| rib | 17 | 0.595 | 0.500 | 0.847 |
+| vertebra | 11 | 0.460 | 0.531 | 0.531 |
+| all | 93 | 0.623 | 0.565 | 0.821 |
+
+Geodesic per scene 54.27° → 59.09° → 26.73°, matches a scene 1,225 → 825 →
+1,109, share reached 0.710 → 0.573 → 0.791. Per piece the median error is
+0.34° and acc@5 0.663 against 66% reached: nearly every piece the chain
+reaches is right, and what is missing is reach — in 10 of the 11 vertebra
+scenes (meshes and scores as in the first conversion) part accuracy equals the
+share reached, none in mode_0 and mode_1, whose second piece touches nothing.
+Hip is the one category to fall, 0.820 → 0.813; its only change is the 6-face
+island now kept in each of hip 6979's seven scenes, as the Breaking Bad reader
+keeps islands. `fractura_real`: part accuracy
+0.037 → 0.000 — vert8, without its copy, is wrong like the other scans (the
+bones' mean 120.72° → 129.64°; ceramics' and egg's unchanged to the second
+decimal), and the embedding term is 0.0000, as on `bone_real`.
+
+**Next.** Breaking Bad's `--jitter/--drop` run beside the scanned sets, whose
+pieces share no break vertex.
