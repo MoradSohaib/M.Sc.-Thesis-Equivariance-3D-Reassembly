@@ -19,7 +19,8 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from reassembly.data.features import build_scene  # noqa: E402
-from reassembly.data.remesh import Remesh, remesh_pieces  # noqa: E402
+from reassembly.data.remesh import (Remesh, collapse_pieces, jitter_pieces,  # noqa: E402
+                                    remesh_pieces)
 from reassembly.data.transforms import random_rotations  # noqa: E402
 from reassembly.mesh.correspondence import (compute_scene_correspondence,  # noqa: E402
                                             contact_vertices, find_shared_points)
@@ -92,6 +93,12 @@ def test_remeshing_is_repeatable_and_draws_each_piece_its_share(fractured_solid)
     other = remesh_pieces(vertices, faces, np.random.default_rng(4), spec)
     assert all(np.array_equal(a, b) for a, b in zip(first[0] + first[1], again[0] + again[1]))
     assert not all(len(a) == len(b) and np.allclose(a, b) for a, b in zip(first[0], other[0]))
+    # The collapse, then the jitter, from one generator: what the dataset does
+    # to label the pieces between the two.
+    rng = np.random.default_rng(3)
+    collapsed, kept = collapse_pieces(vertices, faces, rng, spec)
+    moved = jitter_pieces(collapsed, rng, spec.jitter)
+    assert all(np.array_equal(a, b) for a, b in zip(moved + kept, first[0] + first[1]))
     # A piece too small to collapse keeps its faces, and the jitter still moves it.
     tiny_v = np.array([[1.0, 0, 0], [0, 1, 0], [0, 0, 1], [0, 0, 0]])
     tiny_f = np.array([[0, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2]])
@@ -286,6 +293,10 @@ def test_only_the_training_scenes_are_remeshed(tmp_path):
     later = BreakingBadScenes(config, "train", epoch_seed=1)
     assert not all(np.array_equal(a.vertices, b.vertices)
                    for a, b in zip(train.pieces(0), later.pieces(0)))
+    # What `pieces` holds is what the model was given.
+    for piece, fragment in zip(train.pieces(0), sample.fragments):
+        assert np.allclose(piece.vertices, fragment.target_vertices * fragment.divisor
+                           + fragment.centroid, atol=1e-5)
     # Validation is the scenes as stored.
     assert all(np.array_equal(np.asarray(a.faces), np.asarray(b.faces))
                for a, b in zip(val.pieces(0), val.meshes(0)))
@@ -294,6 +305,31 @@ def test_only_the_training_scenes_are_remeshed(tmp_path):
     assert asked.remesh == Remesh(0.5, 0.5)
     assert sample.contact is not None and sample.contact.dtype == bool and sample.contact.any()
     assert len(sample.contact) == sum(len(f.target_vertices) for f in sample.fragments)
+
+
+@pytest.mark.usefixtures("thinning")
+def test_the_noise_moves_the_vertices_not_the_fracture_labels(tmp_path):
+    """
+    The dihedral test reads the jitter as fracture: on seven Breaking Bad
+    scenes it flags 13-76% of the vertices as stored, 14-80% after the
+    collapse and 90-99.5% after jitter 0.001 -- the labels that place the
+    cross-attention tokens and bound stage two's matching. So they are
+    computed before the jitter. Here 0.02, about the share of this fixture's
+    edge (0.3) that 0.001 is of Breaking Bad's.
+    """
+    root = _dataset(tmp_path / "data")
+    noisy = BreakingBadScenes(_config(root, remesh=(0.5, 0.9), remesh_jitter=0.02,
+                                      contact_radius=0.35), "train")
+    quiet = BreakingBadScenes(_config(root, remesh=(0.5, 0.9), contact_radius=0.35), "train")
+    moved, still = noisy.build(0), quiet.build(0)
+    assert all(np.array_equal(a.fracture, b.fracture)
+               for a, b in zip(moved.fragments, still.fragments))
+    assert not all(np.allclose(a.target_vertices, b.target_vertices)
+                   for a, b in zip(moved.fragments, still.fragments))
+    # Labelled after the jitter, the same pieces would be most of the surface.
+    after = np.concatenate(noisy.labels(noisy.pieces(0)))
+    before = np.concatenate([a.fracture for a in moved.fragments])
+    assert after.mean() > before.mean() + 0.2
 
 
 @pytest.mark.usefixtures("thinning")

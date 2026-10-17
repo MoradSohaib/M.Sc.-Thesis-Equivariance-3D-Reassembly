@@ -131,7 +131,7 @@ tests still pass and the network tests skip.
 git clone <this-repo> && cd <this-repo>
 python -m venv .venv && source .venv/bin/activate      # Windows: .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-python -m pytest                                        # 588 passed
+python -m pytest                                        # 589 passed
 ```
 
 Installing is optional — `pytest.ini` sets `pythonpath = src .` and each script
@@ -313,7 +313,7 @@ scripts/
 ├── tune_sharp_threshold.py        pick --sharp-threshold by F1
 └── visualize.py                   render or describe one scene
 
-tests/                             588 tests
+tests/                             589 tests
 ```
 
 Only `reassembly` is packaged; `scripts/` and `tests/` are entry points and
@@ -917,7 +917,8 @@ Three settings, off by default, train for that:
   own whenever it is loaded — quadric edge collapse keeping a share of its
   faces drawn from `[LOW, HIGH]` (`data/remesh.py`) — and `--remesh_jitter S`
   then moves every vertex by Gaussian noise of `S`, so no vertex is left where
-  its twin was. Validation is never remeshed by it. Needs `fast-simplification`.
+  its twin was. The fracture labels are computed before the noise. Validation
+  is never remeshed by it. Needs `fast-simplification`.
 - `--init_from CHECKPOINT`: a new run starts from that checkpoint's weights;
   the optimizer, the schedule, the epochs and the history start fresh. The
   architecture flags must be the checkpoint's (a mismatch is refused, naming
@@ -931,6 +932,17 @@ a vertex of another piece within 0.015 finds 96–100% of each scene's break, an
 66–96% of the vertices it finds lie on it. On slabs whose breaks share no
 vertex but their corners (`tests/test_contact.py`), a model trained on this
 term places 8 of 9 scored pieces within 5°; on v7's term, 2 of 9.
+
+The fracture labels — which place the cross-attention tokens and bound the
+matching — come from the pieces before the noise: labelled after it, the
+dihedral test flagged 90–99.5% of those scenes' vertices (13–76% as stored).
+The first fine-tune with these settings (Oct 17, from `checkpoint-final`) was
+trained before that was fixed. It left `fractura_real` at chance (no piece of
+67 within 30°) and `bone_synthetic` a little lower (part accuracy 0.821 →
+0.804). Where the pieces of `fractura_real` face each other (vertices within
+0.05 of another piece), the median gap is 0.013–0.029 a scene; Breaking Bad's,
+remeshed, 0.003–0.012. So remeshing does not reproduce these scans' breaks;
+`docs/PROJECT-STATE.md` §21.
 
 ```bash
 pip install fast-simplification

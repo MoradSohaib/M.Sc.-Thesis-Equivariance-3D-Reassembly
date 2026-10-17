@@ -11,7 +11,7 @@ implementing anything from it.
 
 | | |
 |---|---|
-| Pipeline | **built** — 588 tests, clean under `-W error` |
+| Pipeline | **built** — 589 tests, clean under `-W error` |
 | Dataset pass | 1,096,825 fragments across 1,442 objects |
 | Fracture surface | 10.6% of vertices, dataset-wide |
 | Model | **built and verified** — equivariance checked numerically in float64 |
@@ -31,7 +31,7 @@ implementing anything from it.
 | Thesis v7, no head | the rotation head removed: trained on the embedding term alone, every rotation fitted from the matches, the four geometric terms scores only, `best.pt` on validation acc@5; `--split all`, `--predictions` — see §18 |
 | Above the benchmark range | `--min_fragments 21 --max_fragments 0` scores the patterns 2–20 leaves out; the two runs score every pattern once — see §19 |
 | Other datasets | Fractura and Fantastic Breaks converted into Breaking Bad's layout — cleaned, scaled, thinned to the training density unless the pieces share their breaks — and evaluated unchanged — see §20 |
-| Breaks that share no vertex | the embedding term's positives by distance (`--contact_radius`), each training piece remeshed on its own (`--remesh`), a new run from a checkpoint's weights (`--init_from`), `--evaluate --remesh`; not yet trained — see §21 |
+| Breaks that share no vertex | the embedding term's positives by distance (`--contact_radius`), each training piece remeshed on its own (`--remesh`), a new run from a checkpoint's weights (`--init_from`), `--evaluate --remesh`; one fine-tune, before the jitter's labels were fixed: `fractura_real` still at chance, its breaks 1–2 edges apart — see §21 |
 
 ---
 
@@ -1567,3 +1567,86 @@ on a run.
 0.015 --remesh 0.5 0.9 --remesh_jitter 0.001`; score it on Everyday's
 validation scenes as stored and remeshed, on `bone_synthetic`, and on
 `bone_real`, `fractura_real` and Fantastic Breaks.
+
+### Measured, and a correction (Oct 17)
+
+**The first fine-tune** (`checkpoint-contact`, reported by the user): from
+`checkpoint-final/best.pt` with `--contact_radius 0.015 --remesh 0.5 0.9
+--remesh_jitter 0.001 --lr 4e-4 --lr_min 9e-5`, 40 epochs of 800 steps of 2
+scenes; `best.pt` is epoch 40, validation acc@5 0.662 (Everyday val, 2+
+pieces, 8 patterns per object — not the scenes `checkpoint-final` validated
+on, 2–20 pieces and 20 patterns per object, so not comparable with its
+logged numbers). Scored with `--split all --modes_per_scene 0
+--max_fragments 0`:
+
+- `fractura_real`: part accuracy 0.056 (0.000 before), geodesic 129.62° per
+  piece (129.57° before) and 131.04° per scene, acc@5, acc@10 and acc@30 all
+  0.000 over 67 pieces, match@1 0.009, 412 matches a scene of which 6 are in
+  verified fits; the embedding term, now computed by distance, 6.72. Its part
+  accuracy is not a success: no piece is within 30°, and the scenes that score
+  have wrongly turned pieces that pass the Chamfer test (`limb4` 1.0 at
+  132.4°, `limb3` 0.5 at 124.0°).
+- `bone_synthetic`: part accuracy 0.804 (0.821), geodesic per scene 28.22°
+  (26.73°), per piece median 0.95° (0.34°) and acc@5 0.638 (0.663), matches a
+  scene 944 (1,109), 599 verified (629), reached 0.781 (0.791); by category
+  leg 0.883 (0.883), pig 0.856 (0.876), rib 0.840 (0.847), hip 0.784 (0.813),
+  vertebra 0.519 (0.531). These pieces still share their breaks; trained to
+  match within 0.015 rather than the twin, the fits are less exact.
+
+**Correction: the jitter made the fracture labels.** The dihedral test reads
+the jitter as fracture. On the seven Breaking Bad scenes, with training's
+labels (`--sharp_threshold 0.9`), the share of vertices flagged:
+
+| | as stored | remeshed | jitter 1e-5 | 1e-4 | 3e-4 | 1e-3 |
+|---|---|---|---|---|---|---|
+| flagged as fracture | 13–76% | 14–80% | 19–82% | 41–89% | 64–95% | 90–99.5% |
+| coincident vertices left | 370–4,501 | 74–1,462 | 8–136 | 0–2 | 0 | 0 |
+
+The labels place the cross-attention tokens and bound the vertices stage two
+matches, so `checkpoint-contact` was trained with tokens over nearly the whole
+surface while its validation, and every test, used the usual labels; and
+`--evaluate --remesh ... --remesh_jitter 0.001` matched over nearly the whole
+surface. Fixed: `data/remesh.py` splits `remesh_pieces` into
+`collapse_pieces` and `jitter_pieces` — the same draws, so its output is
+unchanged (identical on the seven scenes, two seeds and three settings) — and
+`BreakingBadScenes` computes the labels on the collapsed pieces, before the
+jitter, and everything else on the moved ones; `pieces` holds the moved ones.
+The remeshing measurements above are unaffected. The labels were not measured
+before the jitter was chosen; they should have been.
+
+**The scans' breaks do not close.** Measured on the fine-tune's
+`fractura_real` dumps (the meshes the model got, in the assembled pose) and on
+the seven Breaking Bad scenes, as stored and remeshed as training remeshed
+them; per vertex, the nearest vertex of another piece, in units of the
+object's largest side:
+
+| | Breaking Bad, stored | remeshed (training) | `fractura_real` |
+|---|---|---|---|
+| median edge | 0.0064–0.023 | 0.0082–0.028 | 0.016–0.017 |
+| vertices within 0.005 of another piece | 5–65% | 3–63% | 0.2–3.0% |
+| of the vertices within 0.015, the share within 0.005 | 79–98% | 72–88% | 5–22% |
+| median gap among vertices within 0.05 | 0–0.011 | 0.003–0.012 | 0.013–0.029 |
+
+On Breaking Bad the two sides of a break, remeshed or not, lie within a
+fraction of an edge of each other; on the scans they sit one to two edges
+apart. The same kinds of object agree: Breaking Bad's bowl, plate, vase and
+wine bottle, remeshed, 0.004–0.012; Fractura's bowl, plate, pots and bottles
+0.013–0.021. The fine-tune trained on the first condition. Not separated: how
+much of the scans' gap is in the scans (lost material, noise, the dataset's
+assembled pose) and how much the conversion's thinning: on the seven real
+objects measured in §20 it took median edges of 0.0015–0.0052 to the target
+and kept every vertex within half a target edge of an original one, each piece
+on its own. The full-resolution pieces would separate them.
+
+Also wrong, and not fixed: on a converted set the report's "N of them shapes
+the checkpoint was trained on" (20 of 27, 75 of 93) counts the objects the
+hashed split would put in training — there are no Breaking Bad split lists
+under `external` — though none of them was in training. No score depends on it.
+
+**Verified.** 589 tests, clean under `-W error`
+(`test_the_noise_moves_the_vertices_not_the_fracture_labels`; `pieces` checked
+against the scene's own vertices); each of 52 mutations of §21's code fails a test; 130 version markers.
+
+**Next.** The scans' gap at full resolution. If the thinning makes it, the
+conversion changes; if the scans have it, training needs Breaking Bad breaks
+opened by that much, checked against the table above before a run.

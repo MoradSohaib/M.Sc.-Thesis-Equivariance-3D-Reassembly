@@ -283,6 +283,10 @@ MARKERS = [
      "meshes = dataset.pieces(index)"),
     ("contact tests", "tests/test_contact.py",
      "def test_the_model_learns_breaks_that_share_no_vertex"),
+    ("fracture labels computed before the remesh jitter", "src/reassembly/training.py",
+     "vertices, faces, self.labels(surface),"),
+    ("the collapse and the jitter as two steps", "src/reassembly/data/remesh.py",
+     "def collapse_pieces("),
 ]
 
 

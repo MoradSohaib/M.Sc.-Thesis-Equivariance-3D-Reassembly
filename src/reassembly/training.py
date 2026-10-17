@@ -221,7 +221,9 @@ class Config:
     remesh_jitter: float = 0.0
     """With ``remesh``: Gaussian noise of this standard deviation on every
     vertex after remeshing, in world units, so no vertex is left exactly where
-    its twin was (0.001: none of seven Breaking Bad scenes kept one). 0: none."""
+    its twin was (0.001: none of seven Breaking Bad scenes kept one). 0: none.
+    The fracture labels are computed before it: on those scenes 0.001 made the
+    dihedral test flag 90% to 99.5% of the vertices."""
     # No translation setting, and that is deliberate rather than an omission.
     # `build_scene` applies rotation only, then centres every fragment at its
     # own centroid -- which removes any translation that had been applied. A
@@ -913,12 +915,15 @@ class BreakingBadScenes:
             return Skipped(key, "non-finite vertex coordinates")
 
         draw = stable_seed(key, self.epoch_seed, config.seed) if seed is None else seed
+        surface = meshes
         if self.remesh is not None:
-            meshes = self._remeshed(key, vertices, faces)
+            # Labelled before the jitter: the dihedral test reads the noise as
+            # fracture (data/remesh.py). Everything else reads the moved pieces.
+            surface, meshes = self._remeshed(key, vertices, faces)
             vertices = [m.vertices for m in meshes]
             faces = [m.faces for m in meshes]
         return build_scene(
-            vertices, faces, self.labels(meshes),
+            vertices, faces, self.labels(surface),
             category=self.catalog.objects[scene_index].category or "(uncategorised)",
             rotations=rotations,
             rng=np.random.default_rng(draw),
@@ -936,19 +941,23 @@ class BreakingBadScenes:
     def __getitem__(self, i: int):
         return self.build(i)
 
-    def _remeshed(self, key: str, vertices, faces) -> list:
+    def _remeshed(self, key: str, vertices, faces) -> tuple:
         """
         The pieces remeshed by ``self.remesh``, from their own stream -- so
         the perturbation and the tokens draw what they would have -- and per
         epoch like them: every epoch remeshes a training scene afresh, and
-        one epoch the same way every time it is asked.
+        one epoch the same way every time it is asked. ``(surface, moved)``:
+        the collapsed pieces before the jitter, which the fracture labels are
+        computed on, and after it, what the model reads -- the same faces.
         """
-        from .data.remesh import remesh_pieces
+        from .data.remesh import collapse_pieces, jitter_pieces
 
         rng = np.random.default_rng(stable_seed(key, self.epoch_seed, self.config.seed,
                                                 "remesh"))
-        vertices, faces = remesh_pieces(vertices, faces, rng, self.remesh)
-        return [_Mesh(v, f) for v, f in zip(vertices, faces)]
+        vertices, faces = collapse_pieces(vertices, faces, rng, self.remesh)
+        moved = jitter_pieces(vertices, rng, self.remesh.jitter)
+        return ([_Mesh(v, f) for v, f in zip(vertices, faces)],
+                [_Mesh(v, f) for v, f in zip(moved, faces)])
 
     def pieces(self, i: int) -> list:
         """
@@ -962,7 +971,7 @@ class BreakingBadScenes:
         vertices = [np.asarray(m.vertices, dtype=np.float64) for m in meshes]
         if not all(np.isfinite(v).all() for v in vertices):
             return meshes
-        return self._remeshed(self.key(i), vertices, [np.asarray(m.faces) for m in meshes])
+        return self._remeshed(self.key(i), vertices, [np.asarray(m.faces) for m in meshes])[1]
 
 
 def stable_seed(*parts) -> int:
