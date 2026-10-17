@@ -267,7 +267,7 @@ src/reassembly/
 │   ├── sampling.py                weighted + distributed + reproducible sampler
 │   ├── scene.py                   SceneReader — caches the intact mesh across modes; write_scene
 │   ├── external.py                Fractura (GARF's HDF5) and Fantastic Breaks, read and prepared
-│   ├── remesh.py                  each training piece remeshed on its own: breaks that share no vertex
+│   ├── remesh.py                  each training piece remeshed on its own, its breaks opened: as scans' are
 │   ├── transforms.py              SE(3) perturbation, centring, normalisation
 │   └── features.py                meshes → tensors, and the batch collate
 ├── training.py                 ★  config, dataset, loops, checkpoints, metrics
@@ -367,7 +367,7 @@ Thesis 1's meaning, so one set of habits drives both:
 | `--placement checked\|global` | this version's (below): with `--evaluate`, place the pieces from the verified pair fits (default) or by v6's single solve |
 | `--jitter`, `--drop` | this version's (below): with `--evaluate`, noise on every input vertex and a share of the break vertices left out of the matching, so no two sides of a break coincide (off by default) |
 | `--split all`, `--predictions DIR` | this version's (below): with `--evaluate`, every object of the subsets whatever its split; and every scene's prediction, zipped |
-| `--contact_radius`, `--remesh`, `--init_from` | this version's (below): for breaks that share no vertex, the embedding term's positives by distance, each training piece remeshed on its own, a new run from another run's weights (all off by default) |
+| `--contact_radius`, `--remesh`, `--remesh_gap`, `--init_from` | this version's (below): for breaks that share no vertex, the embedding term's positives by distance, each training piece remeshed on its own and its breaks opened, a new run from another run's weights (all off by default) |
 
 Settings only this project has keep their own names in the same style
 (`--tokens_per_scene`, `--modes_per_scene`, `--max_objects`, `--schedule`, ...);
@@ -892,7 +892,7 @@ report and every match rests on the embeddings alone, so the Breaking Bad run
 to set beside them is `--jitter/--drop`'s, not the clean one. (A checkpoint
 trained with `--contact_radius`, below, reports its term there too.)
 
-### Breaks that share no vertex: training for scans (`--contact_radius`, `--remesh`, `--init_from`)
+### Breaks that share no vertex: training for scans (`--contact_radius`, `--remesh`, `--remesh_gap`, `--init_from`)
 
 v7's embedding term (`correspondence_loss`) has one positive per vertex, its
 exact twin across the break, and every other break vertex is a negative — the
@@ -917,8 +917,14 @@ Three settings, off by default, train for that:
   own whenever it is loaded — quadric edge collapse keeping a share of its
   faces drawn from `[LOW, HIGH]` (`data/remesh.py`) — and `--remesh_jitter S`
   then moves every vertex by Gaussian noise of `S`, so no vertex is left where
-  its twin was. The fracture labels are computed before the noise. Validation
-  is never remeshed by it. Needs `fast-simplification`.
+  its twin was. Before the noise, `--remesh_gap G` opens the breaks, as
+  scanned breaks are open: each piece's break vertices move along the break's
+  normal by a smooth random amount, inward or outward, around a mean opening
+  drawn per scene from `[0, G]`; the vertices beside the break move with it,
+  and no face is turned over. The fracture labels are computed before the
+  noise, and the term's positives are found where the vertices were before
+  the opening, so the two sides of a break stay each other's. Validation is
+  never remeshed by it. Needs `fast-simplification`.
 - `--init_from CHECKPOINT`: a new run starts from that checkpoint's weights;
   the optimizer, the schedule, the epochs and the history start fresh. The
   architecture flags must be the checkpoint's (a mismatch is refused, naming
@@ -940,23 +946,36 @@ The first fine-tune with these settings (Oct 17, from `checkpoint-final`) was
 trained before that was fixed. It left `fractura_real` at chance (no piece of
 67 within 30°) and `bone_synthetic` a little lower (part accuracy 0.821 →
 0.804). Where the pieces of `fractura_real` face each other (vertices within
-0.05 of another piece), the median gap is 0.013–0.029 a scene; Breaking Bad's,
-remeshed, 0.003–0.012. So remeshing does not reproduce these scans' breaks;
-`docs/PROJECT-STATE.md` §21.
+0.05 of another piece's surface), the median gap is 0.011–0.029 a scene
+(0.0184 over the 27); Breaking Bad's, remeshed, 0.0015–0.011. On a
+`bone_real` object measured at full resolution the gap is the same as after
+the conversion's thinning, and a rigid motion of the pieces does not close it:
+it is in the scans.
+
+`--remesh_gap 0.03` opens Breaking Bad's breaks that far. Over five draws of
+each of those seven scenes, the draws opened by 0.01 or more come to a median
+gap of 0.0117–0.0226 on six of them (0.0190 over the draws), with 26–57% of
+the contact within 0.005 (the scans, 20–55%); no face is turned over, and the
+share of vertices labelled fracture moves by at most 2.2 points. The seventh,
+a spoon in 50 pieces too thin for it, opens less (0.0052–0.0075) and its
+labels gain 5.6–8.4 points. A scene can come out barely opened, so closed
+breaks stay in the training too. The opening adds 13–85 ms to a scene (the
+spoon, 140–171). `docs/PROJECT-STATE.md` §21.
 
 ```bash
 pip install fast-simplification
-python -m scripts.train --root_dir data --checkpoint_dir checkpoint-contact --init_from checkpoint-final/best.pt --hidden_channels 128 --contact_radius 0.015 --remesh 0.5 0.9 --remesh_jitter 0.001
-python -m scripts.train --root_dir data --evaluate --checkpoint checkpoint-contact/best.pt --split val --remesh 0.5 0.9 --remesh_jitter 0.001
-python -m scripts.train --root_dir external --evaluate --checkpoint checkpoint-contact/best.pt --data_subsets bone_real --split all --modes_per_scene 0 --max_fragments 0 --checkpoint_dir eval/contact-bone_real
+python -m scripts.train --root_dir data --checkpoint_dir checkpoint-open --init_from checkpoint-final/best.pt --hidden_channels 128 --contact_radius 0.015 --remesh 0.5 0.9 --remesh_jitter 0.001 --remesh_gap 0.03
+python -m scripts.train --root_dir data --evaluate --checkpoint checkpoint-open/best.pt --split val --remesh 0.5 0.9 --remesh_jitter 0.001 --remesh_gap 0.03
+python -m scripts.train --root_dir external --evaluate --checkpoint checkpoint-open/best.pt --data_subsets bone_real --split all --modes_per_scene 0 --max_fragments 0 --checkpoint_dir eval/open-bone_real
 ```
 
 The first line takes the run's other usual flags as well. `--evaluate --remesh
-LOW HIGH [--remesh_jitter S]` scores the scenes remeshed that way — fixed per
-scene and `--seed`; the assembly scored, and dumped, on the remeshed pieces —
-and the files carry it: `val_metrics_remesh0.5-0.9j0.001.json`. A checkpoint's
-own `--remesh` never applies to an evaluation. Training refuses
-`--remesh_jitter` without `--contact_radius` (no vertex would coincide, and
+LOW HIGH [--remesh_jitter S] [--remesh_gap G]` scores the scenes remeshed that
+way — fixed per scene and `--seed`; the assembly scored, and dumped, on the
+remeshed pieces — and the files carry it:
+`val_metrics_remesh0.5-0.9j0.001g0.03.json`. A checkpoint's own `--remesh`
+never applies to an evaluation. Training refuses `--remesh_jitter` or
+`--remesh_gap` without `--contact_radius` (no vertex would coincide, and
 coincidence is all v7's term reads) and `--remesh` with `--label_method
 coincidence`.
 

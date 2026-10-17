@@ -120,6 +120,10 @@ class SceneSample(NamedTuple):
     radius, in the assembled pose -- the anchors of the distance-based
     embedding term (``nn/losses.py``, ``proximity_loss``); ``None`` when that
     term is not used."""
+    contact_points: Optional[np.ndarray] = None
+    """``(sum V, 3)``: where each vertex was, assembled and in world units,
+    before a remeshed scene's breaks were opened and its vertices jittered --
+    where the term's positives are found; ``None``: where the vertices are."""
 
 
 def _scene_token_sets(vertices, faces, masks, *, mode, metric, total, max_per_fragment):
@@ -213,6 +217,7 @@ def build_scene(
     key: str = "",
     perturb: bool = True,
     contact: Optional[np.ndarray] = None,
+    contact_points: Optional[np.ndarray] = None,
 ) -> SceneSample:
     """
     Build one scene's arrays.
@@ -220,7 +225,8 @@ def build_scene(
     ``vertices`` and ``faces`` are the fragments **in their assembled frame** --
     which is also the only frame where the coincidence labels mean anything, so
     if ``cluster`` is being computed it must already have happened, and so must
-    ``contact`` (per vertex, the fragments in order: :class:`SceneSample`).
+    ``contact`` and ``contact_points`` (per vertex, the fragments in order:
+    :class:`SceneSample`).
     ``rotations`` supplies the per-fragment perturbation; omitted, it is drawn
     from ``rng``.
 
@@ -344,8 +350,12 @@ def build_scene(
         contact = np.asarray(contact, dtype=bool)
         if contact.shape != (total,):
             raise ValueError(f"contact has {contact.shape[0]} entries for {total} vertices")
+    if contact_points is not None:
+        contact_points = np.asarray(contact_points, dtype=np.float64)
+        if contact_points.shape != (total, 3):
+            raise ValueError(f"contact_points is {contact_points.shape} for {total} vertices")
     return SceneSample(fragments, np.asarray(cluster, dtype=np.int64), category,
-                       key, Repairs(degenerate, zero_normals), contact)
+                       key, Repairs(degenerate, zero_normals), contact, contact_points)
 
 
 # --------------------------------------------------------------------------
@@ -395,6 +405,7 @@ class Batch(NamedTuple):
     repairs: Tuple[Repairs, ...] = ()     # (S,) what build_scene had to repair
     # -- the distance-based embedding term -------------------------------------
     contact: "object" = None      # (N,) bool: another fragment's vertex within the radius
+    contact_points: "object" = None   # (N, 3) world, before a remeshed scene's opening
 
 
 def collate(samples: Sequence[SceneSample], device=None, dtype=None,
@@ -433,6 +444,8 @@ def collate(samples: Sequence[SceneSample], device=None, dtype=None,
     # A scene without the mask contributes no anchors; a batch with none of
     # them carries none.
     contacts = [] if any(sample.contact is not None for sample in samples) else None
+    # Where the positives are found; a scene without them, where its vertices are.
+    points = [] if any(sample.contact_points is not None for sample in samples) else None
 
     vertex_offset = 0
     fragment_offset = 0
@@ -478,6 +491,11 @@ def collate(samples: Sequence[SceneSample], device=None, dtype=None,
         if contacts is not None:
             contacts.append(np.zeros(vertex_offset - scene_start, bool)
                             if sample.contact is None else sample.contact)
+        if points is not None:
+            points.append(np.concatenate([f.target_vertices * f.divisor
+                                          + (0.0 if f.centroid is None else f.centroid)
+                                          for f in sample.fragments])
+                          if sample.contact_points is None else sample.contact_points)
 
     def cat(parts, kind=dtype):
         if not parts:
@@ -540,6 +558,7 @@ def collate(samples: Sequence[SceneSample], device=None, dtype=None,
         scene_keys=tuple(sample.key for sample in samples),
         repairs=tuple(sample.repairs for sample in samples),
         contact=None if contacts is None else cat(contacts, torch.bool),
+        contact_points=None if points is None else cat(points),
     )
 
 

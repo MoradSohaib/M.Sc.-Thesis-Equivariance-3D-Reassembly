@@ -224,6 +224,20 @@ class Config:
     its twin was (0.001: none of seven Breaking Bad scenes kept one). 0: none.
     The fracture labels are computed before it: on those scenes 0.001 made the
     dihedral test flag 90% to 99.5% of the vertices."""
+    remesh_gap: float = 0.0
+    """
+    With ``remesh``: open the breaks of every training scene, as scanned
+    breaks are open -- each piece's break vertices moved along the break's
+    normal by a smooth random amount, inward or outward, with a mean opening
+    drawn per scene from [0, ``remesh_gap``] (:func:`reassembly.data.remesh.
+    open_pieces`). Measured on Fractura's 27 real scenes, where the pieces
+    face each other the median gap is 0.011 to 0.029 (0.0184 over the scenes);
+    on six Breaking Bad scenes opened by 0.01 or more at 0.03, 0.0117 to
+    0.0226 (0.0190). The positives of the distance-based term are taken where
+    the vertices were before the opening and the jitter, so the two sides of a
+    break stay each other's positives however far apart they are moved. 0:
+    closed, as stored.
+    """
     # No translation setting, and that is deliberate rather than an omission.
     # `build_scene` applies rotation only, then centres every fragment at its
     # own centroid -- which removes any translation that had been applied. A
@@ -489,9 +503,10 @@ class Config:
             if len(self.remesh) != 2:
                 raise ValueError(f"remesh is two numbers, LOW HIGH, got {self.remesh!r}")
             self.remesh = tuple(float(value) for value in self.remesh)
-            check_remesh(*self.remesh, self.remesh_jitter)
-        elif self.remesh_jitter:
-            raise ValueError("remesh_jitter applies to remeshed pieces: give --remesh LOW HIGH")
+            check_remesh(*self.remesh, self.remesh_jitter, self.remesh_gap)
+        elif self.remesh_jitter or self.remesh_gap:
+            raise ValueError("remesh_jitter and remesh_gap apply to remeshed pieces: give "
+                             "--remesh LOW HIGH")
         from .data.catalog import BALANCE_SCHEMES, SPLIT_MODES
 
         if self.split_by not in SPLIT_MODES:
@@ -647,7 +662,7 @@ class BreakingBadScenes:
         # split's augmentation, or what an evaluation asks for (`remesh`, a
         # `Remesh`). Validation is never remeshed by the training settings.
         if remesh is None and split == "train" and config.remesh is not None:
-            remesh = Remesh(*config.remesh, config.remesh_jitter)
+            remesh = Remesh(*config.remesh, config.remesh_jitter, config.remesh_gap)
         if remesh is not None and config.label_method == "coincidence":
             raise ValueError("--label_method coincidence finds a break by its coincident "
                              "vertices, which remeshing removes: use dihedral with --remesh")
@@ -866,7 +881,8 @@ class BreakingBadScenes:
         Per vertex, whether a vertex of another piece lies within
         ``contact_radius`` -- the anchors of the distance-based embedding term
         -- in the ASSEMBLED frame, like the clusters; ``None`` unless that term
-        is on.
+        is on. For a remeshed scene, ``meshes`` are the pieces before the
+        opening and the jitter (:meth:`_remeshed`).
         """
         from .mesh.correspondence import contact_vertices
 
@@ -915,13 +931,18 @@ class BreakingBadScenes:
             return Skipped(key, "non-finite vertex coordinates")
 
         draw = stable_seed(key, self.epoch_seed, config.seed) if seed is None else seed
-        surface = meshes
+        closed = surface = meshes
+        points = None
         if self.remesh is not None:
             # Labelled before the jitter: the dihedral test reads the noise as
-            # fracture (data/remesh.py). Everything else reads the moved pieces.
-            surface, meshes = self._remeshed(key, vertices, faces)
+            # fracture (data/remesh.py). The positives are where the vertices
+            # were before the opening and the jitter, so the two sides of an
+            # opened break stay each other's. The model reads the moved pieces.
+            closed, surface, meshes = self._remeshed(key, vertices, faces)
             vertices = [m.vertices for m in meshes]
             faces = [m.faces for m in meshes]
+            if config.supervise_embedding and config.contact_radius > 0:
+                points = np.concatenate([m.vertices for m in closed])
         return build_scene(
             vertices, faces, self.labels(surface),
             category=self.catalog.objects[scene_index].category or "(uncategorised)",
@@ -935,7 +956,8 @@ class BreakingBadScenes:
             cluster=self.clusters(meshes),
             key=key,
             perturb=(not config.perturb_on_device) if perturb is None else perturb,
-            contact=self.contact(meshes),
+            contact=self.contact(closed),
+            contact_points=points,
         )
 
     def __getitem__(self, i: int):
@@ -946,18 +968,23 @@ class BreakingBadScenes:
         The pieces remeshed by ``self.remesh``, from their own stream -- so
         the perturbation and the tokens draw what they would have -- and per
         epoch like them: every epoch remeshes a training scene afresh, and
-        one epoch the same way every time it is asked. ``(surface, moved)``:
-        the collapsed pieces before the jitter, which the fracture labels are
-        computed on, and after it, what the model reads -- the same faces.
+        one epoch the same way every time it is asked. ``(closed, surface,
+        moved)``, all with the same faces: the collapsed pieces, where the
+        positives are found; after the opening (``gap``), which the fracture
+        labels are computed on; and after the jitter, what the model reads.
         """
-        from .data.remesh import collapse_pieces, jitter_pieces
+        from .data.remesh import break_masks, collapse_pieces, jitter_pieces, open_pieces
 
         rng = np.random.default_rng(stable_seed(key, self.epoch_seed, self.config.seed,
                                                 "remesh"))
-        vertices, faces = collapse_pieces(vertices, faces, rng, self.remesh)
-        moved = jitter_pieces(vertices, rng, self.remesh.jitter)
-        return ([_Mesh(v, f) for v, f in zip(vertices, faces)],
-                [_Mesh(v, f) for v, f in zip(moved, faces)])
+        collapsed, faces = collapse_pieces(vertices, faces, rng, self.remesh)
+        opened = collapsed
+        if self.remesh.gap:
+            opened = open_pieces(collapsed, faces, break_masks(vertices, collapsed), rng,
+                                 self.remesh.gap)
+        moved = jitter_pieces(opened, rng, self.remesh.jitter)
+        return tuple([_Mesh(v, f) for v, f in zip(stage, faces)]
+                     for stage in (collapsed, opened, moved))
 
     def pieces(self, i: int) -> list:
         """
@@ -971,7 +998,7 @@ class BreakingBadScenes:
         vertices = [np.asarray(m.vertices, dtype=np.float64) for m in meshes]
         if not all(np.isfinite(v).all() for v in vertices):
             return meshes
-        return self._remeshed(self.key(i), vertices, [np.asarray(m.faces) for m in meshes])[1]
+        return self._remeshed(self.key(i), vertices, [np.asarray(m.faces) for m in meshes])[2]
 
 
 def stable_seed(*parts) -> int:
@@ -1229,9 +1256,12 @@ def _forward(model, batch, criterion, config, keep=None, score=None, drop=0.0):
             chosen = batch.contact
             fragment = batch.vertex_fragment[chosen]
             embeddings = prediction.vertex_embedding[chosen]
-            near = dict(positions=batch.target_vertices[chosen] * batch.unit[fragment, None]
-                        + batch.centroid[fragment],
-                        groups=fragment, scenes=batch.fragment_scene[fragment])
+            # Where they were before a remeshed scene's opening and jitter
+            # (`contact_points`), else where the model's vertices are.
+            where = (batch.contact_points[chosen] if batch.contact_points is not None
+                     else batch.target_vertices[chosen] * batch.unit[fragment, None]
+                     + batch.centroid[fragment])
+            near = dict(positions=where, groups=fragment, scenes=batch.fragment_scene[fragment])
     elif batch.num_clusters:
         chosen, renumbered, clusters = clustered_vertices(batch.cluster)
         if clusters:
@@ -2187,18 +2217,18 @@ _DATA = ("label_method", "sharp_threshold", "tokens_per_scene", "token_mode",
          # scenes. A resume onto one also resets the best-so-far (`train`).
          "max_fragments", "min_fragments",
          # What the embedding term is and what the training scenes look like.
-         "contact_radius", "contact_band", "remesh", "remesh_jitter")
+         "contact_radius", "contact_band", "remesh", "remesh_jitter", "remesh_gap")
 # Data fields added after checkpoints were first written, read as what those
 # runs did: a checkpoint without `max_fragments` or `min_fragments` used every
 # break pattern, and one without the rest trained on coincidence clusters,
 # with the pieces as stored.
 _DATA_BEFORE_IT_EXISTED = {"max_fragments": None, "min_fragments": None,
                            "contact_radius": 0.0, "contact_band": 2.0,
-                           "remesh": None, "remesh_jitter": 0.0}
+                           "remesh": None, "remesh_jitter": 0.0, "remesh_gap": 0.0}
 # Data fields that shape the TRAINING scenes only: a resume onto a change is
 # announced like any other, but an evaluation does not take them from the
 # checkpoint -- it is remeshed only when it is asked to be (`evaluate`).
-_TRAINING_ONLY = ("remesh", "remesh_jitter")
+_TRAINING_ONLY = ("remesh", "remesh_jitter", "remesh_gap")
 
 
 def _resume_path(config: Config, default: Path) -> Optional[Path]:
@@ -2671,12 +2701,13 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
     if not config.supervise_embedding:
         raise ValueError("supervise_embedding=False leaves nothing to train: the embedding "
                          "term is the only one, and it needs the coincidence clusters")
-    if config.remesh_jitter and not config.contact_radius:
+    if (config.remesh_jitter or config.remesh_gap) and not config.contact_radius:
         # Measured: jitter 0.001 left no coincident vertex in seven Breaking Bad
-        # scenes, and coincidence is all the term reads without --contact_radius.
-        raise ValueError("--remesh_jitter leaves no vertex where its twin was, and the "
-                         "coincidence term (--contact_radius 0) has nothing else to train on: "
-                         "give --contact_radius")
+        # scenes, and the opening moves every break vertex; coincidence is all
+        # the term reads without --contact_radius.
+        raise ValueError("--remesh_jitter and --remesh_gap leave no vertex where its twin was, "
+                         "and the coincidence term (--contact_radius 0) has nothing else to "
+                         "train on: give --contact_radius")
     _seed_everything(config.seed + rank)
     out_dir = Path(config.out_dir)
     if main:
@@ -3157,8 +3188,9 @@ def _contact_banner(config: Config) -> List[str]:
     if config.remesh is not None:
         low, high = config.remesh
         lines.append(f"  remeshed      each training piece on its own: {low:.0%}-{high:.0%} of its "
-                     f"faces kept" + (f", jitter {config.remesh_jitter:g}"
-                                      if config.remesh_jitter else "")
+                     f"faces kept" + (f", breaks opened up to {config.remesh_gap:g}"
+                                      if config.remesh_gap else "")
+                     + (f", jitter {config.remesh_jitter:g}" if config.remesh_jitter else "")
                      + "; validation as stored")
     if config.init_from:
         lines.append(f"  init from     {config.init_from} (weights only)")
@@ -3214,7 +3246,7 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
              jitter: float = 0.0, drop: float = 0.0,
              predictions: Optional[str] = None,
              remesh: Optional[Sequence[float]] = None,
-             remesh_jitter: float = 0.0) -> Dict[str, float]:
+             remesh_jitter: float = 0.0, remesh_gap: float = 0.0) -> Dict[str, float]:
     """
     Score a saved checkpoint on a held-out split: the rotations stage two fits
     from its embedding matches, their four geometric scores, and -- with
@@ -3254,8 +3286,9 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
 
     ``remesh`` (``LOW, HIGH``) scores every scene with each piece remeshed on
     its own, as training does with ``--remesh`` (:mod:`reassembly.data.remesh`),
-    and ``remesh_jitter`` adds its noise: breaks whose sides no longer share
-    their vertices, on the geometry the scenes have. The draws are fixed per
+    and ``remesh_jitter`` adds its noise and ``remesh_gap`` opens the breaks:
+    breaks whose sides no longer share their vertices, on the geometry the
+    scenes have. The draws are fixed per
     scene and ``config.seed``; the assembly is scored on the remeshed pieces.
     A checkpoint's own ``--remesh``, the training augmentation, never applies
     here.
@@ -3304,10 +3337,12 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
     if remesh is not None:
         if len(remesh) != 2:
             raise ValueError(f"remesh is two numbers, LOW HIGH, got {remesh!r}")
-        check_remesh(float(remesh[0]), float(remesh[1]), remesh_jitter)
-        spec = Remesh(float(remesh[0]), float(remesh[1]), float(remesh_jitter))
-    elif remesh_jitter:
-        raise ValueError("remesh_jitter applies to remeshed pieces: give remesh LOW HIGH")
+        check_remesh(float(remesh[0]), float(remesh[1]), remesh_jitter, remesh_gap)
+        spec = Remesh(float(remesh[0]), float(remesh[1]), float(remesh_jitter),
+                      float(remesh_gap))
+    elif remesh_jitter or remesh_gap:
+        raise ValueError("remesh_jitter and remesh_gap apply to remeshed pieces: give remesh "
+                         "LOW HIGH")
     if predictions and not assemble:
         raise ValueError("predictions are placed scenes: they need the assembly, so not "
                          "with --no_assemble")
@@ -3364,7 +3399,8 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
     if jitter or drop:
         summary["noise"] = {"jitter": jitter, "drop": drop}
     if spec is not None:
-        summary["remesh"] = {"low": spec.low, "high": spec.high, "jitter": spec.jitter}
+        summary["remesh"] = {"low": spec.low, "high": spec.high, "jitter": spec.jitter,
+                             "gap": spec.gap}
     # What was scored, and with what: the report's header, kept in the file so
     # a report rebuilt from it (scripts/report_metrics.py) reads the same.
     summary["evaluation"] = {
@@ -3790,16 +3826,20 @@ def _noise_line(noise: Dict[str, float]) -> str:
 
 
 def _remesh_suffix(spec) -> str:
-    """``_remesh0.5-0.9`` (``j0.001`` for a jitter) for output file names; empty without."""
+    """``_remesh0.5-0.9`` (``j0.001`` for a jitter, ``g0.03`` for an opening) for
+    output file names; empty without."""
     if spec is None:
         return ""
-    return f"_remesh{spec.low:g}-{spec.high:g}" + (f"j{spec.jitter:g}" if spec.jitter else "")
+    return (f"_remesh{spec.low:g}-{spec.high:g}" + (f"j{spec.jitter:g}" if spec.jitter else "")
+            + (f"g{spec.gap:g}" if spec.gap else ""))
 
 
 def _remesh_line(remesh: Dict[str, float]) -> str:
     """The report's line for an evaluation on remeshed scenes."""
     return (f"  remeshed          each piece on its own, {remesh['low']:.0%}-{remesh['high']:.0%} "
-            f"of its faces kept" + (f", jitter {remesh['jitter']:g}" if remesh.get("jitter") else "")
+            f"of its faces kept" + (f", breaks opened up to {remesh['gap']:g}"
+                                    if remesh.get("gap") else "")
+            + (f", jitter {remesh['jitter']:g}" if remesh.get("jitter") else "")
             + "\n                    (data/remesh.py): the breaks no longer share their "
               "vertices; scored on the remeshed pieces")
 

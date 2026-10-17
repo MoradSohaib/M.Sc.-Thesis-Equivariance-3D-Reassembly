@@ -272,11 +272,11 @@ MARKERS = [
     ("the contact mask carried into the batch", "src/reassembly/data/features.py",
      "contact=None if contacts is None else cat(contacts, torch.bool)"),
     ("the term trained on the contact vertices", "src/reassembly/training.py",
-     "near = dict(positions=batch.target_vertices[chosen] * batch.unit[fragment, None]"),
+     "near = dict(positions=where, groups=fragment"),
     ("a new run from another run's weights (--init_from)", "src/reassembly/training.py",
      "def _start_from("),
     ("an evaluation remeshed only when asked", "src/reassembly/training.py",
-     '_TRAINING_ONLY = ("remesh", "remesh_jitter")'),
+     '_TRAINING_ONLY = ("remesh", "remesh_jitter", "remesh_gap")'),
     ("--remesh LOW HIGH on the command line", "scripts/config_flags.py",
      'elif name == "remesh":'),
     ("dumps hold the pieces as the model saw them", "scripts/dump_prediction.py",
@@ -287,6 +287,14 @@ MARKERS = [
      "vertices, faces, self.labels(surface),"),
     ("the collapse and the jitter as two steps", "src/reassembly/data/remesh.py",
      "def collapse_pieces("),
+    ("breaks opened (--remesh_gap)", "src/reassembly/data/remesh.py",
+     "def open_pieces("),
+    ("no face turned over by the opening", "src/reassembly/data/remesh.py",
+     "def _unturned("),
+    ("positives found where the vertices were before the opening",
+     "src/reassembly/training.py", "batch.contact_points[chosen]"),
+    ("opening tests", "tests/test_contact.py",
+     "def test_an_opened_break_turns_no_face_over"),
 ]
 
 

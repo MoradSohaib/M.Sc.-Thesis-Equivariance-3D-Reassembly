@@ -96,6 +96,9 @@ HELP = {
               "score remeshed scenes. Needs fast-simplification",
     "remesh_jitter": "with --remesh: Gaussian noise of this standard deviation on "
                      "every vertex after remeshing, in world units",
+    "remesh_gap": "with --remesh: open every break, as scanned breaks are open -- each "
+                  "side moved along the break's normal by a smooth random amount, the "
+                  "mean opening drawn per scene from [0, this], in world units",
     "init_from": "start a NEW run from this checkpoint's weights (fine-tuning): the "
                  "optimizer, the schedule and the history start fresh; ignored when "
                  "the run resumes from its own checkpoint",

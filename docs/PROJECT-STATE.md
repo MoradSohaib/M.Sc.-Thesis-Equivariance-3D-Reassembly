@@ -11,7 +11,7 @@ implementing anything from it.
 
 | | |
 |---|---|
-| Pipeline | **built** — 589 tests, clean under `-W error` |
+| Pipeline | **built** — 596 tests, clean under `-W error` |
 | Dataset pass | 1,096,825 fragments across 1,442 objects |
 | Fracture surface | 10.6% of vertices, dataset-wide |
 | Model | **built and verified** — equivariance checked numerically in float64 |
@@ -31,7 +31,7 @@ implementing anything from it.
 | Thesis v7, no head | the rotation head removed: trained on the embedding term alone, every rotation fitted from the matches, the four geometric terms scores only, `best.pt` on validation acc@5; `--split all`, `--predictions` — see §18 |
 | Above the benchmark range | `--min_fragments 21 --max_fragments 0` scores the patterns 2–20 leaves out; the two runs score every pattern once — see §19 |
 | Other datasets | Fractura and Fantastic Breaks converted into Breaking Bad's layout — cleaned, scaled, thinned to the training density unless the pieces share their breaks — and evaluated unchanged — see §20 |
-| Breaks that share no vertex | the embedding term's positives by distance (`--contact_radius`), each training piece remeshed on its own (`--remesh`), a new run from a checkpoint's weights (`--init_from`), `--evaluate --remesh`; one fine-tune, before the jitter's labels were fixed: `fractura_real` still at chance, its breaks 1–2 edges apart — see §21 |
+| Breaks that share no vertex | the embedding term's positives by distance (`--contact_radius`), each training piece remeshed on its own (`--remesh`) and its breaks opened as the scans' are (`--remesh_gap`), a new run from a checkpoint's weights (`--init_from`), `--evaluate --remesh`; one fine-tune, before the jitter's labels were fixed: `fractura_real` still at chance; the opening not yet trained — see §21 |
 
 ---
 
@@ -1615,28 +1615,35 @@ The remeshing measurements above are unaffected. The labels were not measured
 before the jitter was chosen; they should have been.
 
 **The scans' breaks do not close.** Measured on the fine-tune's
-`fractura_real` dumps (the meshes the model got, in the assembled pose) and on
-the seven Breaking Bad scenes, as stored and remeshed as training remeshed
-them; per vertex, the nearest vertex of another piece, in units of the
-object's largest side:
+`fractura_real` dumps (the meshes the model got, in the assembled pose), on the
+seven Breaking Bad scenes as stored and as training remeshed them, and on one
+`bone_real` object, `pig_bone_1` (the user's one-object copy of the HDF5:
+1,650,918 faces, median edge 0.0014), at full resolution and thinned to 0.0162
+as the converter thins (both read and cleaned by `data/external.py`); per
+vertex, the distance to the other pieces' surface, in units of the object's
+largest side:
 
-| | Breaking Bad, stored | remeshed (training) | `fractura_real` |
-|---|---|---|---|
-| median edge | 0.0064–0.023 | 0.0082–0.028 | 0.016–0.017 |
-| vertices within 0.005 of another piece | 5–65% | 3–63% | 0.2–3.0% |
-| of the vertices within 0.015, the share within 0.005 | 79–98% | 72–88% | 5–22% |
-| median gap among vertices within 0.05 | 0–0.011 | 0.003–0.012 | 0.013–0.029 |
+| | Breaking Bad, stored | remeshed (training) | `fractura_real`, thinned | `pig_bone_1`, full | `pig_bone_1`, thinned |
+|---|---|---|---|---|---|
+| median edge | 0.0064–0.023 | 0.0082–0.028 | 0.016–0.017 | 0.0014 | 0.016 |
+| of the vertices within 0.015, the share within 0.005 | 79–97% | 77–97% | 20–55% | 48% | 50% |
+| of the vertices within 0.05: the gap's first quartile | 0 | 0.0006–0.0013 | 0.0038–0.0175 | 0.0054 | 0.0053 |
+| of the vertices within 0.05: the median gap | 0–0.010 | 0.0015–0.011 | 0.011–0.029 | 0.015 | 0.016 |
 
-On Breaking Bad the two sides of a break, remeshed or not, lie within a
-fraction of an edge of each other; on the scans they sit one to two edges
-apart. The same kinds of object agree: Breaking Bad's bowl, plate, vase and
-wine bottle, remeshed, 0.004–0.012; Fractura's bowl, plate, pots and bottles
-0.013–0.021. The fine-tune trained on the first condition. Not separated: how
-much of the scans' gap is in the scans (lost material, noise, the dataset's
-assembled pose) and how much the conversion's thinning: on the seven real
-objects measured in §20 it took median edges of 0.0015–0.0052 to the target
-and kept every vertex within half a target edge of an original one, each piece
-on its own. The full-resolution pieces would separate them.
+- The thinning does not make the gap: on `pig_bone_1` every row is the same
+  at full resolution and thinned.
+- Nor does an offset of the stored pose: moving each piece of `pig_bone_1`
+  rigidly onto the others (point-to-point ICP on its vertices within 0.05, 60
+  iterations, full resolution) takes their median gap from 0.012–0.019 only to
+  0.007–0.009, by motions of 1.3–12.7° and 0.015–0.070, still sliding.
+- So the scanned surfaces themselves do not fit to within a few thousandths of
+  the object; on Breaking Bad, remeshed or not, the nearest quarter of the
+  facing vertices is within 0.0013. The fine-tune trained on that.
+- This table replaces a first version measured to the nearest vertex of
+  another piece rather than its surface. Without twins, that measure grows
+  with the edge: on `pig_bone_1` thinned it put 13% of the contact within
+  0.005 against 50% to the surface, and the first version gave
+  `fractura_real` 5–22% where the surface gives 20–55%.
 
 Also wrong, and not fixed: on a converted set the report's "N of them shapes
 the checkpoint was trained on" (20 of 27, 75 of 93) counts the objects the
@@ -1647,6 +1654,93 @@ under `external` — though none of them was in training. No score depends on it
 (`test_the_noise_moves_the_vertices_not_the_fracture_labels`; `pieces` checked
 against the scene's own vertices); each of 52 mutations of §21's code fails a test; 130 version markers.
 
-**Next.** The scans' gap at full resolution. If the thinning makes it, the
-conversion changes; if the scans have it, training needs Breaking Bad breaks
-opened by that much, checked against the table above before a run.
+**Next.** Training for scans needs Breaking Bad breaks that open like these
+— the two sides of a break moved apart by gaps distributed like the scans',
+checked against the table above before a run — and a contact radius that
+reaches across them: 0.015 takes in half of the scans' vertices within 0.05.
+Done the same day, below.
+
+### Opening the breaks (Oct 17)
+
+**What changed.** `--remesh_gap G` (with `--remesh`; off by default):
+
+- `data/remesh.py`, `open_pieces`, between the collapse and the jitter. A
+  scene draws a mean opening from `[0, G]`; each piece's break vertices
+  (`break_masks`: those whose nearest stored vertex had a twin) move along the
+  break's normal by `s(x) = m (1 + g(x))`, `m` half the scene's draw, `g` a
+  smooth unit-variance random field (32 random Fourier features of a Gaussian
+  of length 0.026), one per piece — inward where `s` is positive, outward into
+  the other piece where negative — so the two sides stand `2m` apart on
+  average and touch or overlap in places. The length is the scans': the gap of
+  two vertices of a `fractura_real` piece correlates 0.96 at 0–0.01 apart, 0.84
+  at 0.01–0.02, 0.51 at 0.02–0.04 and 0.02 at 0.04–0.08 (medians over the 27
+  scenes); the field, 0.85 at 0.015, 0.51 at 0.03, 0.07 at 0.06.
+- The direction is the break's normal averaged over the break with a Gaussian
+  of width 0.026; the vertices within 3|s| of the break move as their nearest
+  break vertex does, by a smoothstep weight from 1 at the break to 0 there;
+  and wherever a face would still turn over, its corners move half as far,
+  again until none does (zero after eight halvings; a face of no area is left
+  out).
+- `BreakingBadScenes._remeshed` returns the collapsed, the opened and the
+  moved pieces: the fracture labels from the opened ones (before the jitter),
+  the contact mask from the collapsed ones, and the term's positives found
+  where the vertices were before the opening — `SceneSample.contact_points`,
+  `Batch.contact_points`, read by `_forward` — so the two sides of an opened
+  break stay each other's positives however far apart they move. A scene that
+  is not remeshed carries none, and its positives are where its vertices are,
+  as before.
+- `--evaluate --remesh LOW HIGH --remesh_gap G` scores opened scenes (`g0.03`
+  in the file names, the report line, `summary["remesh"]["gap"]`); refused
+  without `--remesh`, or below 0; training refuses it without
+  `--contact_radius`; never taken from a checkpoint (`_TRAINING_ONLY`).
+
+**Measured** — five draws of each of the seven scenes at `--remesh 0.5 0.9
+--remesh_jitter 0.001 --remesh_gap 0.03`, measured as the scans were (the
+distance to the other pieces' surface, among the vertices within 0.05 of it);
+the draws opened by 0.01 or more (a third of the scenes open by less):
+
+| | six scenes (18 draws) | the spoon, 50 pieces (5) | `fractura_real` (27 scenes) |
+|---|---|---|---|
+| of the vertices within 0.015, the share within 0.005 | 26–57% (median 34%) | 49–61% | 20–55% (39%) |
+| the gap's first quartile | 0.0047–0.0130 (0.0088) | 0.0019–0.0031 | 0.0038–0.0175 (0.0081) |
+| the median gap | 0.0117–0.0226 (0.0190) | 0.0052–0.0075 | 0.011–0.029 (0.0184) |
+
+A spread of 1.8 instead of 1 gave the six scenes 42–57% (52%) and a first
+quartile of 0.0034–0.0069 (0.0045), farther from the scans. The spoon's pieces
+are too thin for the step, and the guard holds them back.
+
+Faces turned over (normal more than 90° from where it was), on the same 23
+draws, by three versions of the opening, before the guard:
+
+| | the break's faces | the faces beside it | all faces |
+|---|---|---|---|
+| each vertex along its own normal | 8–25% | 14–49% | 1.0–26% |
+| along the averaged normal | 0–5% | 13–46% | 0.7–17% |
+| and the vertices beside it moving with it | 0–5% | 0.5–9% | 0.03–2% (six), 4–9% (spoon) |
+
+After the guard none is; it keeps 55–96% of the step on the six scenes and
+29–54% on the spoon, and 0.1–1.6% of the faces turn by more than 60° (the
+spoon, 3.7–6.3%). Over all 35 draws: the share of vertices labelled fracture
+goes from 13–85% to 15–88% — at most 2.2 points more on the six, 5.6–8.4 on
+the spoon; the positives, from the pieces before the opening, still find
+96–100% of the break; the opening takes 13–85 ms a scene (the spoon,
+140–171).
+
+**Not yet measured.** No network has been trained with the opening.
+
+**Verified.** 596 tests, clean under `-W error` (seven new in
+`tests/test_contact.py`: the flat break opened along its normal, a field per
+side, the mean opening; the vertices beside a break; no face turned over on a
+rough break, where moved as asked 164 would be, and a face of no area left
+alone; the break carried over to the collapse; the dataset's positives where
+the pieces met; `contact_points` through the batch and the forward pass; the
+script handing `--remesh_gap` to an evaluation); each of 85 mutations of §21's
+code fails a test (one only after a test was added for it: on the test
+scenes, whose breaks are open rims the collapse keeps, breaks found on the
+collapse looked the same); 134 version markers.
+
+**Next.** Fine-tune from `checkpoint-final/best.pt` (not `checkpoint-contact`,
+whose labels were the jitter's) with `--contact_radius 0.015 --remesh 0.5 0.9
+--remesh_jitter 0.001 --remesh_gap 0.03`; score it on Everyday's validation
+scenes as stored and opened, on `bone_synthetic`, and on `bone_real`,
+`fractura_real` and Fantastic Breaks.

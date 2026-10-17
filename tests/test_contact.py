@@ -19,8 +19,8 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from reassembly.data.features import build_scene  # noqa: E402
-from reassembly.data.remesh import (Remesh, collapse_pieces, jitter_pieces,  # noqa: E402
-                                    remesh_pieces)
+from reassembly.data.remesh import (GAP_REACH, Remesh, break_masks, collapse_pieces,  # noqa: E402
+                                    jitter_pieces, open_pieces, remesh_pieces)
 from reassembly.data.transforms import random_rotations  # noqa: E402
 from reassembly.mesh.correspondence import (compute_scene_correspondence,  # noqa: E402
                                             contact_vertices, find_shared_points)
@@ -99,6 +99,16 @@ def test_remeshing_is_repeatable_and_draws_each_piece_its_share(fractured_solid)
     collapsed, kept = collapse_pieces(vertices, faces, rng, spec)
     moved = jitter_pieces(collapsed, rng, spec.jitter)
     assert all(np.array_equal(a, b) for a, b in zip(moved + kept, first[0] + first[1]))
+    # With an opening, it comes between the two, on the breaks the pieces share.
+    opened = Remesh(0.4, 0.9, jitter=1e-3, gap=0.3)
+    rng = np.random.default_rng(3)
+    collapsed, kept = collapse_pieces(vertices, faces, rng, opened)
+    moved = jitter_pieces(open_pieces(collapsed, kept, break_masks(vertices, collapsed), rng,
+                                      opened.gap), rng, opened.jitter)
+    whole = remesh_pieces(vertices, faces, np.random.default_rng(3), opened)
+    assert all(np.array_equal(a, b) for a, b in zip(moved + kept, whole[0] + whole[1]))
+    assert all(np.array_equal(a, b) for a, b in zip(kept, first[1]))
+    assert np.abs(np.concatenate(whole[0]) - np.concatenate(first[0])).max() > 0.01
     # A piece too small to collapse keeps its faces, and the jitter still moves it.
     tiny_v = np.array([[1.0, 0, 0], [0, 1, 0], [0, 0, 1], [0, 0, 0]])
     tiny_f = np.array([[0, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2]])
@@ -171,6 +181,136 @@ def test_remesh_settings_are_checked():
     with pytest.raises(ValueError, match="contact_band"):
         Config(contact_radius=0.01, contact_band=0.5)
     assert Config(remesh=[0.5, 0.9]).remesh == (0.5, 0.9)
+    with pytest.raises(ValueError, match="give --remesh"):
+        Config(remesh_gap=0.03)
+    with pytest.raises(ValueError, match="remesh_gap is the largest mean opening"):
+        Config(remesh=(0.5, 0.9), remesh_gap=-0.01)
+
+
+# --------------------------------------------------------------------------
+# Opening the breaks
+# --------------------------------------------------------------------------
+
+def _halves(heights, n: int = 24, side: float = 0.5, depth: float = 0.4):
+    """Two closed slabs meeting on a break of the given heights (``n x n``),
+    ``side`` across -- 0.5 at 24 a side is an edge of 0.022, about Breaking
+    Bad's -- the lower one's break on top."""
+    from conftest import _build_half
+
+    x = np.linspace(-side / 2, side / 2, n)
+    gx, gy = np.meshgrid(x, x, indexing="ij")
+    interface = np.stack([gx.ravel(), gy.ravel(), np.ravel(heights)], axis=1)
+    halves = (_build_half(interface, n, -depth, upward=True),
+              _build_half(interface, n, depth, upward=False))
+    return [np.asarray(m.vertices, float) for m in halves], [np.asarray(m.faces) for m in halves]
+
+
+def _turned(before, after, faces) -> int:
+    def normals(v):
+        return np.cross(v[faces[:, 1]] - v[faces[:, 0]], v[faces[:, 2]] - v[faces[:, 0]])
+    return int((np.einsum("ij,ij->i", normals(before), normals(after)) <= 0).sum())
+
+
+def test_opening_moves_each_side_of_the_break_along_its_normal():
+    """
+    A flat break: each side's break vertices move along z and nothing else
+    does. Over 16 draws the two sides stand 1.04 times the drawn mean opening
+    apart (0.94 to 1.18 per draw), and in every draw 8.3% or more of each side
+    moves outward, into the other piece, and 12.0% or more inward by over
+    twice its mean.
+    """
+    vertices, faces = _halves(np.zeros(24 * 24))
+    breaks = break_masks(vertices, vertices)
+    assert all(b[:24 * 24].all() and not b[24 * 24:].any() for b in breaks)
+    apart = []
+    for seed in range(16):
+        opened = open_pieces(vertices, faces, breaks, np.random.default_rng(seed), 0.03)
+        mean = 0.03 * np.random.default_rng(seed).uniform()      # the scene's draw, first
+        inward = []
+        for sign, v0, v1, b in zip((-1, 1), vertices, opened, breaks):
+            moved = v1 - v0
+            assert not moved[:, :2].any() and not moved[~b].any()
+            inward.append(sign * moved[b, 2])
+            assert (inward[-1] < 0).mean() > 0.08 and (inward[-1] > mean).mean() > 0.1
+        apart.append((inward[0].mean() + inward[1].mean()) / mean)
+        assert not np.allclose(inward[0], inward[1])              # a field per side
+    assert abs(np.mean(apart) - 1.0) < 0.1
+    # Repeatable; without a gap, nothing moves and nothing is drawn.
+    again = open_pieces(vertices, faces, breaks, np.random.default_rng(15), 0.03)
+    assert all(np.array_equal(a, b) for a, b in zip(again, opened))
+    rng = np.random.default_rng(3)
+    assert all(np.array_equal(a, b) for a, b in
+               zip(open_pieces(vertices, faces, breaks, rng, 0.0), vertices))
+    assert rng.uniform() == np.random.default_rng(3).uniform()
+    # The draws do not depend on the masks: a piece with no break stays, and
+    # the other's field is the one it would have had.
+    rng, other = np.random.default_rng(4), np.random.default_rng(4)
+    one = open_pieces(vertices, faces, [np.zeros_like(breaks[0]), breaks[1]], rng, 0.03)
+    both = open_pieces(vertices, faces, breaks, other, 0.03)
+    assert np.array_equal(one[0], vertices[0]) and np.array_equal(one[1], both[1])
+    assert rng.uniform() == other.uniform()
+
+
+def test_the_vertices_beside_a_break_move_with_it():
+    """Half of a flat face is the break: the rest of the face moves as its
+    nearest break vertex does, by a smoothstep weight falling from 1 at the
+    break to 0 at GAP_REACH times that vertex's step; the far side stays."""
+    from scipy.spatial import cKDTree
+
+    vertices, faces = _halves(np.zeros(24 * 24))
+    v0, f = vertices[0], faces[0]
+    top = np.zeros(len(v0), bool)
+    top[:24 * 24] = True
+    mask = top & (v0[:, 0] < 0)
+    for seed in range(3):
+        (v1,) = open_pieces([v0], [f], [mask], np.random.default_rng(seed), 0.03)
+        moved = v1 - v0
+        assert not moved[:, :2].any() and not moved[~top].any()
+        distance, nearest = cKDTree(v0[mask]).query(v0)
+        step = moved[mask][nearest, 2]
+        u = np.clip(distance / (GAP_REACH * np.abs(step)), 0.0, 1.0)
+        assert np.allclose(moved[:, 2], (1.0 - u * u * (3.0 - 2.0 * u)) * step, atol=1e-15)
+        assert (moved[top & ~mask, 2] != 0).any() and (moved[top & ~mask, 2] == 0).any()
+
+
+def test_an_opened_break_turns_no_face_over():
+    """
+    A rough break (heights 0.02 against an edge of 0.022), opened by up to
+    0.1: moved as asked, 164 faces of the two pieces would turn over at this
+    draw; cut back where they would, none does, and the break still opens.
+    """
+    import reassembly.data.remesh as remesh
+
+    heights = np.random.default_rng(7).normal(scale=0.02, size=(24, 24))
+    heights[0, :] = heights[-1, :] = heights[:, 0] = heights[:, -1] = 0.0
+    vertices, faces = _halves(heights)
+    breaks = break_masks(vertices, vertices)
+    opened = open_pieces(vertices, faces, breaks, np.random.default_rng(0), 0.1)
+    for v0, v1, f, b in zip(vertices, opened, faces, breaks):
+        assert _turned(v0, v1, f) == 0
+        assert np.linalg.norm(v1 - v0, axis=1)[b].max() > 0.1
+    asked = remesh._unturned
+    try:
+        remesh._unturned = lambda vertices, faces, step: step
+        unguarded = open_pieces(vertices, faces, breaks, np.random.default_rng(0), 0.1)
+    finally:
+        remesh._unturned = asked
+    assert sum(_turned(v0, v1, f) for v0, v1, f in zip(vertices, unguarded, faces)) == 164
+    # A face of no area has no side to turn to: left out, not cut back for ever.
+    (v1,) = open_pieces([vertices[0]], [np.vstack([faces[0], [[0, 0, 1]]])], [breaks[0]],
+                        np.random.default_rng(0), 0.1)
+    assert np.array_equal(v1, opened[0])
+
+
+@pytest.mark.usefixtures("thinning")
+def test_the_break_is_carried_over_to_the_collapse(fractured_solid):
+    vertices = [np.asarray(m.vertices, float) for m in fractured_solid]
+    faces = [np.asarray(m.faces) for m in fractured_solid]
+    collapsed, _ = collapse_pieces(vertices, faces, np.random.default_rng(0), Remesh(0.5, 0.9))
+    for v, b in zip(collapsed, break_masks(vertices, collapsed)):
+        # The interface (heights of noise 0.08) is the break, the far side
+        # (z = -1.5 or 1.5) is not.
+        assert b.any() and (np.abs(v[b, 2]) < 0.5).all() and (np.abs(v[~b, 2]) > 0.5).all()
 
 
 # --------------------------------------------------------------------------
@@ -348,12 +488,55 @@ def test_settings_that_would_train_on_nothing_are_refused(tmp_path):
     # Without the jitter a share of the twins is left, and the term trains on those.
     remeshed = BreakingBadScenes(_config(root, remesh=(0.5, 0.9)), "train")
     assert (remeshed.build(0).cluster >= 0).any()
+    # Opened, no twin is left either.
+    with pytest.raises(ValueError, match="give --contact_radius"):
+        training.train(_config(root, out_dir=str(tmp_path / "run"), remesh=(0.5, 0.9),
+                               remesh_gap=0.5))
+
+
+@pytest.mark.usefixtures("thinning")
+def test_an_opened_scene_finds_its_positives_where_the_pieces_met(tmp_path):
+    root = _dataset(tmp_path / "data")
+    opened = BreakingBadScenes(_config(root, remesh=(0.5, 0.9), remesh_gap=0.5,
+                                       contact_radius=0.35), "train")
+    closed = BreakingBadScenes(_config(root, remesh=(0.5, 0.9), contact_radius=0.35), "train")
+    assert opened.remesh == Remesh(0.5, 0.9, 0.0, 0.5)
+    stored = opened.meshes(0)
+    collapsed, surface, seen = opened._remeshed(
+        opened.key(0), [np.asarray(m.vertices, float) for m in stored],
+        [np.asarray(m.faces) for m in stored])
+    sample, plain = opened.build(0), closed.build(0)
+    before = np.concatenate([m.vertices for m in collapsed])
+    # Collapsed as without the opening; the model reads the opened pieces,
+    # opened as `remesh_pieces` opens them -- on the stored pieces' breaks ...
+    assert all(np.array_equal(a.vertices, b.vertices) for a, b in zip(collapsed, closed.pieces(0)))
+    assert all(np.array_equal(a.vertices, b.vertices) for a, b in zip(seen, opened.pieces(0)))
+    from reassembly.training import stable_seed
+
+    rng = np.random.default_rng(stable_seed(opened.key(0), opened.epoch_seed, opened.config.seed,
+                                            "remesh"))
+    expected, _ = remesh_pieces([np.asarray(m.vertices, float) for m in stored],
+                                [np.asarray(m.faces) for m in stored], rng, opened.remesh)
+    assert all(np.array_equal(a.vertices, b) for a, b in zip(seen, expected))
+    world = np.concatenate(_world(sample))
+    assert np.allclose(world, np.concatenate([m.vertices for m in seen]), atol=1e-5)
+    assert np.abs(world - before).max() > 0.05
+    # ... labelled on the opened surface (no jitter here: what it reads) ...
+    assert all(np.array_equal(f.fracture, mask)
+               for f, mask in zip(sample.fragments, opened.labels(surface)))
+    # ... and its positives are where the pieces met: the same anchors as
+    # closed, found among the vertices where they were before the opening.
+    assert np.array_equal(sample.contact_points, before) and plain.contact_points is not None
+    assert np.array_equal(sample.contact, plain.contact)
+    # Not remeshed, a scene leaves the positives to where its vertices are.
+    assert BreakingBadScenes(_config(root, contact_radius=0.35), "train").build(0).contact_points is None
 
 
 def test_the_checkpoints_training_remesh_is_not_an_evaluations():
-    stored = dict(Config(remesh=(0.5, 0.9), remesh_jitter=1e-3, contact_radius=0.015).__dict__)
+    stored = dict(Config(remesh=(0.5, 0.9), remesh_jitter=1e-3, remesh_gap=0.03,
+                         contact_radius=0.015).__dict__)
     adopted = _adopt_checkpoint_settings(Config(), stored, data=True, quiet=True)
-    assert adopted.remesh is None and adopted.remesh_jitter == 0.0
+    assert adopted.remesh is None and adopted.remesh_jitter == 0.0 and adopted.remesh_gap == 0.0
     assert adopted.contact_radius == 0.015                # the term is the checkpoint's
 
 
@@ -416,6 +599,37 @@ def test_the_forward_pass_trains_on_the_contact_vertices():
     assert not bool(far.contact.any())
     loss, _, _ = _forward(model, far, build_criterion(config), config)
     assert not loss.requires_grad
+
+
+def test_the_positives_are_found_where_the_scene_says_the_vertices_were():
+    """An opened scene carries where its vertices were before the opening
+    (``contact_points``); the term finds the positives there, not where the
+    model's vertices are. A scene in the batch without them brings the
+    latter."""
+    from test_training import _scene
+
+    torch.manual_seed(0)
+    config = Config(channels=32, heads=4, contact_radius=1.0)
+    samples = []
+    for seed in (1, 2):
+        sample = _scene(seed)
+        world = _world(sample)
+        samples.append(sample._replace(contact=np.concatenate(contact_vertices(world, 1.0)),
+                                       contact_points=np.concatenate(world) + 0.5))
+    batch, _ = _collate_samples(samples)
+    criterion = _Seen(build_criterion(config))
+    _forward(build_model(config), batch, criterion, config)
+    contact = np.concatenate([s.contact for s in samples])
+    points = np.concatenate([s.contact_points for s in samples])
+    assert np.allclose(criterion.seen["positions"].numpy(), points[contact], atol=1e-5)
+    mixed, _ = _collate_samples([samples[0], samples[1]._replace(contact_points=None)])
+    expected = np.concatenate([samples[0].contact_points, np.concatenate(_world(samples[1]))])
+    assert np.allclose(mixed.contact_points.numpy(), expected, atol=1e-5)
+    assert _collate_samples([s._replace(contact_points=None) for s in samples])[0].contact_points is None
+    meshes, breaks = _unshared(0, 2)
+    with pytest.raises(ValueError, match=r"contact_points is \(3, 3\) for 362 vertices"):
+        build_scene([np.asarray(m.vertices) for m in meshes], [np.asarray(m.faces) for m in meshes],
+                    breaks, contact_points=np.zeros((3, 3)))
 
 
 def test_a_scene_without_the_mask_brings_no_anchors():
@@ -515,20 +729,22 @@ def test_trained_weights_are_not_checked_against_chance(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------
 
 @pytest.mark.usefixtures("thinning")
-def test_an_evaluation_scores_remeshed_scenes_when_asked(tmp_path):
+def test_an_evaluation_scores_remeshed_scenes_when_asked(tmp_path, capsys):
     from reassembly import training
 
     root = _dataset(tmp_path / "data")
     config = _config(root, out_dir=str(tmp_path / "run"), steps_per_epoch=1,
-                     remesh=(0.5, 0.9), remesh_jitter=1e-3, contact_radius=0.35)
+                     remesh=(0.5, 0.9), remesh_jitter=1e-3, remesh_gap=0.5, contact_radius=0.35)
     training.train(config)
+    assert ("50%-90% of its faces kept, breaks opened up to 0.5, jitter 0.001; validation as "
+            "stored") in capsys.readouterr().out
     plain = training.evaluate(_config(root, out_dir=str(tmp_path / "run")), checkpoint="last.pt",
                               split="val")
     assert "remesh" not in plain
     asked = training.evaluate(_config(root, out_dir=str(tmp_path / "run")), checkpoint="last.pt",
                               split="val", remesh=(0.5, 0.9), remesh_jitter=1e-3,
                               predictions=str(tmp_path / "predictions"))
-    assert asked["remesh"] == {"low": 0.5, "high": 0.9, "jitter": 1e-3}
+    assert asked["remesh"] == {"low": 0.5, "high": 0.9, "jitter": 1e-3, "gap": 0.0}
     assert (tmp_path / "run" / "val_metrics_remesh0.5-0.9j0.001.json").exists()
     report = (tmp_path / "run" / "val_report_remesh0.5-0.9j0.001.txt").read_text()
     assert "remeshed          each piece on its own, 50%-90% of its faces kept" in report
@@ -551,6 +767,13 @@ def test_an_evaluation_scores_remeshed_scenes_when_asked(tmp_path):
             assert sum(faces) < sum(len(m.faces) for m in stored.meshes(index))
     with pytest.raises(ValueError, match="give remesh"):
         training.evaluate(config, checkpoint="last.pt", split="val", remesh_jitter=1e-3)
+    with pytest.raises(ValueError, match="give remesh"):
+        training.evaluate(config, checkpoint="last.pt", split="val", remesh_gap=0.5)
+    opened = training.evaluate(_config(root, out_dir=str(tmp_path / "run")), checkpoint="last.pt",
+                               split="val", remesh=(0.5, 0.9), remesh_jitter=1e-3, remesh_gap=0.5)
+    assert opened["remesh"] == {"low": 0.5, "high": 0.9, "jitter": 1e-3, "gap": 0.5}
+    report = (tmp_path / "run" / "val_report_remesh0.5-0.9j0.001g0.5.txt").read_text()
+    assert "50%-90% of its faces kept, breaks opened up to 0.5, jitter 0.001" in report
 
 
 @pytest.mark.usefixtures("thinning")
@@ -569,6 +792,21 @@ def test_the_dump_script_writes_the_pieces_the_model_saw(tmp_path):
     assert faces != [len(m.faces) for m in dataset.meshes(0)]
 
 
+def test_the_script_hands_an_evaluation_its_remeshing(monkeypatch):
+    import sys
+
+    import scripts.train as script
+
+    seen = {}
+    monkeypatch.setattr(script, "evaluate", lambda config, **kw: seen.update(kw))
+    monkeypatch.setattr(sys, "argv", ["train.py", "--root_dir", "nowhere", "--evaluate",
+                                      "--remesh", "0.5", "0.9", "--remesh_jitter", "0.001",
+                                      "--remesh_gap", "0.03"])
+    script.main()
+    assert (tuple(seen["remesh"]), seen["remesh_jitter"], seen["remesh_gap"]) == (
+        (0.5, 0.9), 0.001, 0.03)
+
+
 def test_the_flags_carry_the_new_settings():
     import argparse
 
@@ -576,11 +814,12 @@ def test_the_flags_carry_the_new_settings():
 
     parser = add_config_arguments(argparse.ArgumentParser())
     args = parser.parse_args(["--remesh", "0.5", "0.9", "--remesh_jitter", "0.001",
-                              "--contact_radius", "0.015", "--contact_band", "3",
-                              "--init_from", "runs/v7/best.pt"])
+                              "--remesh_gap", "0.03", "--contact_radius", "0.015",
+                              "--contact_band", "3", "--init_from", "runs/v7/best.pt"])
     config = config_from_args(args)
-    assert (config.remesh, config.remesh_jitter, config.contact_radius, config.contact_band,
-            config.init_from) == ((0.5, 0.9), 0.001, 0.015, 3.0, "runs/v7/best.pt")
+    assert (config.remesh, config.remesh_jitter, config.remesh_gap, config.contact_radius,
+            config.contact_band, config.init_from) == ((0.5, 0.9), 0.001, 0.03, 0.015, 3.0,
+                                                       "runs/v7/best.pt")
     again = config_from_args(parser.parse_args(config_flags(config)))
     assert again == config
     with pytest.raises(SystemExit):                       # LOW and HIGH, both
