@@ -979,6 +979,35 @@ never applies to an evaluation. Training refuses `--remesh_jitter` or
 coincidence is all v7's term reads) and `--remesh` with `--label_method
 coincidence`.
 
+### Real breaks: fine-tuning on Fantastic Breaks
+
+The fine-tune above (`checkpoint-open`, Oct 18) matches synthetic breaks that
+share no vertex -- with Everyday's validation breaks opened, the first
+candidate is the partner for 32% of the anchors, and 55% on `bone_synthetic`
+-- and is at chance on every scanned set (1.2-1.7% on `fractura_real`,
+`bone_real` and Fantastic Breaks; no piece within 30°). So the next run
+trains on real breaks: Fantastic Breaks, split by object with a hash (it has
+no official lists) into 87 training, 30 validation and 33 test objects.
+
+```bash
+python -m scripts.train --root_dir external --data_subsets FB_v1 --split_source hash --val_frac 0.2 --test_frac 0.2 --checkpoint_dir checkpoint-fb --init_from checkpoint-open/best.pt --hidden_channels 128 --contact_radius 0.015 --remesh 0.7 1.0 --remesh_jitter 0.001 --steps_per_epoch 0 --epochs 100 --lr 4e-4 --lr_min 9e-5
+# the held-out objects, before (checkpoint-open) and after; then the other scanned sets
+python -m scripts.train --root_dir external --evaluate --checkpoint checkpoint-open/best.pt --data_from_flags --data_subsets FB_v1 --split test --split_source hash --val_frac 0.2 --test_frac 0.2 --contact_radius 0.015 --modes_per_scene 0 --max_fragments 0 --checkpoint_dir eval/open-FB_v1-test
+python -m scripts.train --root_dir external --evaluate --checkpoint checkpoint-fb/best.pt --data_subsets FB_v1 --split test --split_source hash --modes_per_scene 0 --max_fragments 0 --checkpoint_dir eval/fb-best-FB_v1
+python -m scripts.train --root_dir external --evaluate --checkpoint checkpoint-fb/best.pt --data_subsets fractura_real --split all --modes_per_scene 0 --max_fragments 0 --checkpoint_dir eval/fb-best-fractura_real
+# what it does to Breaking Bad: the checkpoint's data settings are Fantastic Breaks', so --data_from_flags
+python -m scripts.train --root_dir data --evaluate --checkpoint checkpoint-fb/best.pt --data_from_flags --split val --split_source official --contact_radius 0.015 --checkpoint_dir eval/fb-best-bb_val
+```
+
+An epoch is one pass (`--steps_per_epoch 0`). `--remesh 0.7 1.0` keeps the
+training pieces near the scans' density (median edge over largest side 0.0171,
+against `fractura_real`'s 0.0162; 0.0186 at 0.5-0.9); there is nothing to
+open, the pieces sharing no vertex. `best.pt` is chosen by validation acc@5 and
+stays at the first epoch while that reads 0, so score `last.pt` the same way.
+Fantastic Breaks alone for now: Breaking Bad's official split leaves out every
+object it does not list, so mixing the two needs code. `docs/PROJECT-STATE.md`
+§21.
+
 ### Reports and figures from saved results
 
 `--evaluate` writes the report it prints as `<split>_report.txt`

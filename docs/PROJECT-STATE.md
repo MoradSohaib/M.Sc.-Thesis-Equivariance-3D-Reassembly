@@ -1744,3 +1744,64 @@ whose labels were the jitter's) with `--contact_radius 0.015 --remesh 0.5 0.9
 --remesh_jitter 0.001 --remesh_gap 0.03`; score it on Everyday's validation
 scenes as stored and opened, on `bone_synthetic`, and on `bone_real`,
 `fractura_real` and Fantastic Breaks.
+
+### The opened fine-tune, and where real breaks stand (Oct 18)
+
+**The run** (`checkpoint-open`, reported by the user): from
+`checkpoint-final/best.pt` with `--contact_radius 0.015 --remesh 0.5 0.9
+--remesh_jitter 0.001 --remesh_gap 0.03 --lr 4e-4 --lr_min 9e-5`, 80 epochs of
+800 steps of 2 scenes; `best.pt` is epoch 65, validation acc@5 0.624 (Everyday
+val as stored, 2+ pieces, 8 patterns per object). Scored with `--split all
+--modes_per_scene 0 --max_fragments 0` unless named:
+
+| | match@1 | acc@5 | acc@30 | part accuracy | matches a scene (in verified fits) |
+|---|---|---|---|---|---|
+| Everyday val, as stored (epoch 80's validation) | 0.534 | 0.608 | -- | -- | -- |
+| Everyday val, opened (`--evaluate --remesh 0.5 0.9 --remesh_jitter 0.001 --remesh_gap 0.03`) | 0.323 | 0.161 | 0.308 | 0.745 | 193 (65) |
+| `bone_synthetic`, as converted (breaks shared) | 0.676 | 0.638 | 0.650 | 0.799 | 871 (529) |
+| `bone_synthetic`, opened | 0.551 | 0.212 | 0.493 | 0.694 | 549 (209) |
+| `fractura_real` | 0.012 | 0.000 | 0.000 | 0.037 | 424 (4) |
+| `bone_real` | 0.017 | 0.000 | 0.000 | 0.019 | 255 (2) |
+| Fantastic Breaks (`FB_v1`, 150) | 0.012 | 0.000 | 0.000 | 0.027 | 173 (1) |
+
+- The network matches synthetic breaks that share no vertex: opened, the
+  first candidate is the partner for 32% (Everyday) and 55% (`bone_synthetic`)
+  of the anchors, against 1.2-1.7% on the three scanned sets. Sharing no
+  vertex is not why the scans fail; their breaks are.
+- Opened breaks cost precision where matching holds: acc@5 0.61-0.64 as stored,
+  0.16-0.21 opened, while acc@30 and part accuracy fall less. The matched
+  points are a gap apart, so the fitted rotation is a few degrees off; fewer
+  pairs pass the verification (reached 36% against 75% on Everyday val).
+- The scans are clean meshes: all 94 pieces of the 27 `fractura_real` scenes
+  are closed, of one component and wound outward (16 have a few non-manifold
+  edges; Breaking Bad's 96 pieces, none) -- not a conversion fault.
+- The dihedral labels, which place the tokens and bound the matching, find
+  the scanned bones' breaks badly. Per scene, the break taken as the vertices
+  within 0.03 of another piece's surface in the assembled pose: on the 16
+  bones they label 52-87% of the surface, 7-33% is near a break, and 8-35% of
+  the labelled vertices are on it (recall 67-92%); on the 11 ceramics and eggs,
+  38-70% (recall 43-79%); on the seven Breaking Bad scenes as stored, 18-98%
+  (median 38%, recall 69-97%), and as training opens them (two draws each),
+  14-98% (34%, recall 76-99%). The ceramics and eggs fail as completely as the
+  bones, so the labels are not the main cause.
+
+**Next: real breaks in training.** Fantastic Breaks trains as it is: no
+official lists, so `--split_source hash --val_frac 0.2 --test_frac 0.2` splits
+its 150 objects (15 categories) by object into 87 train, 30 val and 33 test
+(seed 0). Its pieces share no vertex, so the positives are by distance in the
+assembled pose and the opening finds nothing to open; `--remesh 0.7 1.0`
+keeps its training density near the scans': median edge over largest side
+0.0161 as converted (30 scenes; 0.0041-0.0167), 0.0171 at 0.7-1.0, 0.0186 at
+0.5-0.9, against `fractura_real`'s 0.0162 (0.0159-0.0170). `--steps_per_epoch
+0` makes an epoch one pass. Checked here on CPU with the converted pieces
+rebuilt from the Visualizer's dumps and a stand-in checkpoint of the same
+architecture (2,754,784 parameters): the training starts from the weights
+(87 train / 30 val, hashed split, positives within 0.015, remeshed 70%-100%),
+an evaluation of the 33 test objects takes the split from the checkpoint, and
+one of Everyday val needs `--data_from_flags --split_source official`
+(otherwise it takes `--data_subsets FB_v1` from the checkpoint and finds no
+scene). acc@5 picks `best.pt` and stays at its first epoch while it reads 0,
+so `last.pt` is scored too. The commands are in the README ("Real breaks").
+Not mixed with Breaking Bad yet: Breaking Bad's official split leaves every
+object it does not list out of every split, so a mixed run needs code; worth
+it if this one moves the scanned sets.
