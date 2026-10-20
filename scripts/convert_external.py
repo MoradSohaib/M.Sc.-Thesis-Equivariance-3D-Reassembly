@@ -8,8 +8,12 @@ layout, so the model is evaluated on them exactly as on Breaking Bad.
     python -m scripts.convert_external Fractura/<synthetic>.hdf5 --split val \\
         --out external --reference data
 
-Each source becomes one subset, named after the file or folder (``-`` becomes
-``_``); then, per subset::
+A source is a GARF-format ``.hdf5`` file, a Fantastic Breaks folder
+(``model_b_<k>.ply``, ``model_r_<k>.ply``, ``meta_<k>.npz``), or assemblies
+stored one per ``.npz`` (``num_pieces``, ``piece_<i>_vertices``,
+``piece_<i>_faces``, ``piece_<i>_shared_faces``: the Fantastic Breaks sample's
+layout) -- one such file, or a folder of them. Each source becomes one subset,
+named after the file or folder (``-`` becomes ``_``); then, per subset::
 
     python -m scripts.train --root_dir external --evaluate --checkpoint path/to/best.pt \\
         --data_subsets bone_real --split all --modes_per_scene 0 --max_fragments 20 \\
@@ -46,11 +50,15 @@ model's dihedral test flags before and after, against the break faces the
 dataset marks where it marks them.
 
 Where the dataset marks its breaks (Fractura's ``shared_faces``, Fantastic
-Breaks' ``mask``), the vertices on them are written beside the scene too
-(``fractured_0/break_vertices.npy``; a piece with no marks of its own, Fantastic
-Breaks' restoration, takes the vertices within 0.03 of the other piece's), so
-the evaluation can be run with the true breaks in place of the dihedral test --
-the oracle experiment::
+Breaks' ``mask`` or ``piece_<i>_shared_faces``), the vertices on them are
+written beside the scene too (``fractured_0/break_vertices.npy``; a piece with
+no marks of its own, Fantastic Breaks' restoration, takes the vertices within
+0.03 of the other piece's). An assembly that marks none -- Fractura's real
+bones, whose ``shared_faces`` mark only debris -- has its break estimated from
+the assembled pose instead (``reassembly.data.external.estimated_breaks``), and
+the CSV's ``break_source`` and the summary say so. The evaluation can then be
+run with the true breaks in place of the dihedral test -- the oracle
+experiment::
 
     python -m scripts.train --root_dir external --evaluate --checkpoint path/to/best.pt \\
         --data_subsets bone_real --split all --modes_per_scene 0 --max_fragments 20 \\
@@ -74,8 +82,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from reassembly.data.external import (Preparation, SCALES, fantastic_breaks_entries,  # noqa: E402
-                                      garf_entries, prepare, read_fantastic_breaks,
-                                      read_garf, reference_edge, write)
+                                      garf_entries, npz_entries, prepare,
+                                      read_fantastic_breaks, read_garf, read_npz,
+                                      reference_edge, write)
 from reassembly.mesh.decimate import TOLERANCE  # noqa: E402
 
 # Measured for the error message only: seven Breaking Bad scenes' median edge
@@ -87,7 +96,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("sources", nargs="+",
-                        help="a GARF-format .hdf5 file (Fractura) or a Fantastic Breaks folder")
+                        help="a GARF-format .hdf5 file (Fractura), a Fantastic Breaks folder, "
+                             "or one-assembly .npz files (a file, or a folder of them)")
     parser.add_argument("--out", required=True, help="the converted data's root folder")
     parser.add_argument("--subsets", nargs="+", default=None,
                         help="a subset name per source (default: the file's or folder's "
@@ -134,12 +144,18 @@ def _subset_name(source: Path) -> str:
 
 
 def _tasks(source: Path, split: str, limit: int):
-    if source.is_file():
+    if source.is_file() and source.suffix.lower() == ".npz":
+        entries = [("npz", root, entry, "") for root, entry in npz_entries(source)]
+    elif source.is_file():
         entries = [("hdf5", str(source), entry, split_name)
                    for entry, split_name in garf_entries(source, split)]
     elif source.is_dir():
+        # A Fantastic Breaks folder holds .npz files too (meta_<k>.npz), so its
+        # pairs are looked for first; npz_entries passes the meta files over.
         entries = [("fantastic_breaks", str(source), entry, k)
                    for entry, k in fantastic_breaks_entries(source)]
+        if not entries:
+            entries = [("npz", root, entry, "") for root, entry in npz_entries(source)]
     else:
         raise SystemExit(f"{source}: no such file or folder")
     return entries[:limit] if limit else entries
@@ -149,8 +165,12 @@ def _convert(task, out: str, subset: str, settings: Preparation) -> dict:
     kind, source, entry, extra = task
     started = time.perf_counter()
     try:
-        assembly = (read_garf(source, entry, extra) if kind == "hdf5"
-                    else read_fantastic_breaks(source, entry, extra))
+        if kind == "hdf5":
+            assembly = read_garf(source, entry, extra)
+        elif kind == "npz":
+            assembly = read_npz(source, entry)
+        else:
+            assembly = read_fantastic_breaks(source, entry, extra)
         pieces, row, breaks = prepare(assembly, settings, return_breaks=True)
         if pieces is not None:
             row["folder"] = write(pieces, Path(out) / subset / row["scene"],
@@ -200,13 +220,20 @@ def _summary(subset: str, rows: list) -> str:
             f"  faces the dihedral test flags (median share): {middle('flagged_full')} before "
             f"thinning, {middle('flagged')} after",
         ]
+        estimated = sum(r.get("break_source") == "estimated" for r in ok)
+        if estimated:
+            lines.append(f"  marks no break: {estimated} of {len(ok)} -- their break is ESTIMATED from "
+                         f"the assembled pose (data/external.py, estimated_breaks), and the "
+                         f"oracle reads that")
         failed = sum(int(r.get("isotropic_failed") or 0) for r in ok)
         if any(r.get("isotropic") for r in ok):
-            lines.append(f"  remeshed isotropically; pieces the remesher could not work on, kept "
-                         f"as cleaned: {failed}")
+            lines.append(f"  remeshed isotropically; pieces the remesher could not work on, "
+                         f"collapsed to the density instead: {failed}")
         marked = [r for r in ok if not math.isnan(float(r["break_share"]))]
         if marked and any(float(r["break_share"]) > 0 for r in marked):
-            lines.append(f"  against the dataset's break faces ({middle('break_share')} of "
+            whose = "the break faces, marked or estimated" if estimated else \
+                "the dataset's break faces"
+            lines.append(f"  against {whose} ({middle('break_share')} of "
                          f"faces): recall {middle('recall_full')} -> {middle('recall')}, "
                          f"precision {middle('precision_full')} -> {middle('precision')}")
         elif marked:

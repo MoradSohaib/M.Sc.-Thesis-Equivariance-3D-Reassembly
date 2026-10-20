@@ -31,8 +31,8 @@ from reassembly.assembly.translation import (farthest_points,  # noqa: E402
                                              mutual_nearest_neighbours, subsample_per_fragment)
 from reassembly.data.external import Preparation, prepare, vertex_breaks  # noqa: E402
 from reassembly.data.features import collate  # noqa: E402
-from reassembly.data.remesh import (Remesh, break_masks, carry_masks,  # noqa: E402
-                                    deform_pieces, noise_pieces, remesh_scene, smooth_pieces)
+from reassembly.data.remesh import (Remesh, break_masks, deform_pieces,  # noqa: E402
+                                    noise_pieces, remesh_scene, smooth_pieces)
 from reassembly.data.scene import BREAK_FILE, SceneReader, write_scene  # noqa: E402
 from reassembly.data.transforms import random_rotations  # noqa: E402
 from reassembly.mesh.clean import edge_counts  # noqa: E402
@@ -188,6 +188,51 @@ def test_the_converter_returns_the_marked_break_with_the_pieces(real_like):  # n
         assert np.ptp(z) < 0.02
     again, _ = prepare(_assembly(stored, marked), Preparation(edge=0.05))
     assert all(np.array_equal(a[0], b[0]) for a, b in zip(again, pieces))
+
+
+def test_a_dataset_that_marks_nothing_has_its_break_estimated(fractured_solid):
+    """
+    Fractura's real bones mark no break (their shared_faces mark the debris the
+    cleaning drops). The estimate -- nearest vertex on another piece within
+    reach, the normals opposed -- is checked where the truth is known: the
+    fixture's coincident interface, and the tube's caps opened a little apart.
+    """
+    from reassembly.data.external import Assembly, estimated_breaks
+    from reassembly.mesh.fracture import fracture_vertex_masks
+
+    vertices, faces = _pieces(fractured_solid)
+    truth = fracture_vertex_masks(vertices)
+    for (v, f), face_mask, t in zip(zip(vertices, faces), estimated_breaks(list(zip(vertices, faces)),
+                                                                             reach=0.05), truth):
+        estimated = np.zeros(len(v), bool)
+        estimated[np.unique(f[face_mask])] = True
+        precision = (estimated & t).sum() / max(estimated.sum(), 1)
+        assert precision > 0.95 and (estimated & t).sum() > 0.5 * t.sum()
+    pieces, breaks = tube_pieces([0.4])
+    pieces[1] = (pieces[1][0] + [0.0, 0.0, 0.02], pieces[1][1])       # opened by 0.02 of 6
+    assembly = Assembly("test", "tube", "", "tube", "", list(pieces), [None, None])
+    _, row, marks = prepare(assembly, Preparation(), return_breaks=True)
+    assert row["break_source"] == "estimated"
+    for (v, f), b, mask in zip(pieces, breaks, marks):
+        cap = np.zeros(len(v), bool)
+        cap[np.unique(f[b >= 0])] = True
+        assert (mask & cap).sum() / max(mask.sum(), 1) > 0.9 and (mask & cap).sum() > 0.5 * cap.sum()
+    marked = Assembly("test", "tube", "", "tube", "", list(pieces), [b >= 0 for b in breaks])
+    assert prepare(marked, Preparation())[1]["break_source"] == "marked"
+
+
+@isotropic
+def test_a_dense_scan_is_thinned_keeping_its_topology_before_it_is_remeshed():
+    from reassembly.data.remesh import thin_keeping_topology
+
+    from reassembly.mesh.decimate import surface_area
+
+    dense = trimesh.creation.icosphere(subdivisions=6)              # 81,920 faces
+    v0, f0 = np.asarray(dense.vertices), np.asarray(dense.faces)
+    v, f = thin_keeping_topology(v0, f0, 0.05)
+    even = surface_area(v0, f0) / (np.sqrt(3.0) / 4.0 * 0.05 ** 2)  # an even mesh's faces
+    assert abs(len(f) / even - 1) < 0.05 and edge_counts(f) == (0, 0)
+    assert thin_keeping_topology(v, f, 0.01)[1] is f                # already coarser: kept
 
 
 def _marked_dataset(tmp_path):
@@ -346,7 +391,8 @@ def test_a_piece_the_remesher_cannot_work_on_is_refused_and_handled(tmp_path):
     # A manifold piece passes the gate.
     sphere = trimesh.creation.icosphere(subdivisions=4)
     assert try_isotropic(np.asarray(sphere.vertices), np.asarray(sphere.faces), 0.08) is not None
-    # The converter keeps the piece as cleaned, and counts it.
+    # The converter collapses it to the density instead, its topology kept,
+    # and counts it -- or, already coarser than that, keeps it as it came.
     good = trimesh.creation.icosphere(subdivisions=4)
     good.apply_translation([2.2, 0.0, 0.0])
     pieces = [(np.asarray(good.vertices), np.asarray(good.faces)), (vertices, faces)]
@@ -356,8 +402,11 @@ def test_a_piece_the_remesher_cannot_work_on_is_refused_and_handled(tmp_path):
     out, row, breaks = prepare(assembly, Preparation(edge=0.018, isotropic=True),
                                return_breaks=True)
     assert row["status"] == "ok" and row["isotropic_failed"] == 1
-    assert edge_counts(out[1][1])[1] > 0                     # kept as it came
+    assert len(out[1][1]) == len(faces) and edge_counts(out[1][1])[1] > 0
     assert edge_counts(out[0][1]) == (0, 0) and breaks[0].any()
+    out, row = prepare(assembly, Preparation(edge=0.08, isotropic=True))
+    assert row["status"] == "ok" and row["isotropic_failed"] == 1
+    assert len(out[1][1]) < len(faces) / 2 and edge_counts(out[1][1])[1] > 0
 
 
 def test_one_draw_per_scene_decides_remeshed_perturbed_or_stored(tmp_path):

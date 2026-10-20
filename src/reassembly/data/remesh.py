@@ -463,6 +463,38 @@ def remesh_isotropic(vertices: np.ndarray, faces: np.ndarray, edge: float,
                             else piece.faces)
 
 
+def thin_keeping_topology(vertices: np.ndarray, faces: np.ndarray,
+                          edge: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    A dense piece collapsed to the faces an even mesh of edge ``edge`` would
+    have, by pymeshlab's quadric edge collapse with its topology kept -- the
+    converter's step before remeshing a full-resolution scan. The faster
+    collapse :func:`~reassembly.mesh.decimate.simplify` uses does not keep it:
+    on Fractura's pig_bone_1 it left 12 to 173 edges shared by more than two
+    faces in each of the four pieces, which the remesher then carried on and
+    opened into holes (360 boundary edges). Kept, none, and the remesh came out
+    as closed as the scan.
+    """
+    from ..mesh.decimate import MIN_FACES, surface_area
+
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    target = int(round(surface_area(vertices, faces) / (np.sqrt(3.0) / 4.0 * edge * edge)))
+    if target >= len(faces):
+        return vertices, faces
+    pymeshlab = _pymeshlab()
+    meshes = pymeshlab.MeshSet(verbose=False)
+    meshes.add_mesh(pymeshlab.Mesh(vertex_matrix=vertices, face_matrix=faces))
+    meshes.meshing_decimation_quadric_edge_collapse(targetfacenum=max(target, MIN_FACES),
+                                                    preservetopology=True,
+                                                    preserveboundary=True, qualitythr=0.3)
+    out = meshes.current_mesh()
+    thinned = np.asarray(out.face_matrix(), dtype=np.int64)
+    if len(thinned) < MIN_FACES:           # nothing usable left: kept as it came
+        return vertices, faces
+    return np.asarray(out.vertex_matrix(), dtype=np.float64), thinned
+
+
 def isotropic_pieces(vertices: Sequence[np.ndarray], faces: Sequence[np.ndarray],
                      rng: np.random.Generator, low: float, high: float,
                      iterations: int = ISOTROPIC_ITERATIONS
@@ -689,4 +721,4 @@ __all__ = ["DEFORM_LENGTH", "GAP_LENGTH", "GAP_REACH", "GAP_SPREAD", "GAP_TERMS"
            "check_augment", "check_remesh", "collapse_pieces", "deform_pieces",
            "isotropic_pieces", "jitter_pieces", "noise_pieces", "open_pieces",
            "remesh_isotropic", "remesh_pieces", "remesh_scene", "smooth_pieces",
-           "try_isotropic"]
+           "thin_keeping_topology", "try_isotropic"]

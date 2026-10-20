@@ -20,8 +20,9 @@ import pytest
 trimesh = pytest.importorskip("trimesh")
 
 from reassembly.data.external import (Assembly, Preparation, fantastic_breaks_entries,  # noqa: E402
-                                      garf_entries, place, prepare, read_fantastic_breaks,
-                                      read_garf, reference_edge, shares_breaks, write)
+                                      garf_entries, npz_entries, place, prepare,
+                                      read_fantastic_breaks, read_garf, read_npz,
+                                      reference_edge, shares_breaks, write)
 from reassembly.data.paths import find_scenes  # noqa: E402
 from reassembly.data.scene import SceneReader, write_scene  # noqa: E402
 from reassembly.mesh.clean import (clean_piece, copies_of_pieces, edge_counts,  # noqa: E402
@@ -348,6 +349,52 @@ def test_fantastic_breaks_pairs_and_their_mask_are_read(tmp_path):
     assert (assembly.category, assembly.name) == ("00", "00002")
     assert len(assembly.pieces) == 2 and assembly.breaks[1] is None
     assert assembly.breaks[0].sum() == (breaks[0] >= 0).sum()
+
+
+def save_npz(path, pieces, breaks, counted=True):
+    """One assembly in one .npz, as the Fantastic Breaks sample stores it."""
+    arrays = {"num_pieces": np.int64(len(pieces))} if counted else {}
+    for i, ((v, f), b) in enumerate(zip(pieces, breaks)):
+        arrays.update({f"piece_{i}_vertices": v, f"piece_{i}_faces": f,
+                       f"piece_{i}_shared_faces": np.asarray(b, dtype=np.int32)})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(path, **arrays)
+    return path
+
+
+def test_assemblies_stored_one_per_npz_are_read_and_other_npz_files_passed_over(tmp_path):
+    pieces, breaks = tube_pieces([0.4])
+    folder = tmp_path / "FB_npz"
+    save_npz(folder / "set" / "00002.npz", pieces, breaks)
+    np.savez(folder / "set" / "meta_0.npz", mask=np.zeros(3, bool))    # Fantastic Breaks' own
+    np.save(folder / "set" / "array.npy", np.zeros(3))
+    (folder / "torn.npz").write_bytes(b"not a zip archive")
+    assert npz_entries(folder) == [(str(folder), "set/00002")]
+    assert npz_entries(folder / "set" / "00002.npz") == [(str(folder / "set"), "00002")]
+    assert npz_entries(folder / "set" / "meta_0.npz") == []
+    assembly = read_npz(folder, "set/00002")
+    assert (assembly.category, assembly.name, assembly.split) == ("set", "00002", "")
+    assert len(assembly.pieces) == 2
+    for (v, f), (v0, f0), b, b0 in zip(assembly.pieces, pieces, assembly.breaks, breaks):
+        assert np.array_equal(v, v0) and np.array_equal(f, f0)
+        assert b.dtype == bool and np.array_equal(b, np.asarray(b0) >= 0)
+    save_npz(folder / "uncounted.npz", pieces, breaks, counted=False)
+    assert len(read_npz(folder, "uncounted").pieces) == 2         # no num_pieces: counted
+
+
+def test_the_script_converts_assemblies_stored_one_per_npz(tmp_path, capsys):
+    from scripts.convert_external import main
+
+    pieces, breaks = tube_pieces([0.4])
+    folder = save_npz(tmp_path / "FB_npz" / "00002.npz", pieces, breaks).parent
+    np.savez(folder / "meta_0.npz", mask=np.zeros(3, bool))
+    assert main([str(folder), "--out", str(tmp_path / "external"), "--no_thinning"]) == 0
+    assert "FB_npz: 1 of 1 assemblies converted" in capsys.readouterr().out
+    scene, = find_scenes(tmp_path / "external", ["FB_npz"])
+    assert (scene.category, scene.name) == ("", "00002")
+    marks = np.load(scene.path / "fractured_0" / "break_vertices.npy")
+    assert 0 < marks.mean() < 1
+    assert len(SceneReader(scene.path).load_mode("fractured_0").fragments) == 2
 
 
 # --------------------------------------------------------------------------

@@ -28,11 +28,19 @@ Fantastic Breaks::
     <group>/<object>/model_r_<k>.ply      the restoration: what broke off
     <group>/<object>/meta_<k>.npz         'mask', the break on model_b, per
                                           vertex or per face
+
+One assembly per ``.npz`` -- GARF's arrays flattened into one file, the layout
+of the Fantastic Breaks sample this project was given (``00002.npz``)::
+
+    <object>.npz                          num_pieces, and per piece i:
+                                          piece_<i>_vertices, piece_<i>_faces,
+                                          piece_<i>_shared_faces (as GARF's)
 """
 from __future__ import annotations
 
 import os
 import shutil
+import zipfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -64,6 +72,19 @@ SHARED_BREAKS = 0.01
 # marked ones. Fractura's real pieces, converted, stand 0.011 to 0.029 apart
 # where they face each other (median 0.0184), so this reaches across the gap.
 BREAK_REACH = 0.03
+# A dataset that marks no break at all -- Fractura's real bones: their
+# shared_faces mark 24 faces per piece, the same ones in all four pieces of
+# pig_bone_1, around the origin: the debris the cleaning drops -- gets its break
+# estimated (`estimated_breaks`): the faces each of whose corners has its
+# nearest vertex on another piece within BREAK_REACH, facing it, the two vertex
+# normals' dot below ESTIMATE_OPPOSED. Checked where the break is known, the
+# vertices of those faces against the true break's: on a Breaking Bad scene
+# (the coincident vertices) precision 1.00, recall 0.62; on Fantastic Breaks'
+# 00002 (its marks) 0.92 and 0.21 -- a conservative estimate, what an oracle
+# needs: the vertices it calls break are break. Not proximity alone: the four
+# shards of pig_bone_1 are thin and lie against each other, and 44% to 91% of
+# each one's vertices are within 0.03 of another piece; facing, 7% to 28%.
+ESTIMATE_OPPOSED = -0.5
 # Passes of the isotropic remesher when converting (Preparation.isotropic): once
 # per object, so the two more than training's three are cheap. A scan denser
 # than the target edge by more than ISOTROPIC_DENSER is thinned first.
@@ -166,13 +187,21 @@ def read_garf(path, entry: str, split: str = "") -> Assembly:
             faces = np.asarray(group["faces"][()], dtype=np.int64)
             breaks = None
             if "shared_faces" in group:
-                shared = np.asarray(group["shared_faces"][()])
-                breaks = shared if shared.dtype == bool else shared >= 0
-                if len(breaks) != len(faces):
-                    breaks = None
+                breaks = _face_marks(group["shared_faces"][()], len(faces))
             assembly.pieces.append((vertices, faces))
             assembly.breaks.append(breaks)
     return assembly
+
+
+def _face_marks(shared, count: int) -> Optional[np.ndarray]:
+    """
+    Per face, whether the dataset marks it as break: from GARF's
+    ``shared_faces`` (the piece the face shares a break with, -1 for none) or
+    a boolean mask; ``None`` when it does not have one value per face.
+    """
+    shared = np.asarray(shared).ravel()
+    marks = shared if shared.dtype == bool else shared >= 0
+    return marks if len(marks) == count else None
 
 
 def fantastic_breaks_entries(root) -> List[Tuple[str, int]]:
@@ -218,6 +247,60 @@ def read_fantastic_breaks(root, entry: str, k: int = 0) -> Assembly:
                 breaks = mask
     assembly.pieces = [broken, restoration]
     assembly.breaks = [breaks, None]
+    return assembly
+
+
+def _is_npz_assembly(path) -> bool:
+    """Whether ``path`` holds an assembly in :func:`read_npz`'s layout."""
+    try:
+        data = np.load(path, allow_pickle=False)
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return False
+    files = getattr(data, "files", None)          # an .npy array has none
+    if files is None:
+        return False
+    data.close()
+    return "piece_0_vertices" in files
+
+
+def npz_entries(source) -> List[Tuple[str, str]]:
+    """
+    ``(root, entry)`` for every assembly stored as one ``.npz``
+    (:func:`read_npz`): ``source`` itself when it is such a file, else every
+    such file under the folder, ``entry`` its path below ``root`` without the
+    suffix. Other ``.npz`` files -- Fantastic Breaks' ``meta_<k>.npz`` -- are
+    passed over.
+    """
+    source = Path(source)
+    if source.is_file():
+        return [(str(source.parent), source.stem)] if _is_npz_assembly(source) else []
+    return [(str(source), path.relative_to(source).with_suffix("").as_posix())
+            for path in sorted(source.rglob("*.npz")) if _is_npz_assembly(path)]
+
+
+def read_npz(root, entry: str) -> Assembly:
+    """
+    The assembly in ``<root>/<entry>.npz``: per piece ``piece_<i>_vertices``,
+    ``piece_<i>_faces`` and, where marked, ``piece_<i>_shared_faces`` (GARF's),
+    ``i`` from 0 to ``num_pieces`` - 1 -- or, without ``num_pieces``, as far as
+    the pieces run.
+    """
+    category, name = place(entry)
+    assembly = Assembly(str(root), entry, category, name, "")
+    with np.load(Path(root) / f"{entry}.npz", allow_pickle=False) as data:
+        if "num_pieces" in data.files:
+            count = int(data["num_pieces"])
+        else:
+            count = 0
+            while f"piece_{count}_vertices" in data.files:
+                count += 1
+        for i in range(count):
+            vertices = np.asarray(data[f"piece_{i}_vertices"], dtype=np.float64)
+            faces = np.asarray(data[f"piece_{i}_faces"], dtype=np.int64)
+            key = f"piece_{i}_shared_faces"
+            breaks = _face_marks(data[key], len(faces)) if key in data.files else None
+            assembly.pieces.append((vertices, faces))
+            assembly.breaks.append(breaks)
     return assembly
 
 
@@ -314,6 +397,38 @@ def vertex_breaks(pieces: Sequence, breaks: Sequence,
     return out
 
 
+def estimated_breaks(pieces: Sequence, reach: float = BREAK_REACH,
+                     opposed: float = ESTIMATE_OPPOSED) -> List[np.ndarray]:
+    """
+    Per piece, per FACE, the break estimated from the assembled pose: faces all
+    of whose corners have their nearest vertex on another piece within
+    ``reach``, with an opposed normal (dot below ``opposed``) -- the two sides
+    of a break face each other. For pieces in the assembled pose at full
+    resolution, where the nearest vertex stands in for the nearest point.
+    """
+    from scipy.spatial import cKDTree
+
+    from ..mesh.topology import vertex_normals
+
+    pieces = [(np.asarray(v, dtype=np.float64), np.asarray(f, dtype=np.int64)) for v, f in pieces]
+    normals = [vertex_normals(v, f) for v, f in pieces]
+    every = np.concatenate([v for v, _ in pieces]) if pieces else np.zeros((0, 3))
+    every_normal = np.concatenate(normals) if pieces else np.zeros((0, 3))
+    owner = np.repeat(np.arange(len(pieces)), [len(v) for v, _ in pieces])
+    out = []
+    for i, (v, f) in enumerate(pieces):
+        others = owner != i
+        mask = np.zeros(len(v), dtype=bool)
+        if others.any() and len(v):
+            distance, nearest = cKDTree(every[others]).query(v, distance_upper_bound=reach)
+            near = np.isfinite(distance)
+            facing = np.einsum("ij,ij->i", normals[i][near],
+                               every_normal[others][nearest[near]]) < opposed
+            mask[np.flatnonzero(near)[facing]] = True
+        out.append(mask[f].all(axis=1) if len(f) else np.zeros(0, dtype=bool))
+    return out
+
+
 def prepare(assembly: Assembly, settings: Preparation = Preparation(),
             return_breaks: bool = False):
     """
@@ -325,9 +440,11 @@ def prepare(assembly: Assembly, settings: Preparation = Preparation(),
     their breaks (:data:`SHARED_BREAKS`) are not thinned.
 
     ``return_breaks`` adds a third value: per piece of ``pieces``, which
-    vertices lie on the break the dataset marks (:func:`vertex_breaks`), or
-    ``None`` when it marks none -- what ``scripts/convert_external.py`` writes
-    beside the scene for the oracle evaluation (``--label_method marked``).
+    vertices lie on the break the dataset marks (:func:`vertex_breaks`) --
+    what ``scripts/convert_external.py`` writes beside the scene for the
+    oracle evaluation (``--label_method marked``). A dataset that marks no
+    break at all has it estimated from the assembled pose instead
+    (:func:`estimated_breaks`), and ``row["break_source"]`` says which.
     """
     if return_breaks:
         pieces, row, breaks = _prepare(assembly, settings)
@@ -402,6 +519,13 @@ def _prepare(assembly: Assembly, settings: Preparation):
         scale = 1.0 / max(1.0, max(float(np.ptp(v, axis=0).max()) for v, _ in cleaned))
     cleaned = [(v * scale, f) for v, f in cleaned]
     row.update(scale=scale, extent_stored=extent)
+    if not any(b is not None and np.any(b) for b in breaks):
+        # Nothing marked anywhere (BREAK_REACH's note): the break estimated,
+        # at full resolution, before any thinning -- and said to be.
+        breaks = estimated_breaks(cleaned)
+        row["break_source"] = "estimated"
+    else:
+        row["break_source"] = "marked"
 
     flagged = _flagged(cleaned)
     share, precision, recall = _agreement(flagged, breaks)
@@ -413,25 +537,28 @@ def _prepare(assembly: Assembly, settings: Preparation):
         # Every piece, sharing its breaks or not: the point is that the scans
         # and the training scenes (--remesh_edge) are triangulated alike, and a
         # model trained that way does not rest on shared vertices.
-        from .remesh import try_isotropic
+        from .remesh import thin_keeping_topology, try_isotropic
 
         extent = object_extent(cleaned)
         target = settings.edge * extent
         before = median_edge(cleaned) / extent
         source = cleaned
         if before < settings.edge / ISOTROPIC_DENSER:
-            # A full-resolution scan: thinned first, by quadric collapse --
-            # seconds where the remesher would take minutes -- to half the
-            # edge, leaving it detail to work from.
-            source, _ = thin_assembly(cleaned, edge=settings.edge / 2.0)
+            # A full-resolution scan: thinned first, by a quadric collapse that
+            # keeps the topology -- seconds where the remesher would take
+            # minutes -- to half the edge, leaving it detail to work from.
+            source = [thin_keeping_topology(v, f, target / 2.0) for v, f in cleaned]
         thinned, failed = [], 0
-        for (v, f), (v0, f0) in zip(source, cleaned):
+        for v, f in source:
             result = try_isotropic(v, f, target, iterations=ISOTROPIC_PASSES, fidelity=True)
             if result is None:
                 # Not a surface the remesher can work on (ISOTROPIC_SLIVERS in
-                # data/remesh.py): kept as cleaned, and counted.
+                # data/remesh.py): collapsed instead to the faces an even mesh
+                # of the edge would have, its own tessellation and topology
+                # kept -- as training does (remesh_isotropic) -- so that a
+                # full-resolution scan is not left dense; and counted.
                 failed += 1
-                result = (v0, f0)
+                result = thin_keeping_topology(v, f, target)
             thinned.append(result)
         report = ThinReport(True, before, median_edge(thinned) / object_extent(thinned),
                             sum(len(f) for _, f in cleaned), sum(len(f) for _, f in thinned),

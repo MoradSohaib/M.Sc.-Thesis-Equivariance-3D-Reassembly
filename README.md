@@ -316,7 +316,7 @@ scripts/
 ├── tune_sharp_threshold.py        pick --sharp-threshold by F1
 └── visualize.py                   render or describe one scene
 
-tests/                             621 tests
+tests/                             625 tests
 ```
 
 Only `reassembly` is packaged; `scripts/` and `tests/` are entry points and
@@ -828,8 +828,10 @@ to be written, which adds to the evaluation's time.
 
 The model reads Breaking Bad's layout, so another dataset is converted into it
 once and then evaluated, drawn and viewed as Breaking Bad is. A GARF-format
-`.hdf5` (Fractura) or a Fantastic Breaks folder is one source, and each source
-becomes one subset named after the file or folder:
+`.hdf5` (Fractura), a Fantastic Breaks folder, or assemblies stored one per
+`.npz` (`piece_<i>_vertices`, `piece_<i>_faces`, `piece_<i>_shared_faces`: one
+such file or a folder of them) is one source, and each source becomes one subset
+named after the file or folder:
 
 ```bash
 pip install h5py fast-simplification

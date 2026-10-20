@@ -1861,25 +1861,63 @@ evaluates as it did, except that candidates are now spread over the break
    fragment, handed back to its vertices.
 7. **`--init_partial`**: a v7 run's weights carried into such a schedule.
 
-**Two samples** (`docs/SIM2REAL.md` §7) are one Breaking Bad scene and
-Fantastic Breaks' `00002`, decimated to 5%:
+**Three samples** are measured in `docs/SIM2REAL.md` §7: one Breaking Bad
+scene; Fantastic Breaks' `00002`, decimated to 5% and stored one `.npz` per
+object; and Fractura's real `pig_bone_1`.
 
-- Breaking Bad's edges spread 14.8× (the scan's 4.2×), with 39% slivers.
-- Its breaks are 2–3.5× smoother than the scan's at 0.02 of the object; the
-  intact surfaces are alike.
-- The scan pair is flush: the restoration's break lies a median 0.0003 from the
-  broken piece's surface.
+- Breaking Bad's edges spread 14.8× (the scans' 3.0–4.2×), with 39% slivers.
+- The Fantastic Breaks pair is flush: the restoration's break lies a median
+  0.0003 from the broken piece's surface. The bone's pieces stand 0.0043 apart
+  across their estimated break.
+- **Roughness, corrected.** The plane-fit measure first used took in the far
+  side of thin walls and the turned facets of narrow breaks. It read the bone's
+  intact surface as rougher than its break, and Fantastic Breaks' break as
+  2–3.5× rougher than Breaking Bad's. The corrected measure counts only
+  neighbours facing within 60° and fits a quadric, at the resolution the model
+  reads (edge about 0.0145). With it:
+  - §6.3's settings cover the intact surfaces: theirs measure 0.00024–0.00029,
+    the bone's 0.00023 and Fantastic Breaks' 0.00006.
+  - The scans' breaks are 1.3–3× rougher than the training breaks: 0.00071 and
+    0.00118, against 0.00037–0.00055. No setting closes this gap. A detector
+    forgives that direction, and the fracture head's report on the scans
+    measures it.
 - The restoration is a boolean cut's mesh: 91% slivers, 341 edges shared by four
   or six faces. No remesher setting could even it out, so a remesh worse than
-  its input is now refused: collapsed instead in training, and kept and counted
-  by the converter.
+  its input is now refused. The piece is collapsed to the density instead, in
+  training and in the converter, which counts it.
 - Training remeshes without the remesher's surface check, at 0.50 s a scene
   against 1.38 s and the same edges.
-- §6.3's settings bring the Breaking Bad scene's break roughness to the scan's
-  (0.0037 against 0.0025–0.0040) and its edge spread to 1.8–1.9.
+- §6.3's settings bring the Breaking Bad scene's edge spread to 1.8–1.9 and open
+  its contact to a median 0.0085–0.0138.
+
+**The bone, and what it changed in the converter:**
+
+- **It marks no break.** Its `shared_faces` mark 24 debris faces per piece, the
+  same faces in all four. An assembly that marks no break now has one estimated
+  from the pose: the faces whose corners each have their nearest vertex on
+  another piece within 0.03, with the two normals opposed (dot below −0.5).
+  Checked where the break is known, that gives precision 1.00 and recall 0.62 on
+  the Breaking Bad sample, and 0.92 and 0.21 on Fantastic Breaks. `break_source`
+  in the CSV says which kind each assembly has.
+- **A dense scan is thinned before remeshing by a quadric collapse that keeps
+  the topology.** fast-simplification left 12–173 non-manifold edges per piece,
+  which the remesher opened into 360 boundary edges. Now the bone converts
+  closed and manifold, in 72 s.
+- **Its walls are thin**, 0.011–0.016 of its length. Converted at 0.0145, its
+  break is as many edges across as Breaking Bad's in training: 81% of the break
+  vertices are one edge from the intact side, against 81–83%. So no finer edge
+  is called for.
+- **The dihedral test floods on it.** At the converted resolution it flags
+  42–86% of each piece's vertices (precision 0.35 against the estimate). At full
+  resolution it flags 8–41%, with recall 0.30.
+
+**Fantastic Breaks stored one `.npz` per object**, the sample's layout
+(`num_pieces`, `piece_<i>_vertices`, `piece_<i>_faces`,
+`piece_<i>_shared_faces`), is now read by `convert_external`, given one such
+file or a folder of them.
 
 **Checked here.** No Breaking Bad dataset and no GPU are available in this
-environment, beyond the samples above. `tests/test_sim2real.py` (25 tests) and
+environment, beyond the samples above. `tests/test_sim2real.py` (27 tests) and
 the whole suite, slow tests included, pass on CPU, and `--preflight` runs clean
 with every change on the tests' fixture. No model has been trained or scored on
 Breaking Bad or on the scans with these changes yet; the first numbers come from
