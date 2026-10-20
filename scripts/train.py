@@ -9,6 +9,13 @@ Train, resume, or evaluate the V-GAT reassembly model.
     python -m scripts.train --root_dir ... --evaluate --remesh 0.5 0.9 --remesh_jitter 0.001   # each piece remeshed on its own
     python -m scripts.train --root_dir ... --init_from path/to/best.pt --contact_radius 0.015 \\
         --remesh 0.5 0.9 --remesh_jitter 0.001 --remesh_gap 0.03   # fine-tune for scanned breaks
+    python -m scripts.train --root_dir ... --contact_radius 0.02 --remesh_edge 0.012 0.018 \\
+        --remesh_gap 0.03 --remesh_smooth 3 --remesh_noise 0.0015 --remesh_deform 0.003 \\
+        --remesh_jitter 0.0005 --augment_probability 0.625 --w_consistency 0.5 \\
+        --schedule intra intra intra intra segment global cross intra cross intra cross intra
+                                                   # the sim-to-real run (docs/SIM2REAL.md)
+    python -m scripts.train --root_dir external --evaluate --checkpoint path/to/best.pt \\
+        --data_subsets bone_real --split all --label_method marked   # the oracle: true breaks
     python -m scripts.train --root_dir ... --evaluate --data_subsets artifact_compressed --split all \\
         --modes_per_scene 0 --predictions predictions   # a whole unseen subset, every prediction zipped
     python -m scripts.train --root_dir ... --num_gpus 2        # both GPUs (the default: all)
@@ -215,7 +222,10 @@ def main() -> None:
         # on -- and so does an explicit --data_subsets: scoring on another
         # subset keeps the labels, tokens and normalisation the model was
         # trained with.
-        override = tuple(name for name in ("max_fragments", "min_fragments", "subsets")
+        # So does an explicit --label_method: --label_method marked is the
+        # oracle, the true break in place of whatever the checkpoint labels by.
+        override = tuple(name for name in ("max_fragments", "min_fragments", "subsets",
+                                           "label_method")
                          if getattr(args, name) is not None)
         # --remesh with --evaluate scores remeshed scenes; a checkpoint's own
         # --remesh, the training augmentation, never applies to an evaluation.
@@ -225,7 +235,7 @@ def main() -> None:
                  placement=args.placement, jitter=args.jitter, drop=args.drop,
                  predictions=args.predictions or None,
                  remesh=args.remesh, remesh_jitter=args.remesh_jitter or 0.0,
-                 remesh_gap=args.remesh_gap or 0.0)
+                 remesh_gap=args.remesh_gap or 0.0, remesh_edge=args.remesh_edge)
     else:
         # Not Config fields: the token must not reach a checkpoint, and the
         # checkpoints are what gets uploaded.

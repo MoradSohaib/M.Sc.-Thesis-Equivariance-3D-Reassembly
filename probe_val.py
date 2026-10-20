@@ -288,6 +288,11 @@ def hide_truth(batch):
               for name in TRUTH_FIELDS if getattr(batch, name) is not None}
     hidden["cluster"] = torch.full_like(batch.cluster, -1)
     hidden["num_clusters"] = 0
+    # The true break (what the fracture head is trained on) and the stored view.
+    if batch.breaks is not None:
+        hidden["breaks"] = torch.zeros_like(batch.breaks)
+        hidden["breaks_known"] = torch.zeros_like(batch.breaks_known)
+    hidden["view"], hidden["view_index"] = None, None
     return batch._replace(**hidden)
 
 
@@ -858,7 +863,8 @@ def main(argv=None) -> int:
     from reassembly.data.features import complete_batch
     from reassembly.evaluation.noise import jitter_inputs
     from reassembly.training import (BreakingBadScenes, _head_keys, _is_oom, _loader,
-                                     _to_device, build_model)
+                                     _to_device, build_model, predicted_batch, run_model,
+                                     segments)
 
     device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -893,6 +899,12 @@ def main(argv=None) -> int:
             weights = {k: v for k, v in weights.items() if k not in head}
         model.load_state_dict(weights)
     model.eval()
+    if segments(model) and args.cross != "normal":
+        # Such a network picks its own tokens and builds their pair lists inside
+        # the forward pass, so the rewired lists would never be read.
+        raise SystemExit(f"--cross {args.cross}: this checkpoint has a fracture head, which "
+                         f"picks its own tokens inside the network; the probe rewires the "
+                         f"pair lists the batch carries, so it cannot reach them")
 
     scenes_per_batch = args.batch_scenes or (min(config.batch_size, 4) if args.cross == "swap"
                                              else config.batch_size)
@@ -931,12 +943,15 @@ def main(argv=None) -> int:
                 batch = jitter_inputs(batch, args.jitter, args.seed)
             seen = hide_truth(batch) if args.hide_truth else batch
             try:
-                # Exactly the inputs `training._forward` passes the model.
-                prediction = model(
-                    seen.node_features, seen.edge_index, seen.edge_attr,
-                    seen.vertex_fragment, seen.num_fragments,
-                    log_scale=seen.log_scale, token_index=seen.token_index,
-                    token_query=seen.token_query, token_key=seen.token_key)
+                # Exactly the inputs `training._forward` passes the model; with a
+                # fracture head, the oracle's true break as its tokens under
+                # --label_method marked, else its own picks.
+                mask = (seen.fracture if segments(model) and config.label_method == "marked"
+                        else None)
+                prediction = run_model(model, seen, config, token_mask=mask)
+                # The head's predicted break as the fracture mask, as stage two
+                # reads it in training and --evaluate.
+                seen = predicted_batch(seen, prediction, config)
                 embedding = prediction.vertex_embedding
                 if args.shuffle_fingerprints:
                     embedding = shuffled_embedding(seen, embedding, noise)
@@ -944,7 +959,8 @@ def main(argv=None) -> int:
                 # own matching, as validation and --evaluate run it.
                 matched = match_batch(seen, embedding, seed=args.seed, drop=args.drop,
                                       min_matches=args.min_matches, tau=args.ransac_tau,
-                                      iterations=args.ransac_iters)
+                                      iterations=args.ransac_iters,
+                                      cosine=config.match_metric == "cosine")
             except Exception as error:                      # noqa: BLE001
                 if not _is_oom(error):
                     raise

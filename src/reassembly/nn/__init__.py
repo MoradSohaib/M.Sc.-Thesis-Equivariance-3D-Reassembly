@@ -16,8 +16,11 @@ on a machine with no torch installed at all.
     ``losses``   The composite objective, with verified chance values.
     ``anchor``   Each scene's largest fragment set to its true pose: the frame
                  the metrics, and by default the loss, are read in.
+    ``context``  The fracture head that picks the tokens, the token picking on
+                 the device, and each fragment's summary for its vertices.
+    ``schedule`` The layer kinds and the order they may come in (no torch).
     ``model``    The backbone and the rotation convention.
 """
 from __future__ import annotations
 
-__all__ = ["anchor", "cross", "gat", "losses", "model", "segment", "vn"]
+__all__ = ["anchor", "context", "cross", "gat", "losses", "model", "schedule", "segment", "vn"]

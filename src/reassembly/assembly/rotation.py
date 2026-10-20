@@ -160,7 +160,8 @@ def pairwise_rotations(points: Tensor, point_fragment: Tensor, embeddings: Tenso
                        num_fragments: int, *, candidates: Optional[Tensor] = None,
                        max_points: int = 2048, min_matches: int = MIN_MATCHES,
                        tau: float = INLIER_DISTANCE, iterations: int = RANSAC_ITERATIONS,
-                       generator: Optional[torch.Generator] = None) -> List[PairRotation]:
+                       generator: Optional[torch.Generator] = None,
+                       cosine: bool = False) -> List[PairRotation]:
     """
     Every pair of fragments of ONE scene with at least ``min_matches`` matches,
     fitted. ``points`` are the fragments' input coordinates in one common scale
@@ -168,8 +169,9 @@ def pairwise_rotations(points: Tensor, point_fragment: Tensor, embeddings: Tenso
     the matching to the fracture surface, as in the translation solver. Each
     pair carries its whole motion and the indices of its inliers.
     """
-    keep = subsample_per_fragment(point_fragment, max_points, candidates)
-    source, target = mutual_nearest_neighbours(embeddings[keep], point_fragment[keep])
+    keep = subsample_per_fragment(point_fragment, max_points, candidates, points)
+    source, target = mutual_nearest_neighbours(embeddings[keep], point_fragment[keep],
+                                               cosine=cosine)
     source, target = keep[source], keep[target]
     if source.numel() == 0:
         return []
@@ -242,13 +244,13 @@ def match_rotations(points: Tensor, point_fragment: Tensor, embeddings: Tensor,
                     rotations: Tensor, root: int, *, candidates: Optional[Tensor] = None,
                     max_points: int = 2048, min_matches: int = MIN_MATCHES,
                     tau: float = INLIER_DISTANCE, iterations: int = RANSAC_ITERATIONS,
-                    generator: Optional[torch.Generator] = None
+                    generator: Optional[torch.Generator] = None, cosine: bool = False
                     ) -> Tuple[Tensor, Tensor, List[PairRotation]]:
     """Fit and chain, for ONE scene: ``(rotations, reached, pairs)``."""
     pairs = pairwise_rotations(points, point_fragment, embeddings, rotations.shape[0],
                                candidates=candidates, max_points=max_points,
                                min_matches=min_matches, tau=tau, iterations=iterations,
-                               generator=generator)
+                               generator=generator, cosine=cosine)
     chained, reached = chain_rotations(pairs, rotations, root, min_matches)
     return chained, reached, pairs
 
@@ -273,7 +275,7 @@ class MatchedRotations(NamedTuple):
 def match_batch(batch, embedding: Tensor, *, seed: int = 0, drop: float = 0.0,
                 max_points: int = 2048, min_matches: int = MIN_MATCHES,
                 tau: float = INLIER_DISTANCE,
-                iterations: int = RANSAC_ITERATIONS) -> MatchedRotations:
+                iterations: int = RANSAC_ITERATIONS, cosine: bool = False) -> MatchedRotations:
     """
     Every scene's rotations from the embedding matches -- reading only what the
     method is given at inference.
@@ -290,6 +292,8 @@ def match_batch(batch, embedding: Tensor, *, seed: int = 0, drop: float = 0.0,
     scene), and the fits are chained from the largest fragment held at the
     identity. RANSAC draws one stream per scene, keyed by the scene's name and
     ``seed``, so a scene draws the same hypotheses whatever batch it lands in.
+    ``cosine`` matches the embeddings by direction
+    (:func:`~reassembly.assembly.translation.mutual_nearest_neighbours`).
     """
     from ..evaluation.noise import drop_candidates, scene_generator
     from ..nn.anchor import anchor_fragments
@@ -327,7 +331,8 @@ def match_batch(batch, embedding: Tensor, *, seed: int = 0, drop: float = 0.0,
         fitted, hit, fits = match_rotations(
             points, local, embedding[v0:v1], start, root, candidates=mask,
             max_points=max_points, min_matches=min_matches, tau=tau,
-            iterations=iterations, generator=scene_generator(name, seed, device))
+            iterations=iterations, generator=scene_generator(name, seed, device),
+            cosine=cosine)
         rotation[f0:f1] = fitted.to(dtype)
         reached[f0:f1] = hit
         roots.append(root)

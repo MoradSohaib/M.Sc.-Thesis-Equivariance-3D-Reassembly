@@ -124,6 +124,18 @@ class SceneSample(NamedTuple):
     """``(sum V, 3)``: where each vertex was, assembled and in world units,
     before a remeshed scene's breaks were opened and its vertices jittered --
     where the term's positives are found; ``None``: where the vertices are."""
+    breaks: Optional[np.ndarray] = None
+    """``(sum V,)`` bool: the true break -- the vertices a Breaking Bad piece
+    shares with another (carried over to a remeshed piece), or those a
+    converted dataset marks -- what the fracture head is trained on and scored
+    against (``nn/model.py``); ``None`` when unknown."""
+    view: Optional["SceneSample"] = None
+    """The same scene as stored -- not remeshed, not perturbed -- for the
+    consistency term (``nn/losses.py``, ``consistency_loss``); ``None`` when
+    the scene was not changed or the term is off."""
+    view_index: Optional[np.ndarray] = None
+    """``(sum V,)``: per vertex, the vertex of ``view`` it came from -- the
+    stored vertex nearest to it before anything moved it -- or -1."""
 
 
 def _scene_token_sets(vertices, faces, masks, *, mode, metric, total, max_per_fragment):
@@ -218,6 +230,8 @@ def build_scene(
     perturb: bool = True,
     contact: Optional[np.ndarray] = None,
     contact_points: Optional[np.ndarray] = None,
+    breaks: Optional[np.ndarray] = None,
+    select_tokens: bool = True,
 ) -> SceneSample:
     """
     Build one scene's arrays.
@@ -266,6 +280,11 @@ def build_scene(
     means a separate pool-attend-scatter path, not a different argument here --
     and silently falling back would ignore the budget entirely while appearing
     to have worked.
+
+    ``select_tokens=False`` leaves the tokens out: a network with a fracture
+    head picks its own, on the device, from what the head predicts
+    (``nn/model.py``). ``breaks`` (per vertex, the fragments in order) is the
+    true break that head is trained on (:class:`SceneSample`).
     """
     if token_mode not in ("sample", "vertex"):
         raise ValueError(
@@ -297,11 +316,14 @@ def build_scene(
     # split is a property of the scene: a fragment's share depends on how much
     # fracture surface the *others* have.
     masks = [np.asarray(m, dtype=bool) for m in fracture_masks]
-    token_sets = _scene_token_sets(
-        normalized.vertices, faces, masks,
-        mode=token_mode, metric=token_metric, total=tokens_per_scene,
-        max_per_fragment=max_tokens_per_fragment,
-    )
+    if select_tokens:
+        token_sets = _scene_token_sets(
+            normalized.vertices, faces, masks,
+            mode=token_mode, metric=token_metric, total=tokens_per_scene,
+            max_per_fragment=max_tokens_per_fragment,
+        )
+    else:
+        token_sets = [np.zeros(0, np.int64) for _ in range(n)]
 
     fragments: List[FragmentArrays] = []
     degenerate = zero_normals = 0
@@ -354,8 +376,13 @@ def build_scene(
         contact_points = np.asarray(contact_points, dtype=np.float64)
         if contact_points.shape != (total, 3):
             raise ValueError(f"contact_points is {contact_points.shape} for {total} vertices")
+    if breaks is not None:
+        breaks = np.asarray(breaks, dtype=bool)
+        if breaks.shape != (total,):
+            raise ValueError(f"breaks has {breaks.shape[0]} entries for {total} vertices")
     return SceneSample(fragments, np.asarray(cluster, dtype=np.int64), category,
-                       key, Repairs(degenerate, zero_normals), contact, contact_points)
+                       key, Repairs(degenerate, zero_normals), contact, contact_points,
+                       breaks)
 
 
 # --------------------------------------------------------------------------
@@ -406,6 +433,11 @@ class Batch(NamedTuple):
     # -- the distance-based embedding term -------------------------------------
     contact: "object" = None      # (N,) bool: another fragment's vertex within the radius
     contact_points: "object" = None   # (N, 3) world, before a remeshed scene's opening
+    # -- the fracture head and the consistency term ----------------------------
+    breaks: "object" = None       # (N,) bool: the true break; False where unknown
+    breaks_known: "object" = None  # (S,) bool: whether the scene's true break is known
+    view: "object" = None         # Batch: the scenes as stored, for the consistency term
+    view_index: "object" = None   # (N,) global vertex of `view` each vertex came from, or -1
 
 
 def collate(samples: Sequence[SceneSample], device=None, dtype=None,
@@ -446,6 +478,12 @@ def collate(samples: Sequence[SceneSample], device=None, dtype=None,
     contacts = [] if any(sample.contact is not None for sample in samples) else None
     # Where the positives are found; a scene without them, where its vertices are.
     points = [] if any(sample.contact_points is not None for sample in samples) else None
+    # The true break, False where a scene does not know it (and says so).
+    breaks = [] if any(sample.breaks is not None for sample in samples) else None
+    # The scenes as stored, for the scenes that were changed.
+    viewed = [sample for sample in samples if sample.view is not None]
+    view_index = [] if viewed else None
+    view_offset = 0
 
     vertex_offset = 0
     fragment_offset = 0
@@ -496,6 +534,16 @@ def collate(samples: Sequence[SceneSample], device=None, dtype=None,
                                           + (0.0 if f.centroid is None else f.centroid)
                                           for f in sample.fragments])
                           if sample.contact_points is None else sample.contact_points)
+        count = vertex_offset - scene_start
+        if breaks is not None:
+            breaks.append(np.zeros(count, bool) if sample.breaks is None else sample.breaks)
+        if view_index is not None:
+            if sample.view is None or sample.view_index is None:
+                view_index.append(np.full(count, -1, np.int64))
+            else:
+                local = np.asarray(sample.view_index, dtype=np.int64)
+                view_index.append(np.where(local >= 0, local + view_offset, -1))
+                view_offset += sum(f.target_vertices.shape[0] for f in sample.view.fragments)
 
     def cat(parts, kind=dtype):
         if not parts:
@@ -559,6 +607,12 @@ def collate(samples: Sequence[SceneSample], device=None, dtype=None,
         repairs=tuple(sample.repairs for sample in samples),
         contact=None if contacts is None else cat(contacts, torch.bool),
         contact_points=None if points is None else cat(points),
+        breaks=None if breaks is None else cat(breaks, torch.bool),
+        breaks_known=None if breaks is None else torch.as_tensor(
+            [sample.breaks is not None for sample in samples], dtype=torch.bool, device=device),
+        view=collate([sample.view for sample in viewed], device=device, dtype=dtype,
+                     pairs=pairs) if viewed else None,
+        view_index=None if view_index is None else cat(view_index, long),
     )
 
 
@@ -603,10 +657,14 @@ def pair_on_device(batch: Batch) -> Batch:
 def complete_batch(batch: Batch) -> Batch:
     """
     Everything a batch may have left to the device: the perturbed copy
-    (:func:`perturb_on_device`) and the pair lists (:func:`pair_on_device`).
-    Idempotent, so any consumer can call it.
+    (:func:`perturb_on_device`) and the pair lists (:func:`pair_on_device`),
+    for the batch and for the stored view it carries (``view``). Idempotent,
+    so any consumer can call it.
     """
-    return pair_on_device(perturb_on_device(batch))
+    batch = pair_on_device(perturb_on_device(batch))
+    if batch.view is not None:
+        batch = batch._replace(view=complete_batch(batch.view))
+    return batch
 
 
 def _ptr(counts: Sequence[int], device=None):

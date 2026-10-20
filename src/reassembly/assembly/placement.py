@@ -198,7 +198,7 @@ def place(points: Tensor, normals: Tensor, point_fragment: Tensor, embeddings: T
           reached: Tensor, root: int, *, candidates: Optional[Tensor] = None,
           max_points: int = 2048, iterations: int = 5, huber: float = 0.05,
           min_inliers: int = MIN_MATCHES, agreement: float = AGREEMENT_DEG,
-          collision_radii: Optional[Tensor] = None) -> Placement:
+          collision_radii: Optional[Tensor] = None, cosine: bool = False) -> Placement:
     """
     Verify, place the reached fragments, then the rest -- for ONE scene
     (module docstring).
@@ -218,8 +218,9 @@ def place(points: Tensor, normals: Tensor, point_fragment: Tensor, embeddings: T
 
     # Every embedding match, as the global solve finds and weights them: the
     # count is reported either way, and step 3 places the unreached from them.
-    keep = subsample_per_fragment(point_fragment, max_points, candidates)
-    source, target = mutual_nearest_neighbours(embeddings[keep], point_fragment[keep])
+    keep = subsample_per_fragment(point_fragment, max_points, candidates, points)
+    source, target = mutual_nearest_neighbours(embeddings[keep], point_fragment[keep],
+                                               cosine=cosine)
     source, target = keep[source], keep[target]
     weight = (normal_compatibility(normals[source], normals[target]) if source.numel()
               else points.new_zeros(0))

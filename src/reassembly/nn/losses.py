@@ -467,6 +467,40 @@ def proximity_loss(
     return loss, accuracy
 
 
+def consistency_loss(embeddings: Tensor, view_embeddings: Tensor, index: Tensor,
+                     max_anchors: int = 1024, generator: Optional[torch.Generator] = None
+                     ) -> Tensor:
+    """
+    ``mean(1 - cos)`` between each vertex's embedding and the embedding the
+    same network gave, on the scene as stored, to the vertex it came from:
+    ``index`` ``(N,)`` into ``view_embeddings``, -1 where none (and ``N``
+    subsampled to ``max_anchors``). The stored side carries no gradient: it
+    is the target, as the network sees a scene with no remeshing and no
+    perturbation, and the term asks the remeshed, opened, worn and rippled
+    scene to embed the same way.
+
+    Rotating a scene cannot be what it compares -- the embedding is invariant
+    to every fragment's pose by construction (``tests/test_model.py``), so a
+    loss between a scene and the same scene turned is exactly 0 for any
+    weights. Remeshing and perturbing are what change the embedding, and so
+    what it can teach the network to ignore.
+
+    0 for a perfect match, about 1 for unrelated directions. It is also 0
+    for a constant embedding -- it is never trained alone: the contrastive
+    term beside it makes that collapse expensive.
+    """
+    chosen = torch.nonzero(index >= 0, as_tuple=False).flatten()
+    if chosen.numel() == 0:
+        return embeddings.new_zeros(())
+    if chosen.numel() > max_anchors:
+        pick = torch.randperm(chosen.numel(), device=embeddings.device,
+                              generator=generator)[:max_anchors]
+        chosen = chosen[pick]
+    a = torch.nn.functional.normalize(embeddings[chosen], dim=-1)
+    b = torch.nn.functional.normalize(view_embeddings[index[chosen]].detach(), dim=-1)
+    return (1.0 - torch.sum(a * b, dim=-1)).mean()
+
+
 SCORE_TERMS = ("rotation", "position", "normal", "face")
 """The four geometric terms: scores of a rotation, never trained on (since v7)."""
 

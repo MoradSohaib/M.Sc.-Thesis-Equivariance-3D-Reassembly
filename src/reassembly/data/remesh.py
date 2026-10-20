@@ -46,21 +46,50 @@ before), and 66% to 96% of the vertices it finds lie on it
 """
 from __future__ import annotations
 
-from typing import List, NamedTuple, Sequence, Tuple
+from typing import List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 
 
 class Remesh(NamedTuple):
-    """How each piece is remeshed: the share of its faces kept is drawn from
-    ``[low, high]``; with ``gap``, the breaks are opened by a mean drawn per
-    scene from ``[0, gap]`` (:func:`open_pieces`); then every vertex moves by
-    Gaussian noise of ``jitter``."""
+    """
+    How each piece is remeshed, and how its breaks are then made to look
+    scanned.
+
+    Remeshing: the share of its faces kept is drawn from ``[low, high]``
+    (quadric collapse, :func:`collapse_pieces`) -- or, with ``edge``, each
+    piece is remeshed isotropically to an edge length drawn from that range
+    (:func:`isotropic_pieces`), in place of the collapse.
+
+    The breaks, in this order: with ``gap``, opened by a mean drawn per scene
+    from ``[0, gap]`` (:func:`open_pieces`); with ``smooth``, worn by up to
+    that many smoothing steps (:func:`smooth_pieces`); with ``deform``, bent
+    by a slow field of up to that amplitude (:func:`deform_pieces`); then, after
+    the fracture labels are read, with ``noise``, rippled along the normal by
+    a spatially correlated field (:func:`noise_pieces`); and every vertex moved
+    by Gaussian noise of ``jitter``.
+
+    ``remesh_probability`` and ``augment_probability`` are the shares of the
+    scenes remeshed and perturbed (one draw per scene and epoch decides both:
+    a scene is perturbed only if it is also remeshed, unless the perturbing
+    share is the larger); the rest are the scenes as stored.
+    """
 
     low: float
     high: float
     jitter: float = 0.0
     gap: float = 0.0
+    edge: Optional[Tuple[float, float]] = None
+    smooth: int = 0
+    noise: float = 0.0
+    deform: float = 0.0
+    remesh_probability: float = 1.0
+    augment_probability: float = 1.0
+
+    @property
+    def perturbs(self) -> bool:
+        """Whether anything moves the vertices once the pieces are remeshed."""
+        return bool(self.jitter or self.gap or self.smooth or self.noise or self.deform)
 
 
 def check_remesh(low: float, high: float, jitter: float = 0.0, gap: float = 0.0) -> None:
@@ -72,6 +101,26 @@ def check_remesh(low: float, high: float, jitter: float = 0.0, gap: float = 0.0)
         raise ValueError(f"remesh_jitter is a standard deviation: >= 0, got {jitter:g}")
     if gap < 0.0:
         raise ValueError(f"remesh_gap is the largest mean opening of a break: >= 0, got {gap:g}")
+
+
+def check_augment(edge: Optional[Sequence[float]] = None, smooth: int = 0, noise: float = 0.0,
+                  deform: float = 0.0, remesh_probability: float = 1.0,
+                  augment_probability: float = 1.0) -> None:
+    """Refuse the settings beyond :func:`check_remesh` that could not work."""
+    if edge is not None:
+        if len(edge) != 2 or not 0.0 < edge[0] <= edge[1]:
+            raise ValueError(f"remesh_edge is two edge lengths, 0 < LOW <= HIGH, in world "
+                             f"units, got {edge!r}")
+    if smooth < 0:
+        raise ValueError(f"remesh_smooth is a number of smoothing steps: >= 0, got {smooth}")
+    if noise < 0.0:
+        raise ValueError(f"remesh_noise is an amplitude: >= 0, got {noise:g}")
+    if deform < 0.0:
+        raise ValueError(f"remesh_deform is an amplitude: >= 0, got {deform:g}")
+    for name, value in (("remesh_probability", remesh_probability),
+                        ("augment_probability", augment_probability)):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} is a share of the scenes: in [0, 1], got {value:g}")
 
 
 # How an opened break varies, measured on Fractura's 27 real scenes as the
@@ -153,6 +202,24 @@ def jitter_pieces(vertices: Sequence[np.ndarray], rng: np.random.Generator,
     return [v + rng.normal(0.0, jitter, v.shape) for v in vertices]
 
 
+def carry_masks(stored: Sequence[np.ndarray], masks: Sequence[np.ndarray],
+                vertices: Sequence[np.ndarray]) -> List[np.ndarray]:
+    """
+    Per piece, a per-vertex mask of the ``stored`` piece carried over to the
+    same piece remeshed (``vertices``, before anything moved them): each
+    vertex takes the value of the stored vertex nearest to it.
+    """
+    from scipy.spatial import cKDTree
+
+    out = []
+    for s, mask, v in zip(stored, masks, vertices):
+        s = np.asarray(s, dtype=np.float64)
+        v = np.asarray(v, dtype=np.float64)
+        out.append(np.asarray(mask, dtype=bool)[cKDTree(s).query(v)[1]] if len(s) else
+                   np.zeros(len(v), dtype=bool))
+    return out
+
+
 def break_masks(stored: Sequence[np.ndarray], vertices: Sequence[np.ndarray]
                 ) -> List[np.ndarray]:
     """
@@ -160,16 +227,12 @@ def break_masks(stored: Sequence[np.ndarray], vertices: Sequence[np.ndarray]
     break: those whose nearest vertex of the ``stored`` piece coincides with a
     vertex of another stored piece -- Breaking Bad's break, exact in the stored
     pieces (:func:`~reassembly.mesh.fracture.fracture_vertex_masks`), carried
-    over to the collapse.
+    over to the collapse (:func:`carry_masks`).
     """
-    from scipy.spatial import cKDTree
-
     from ..mesh.fracture import fracture_vertex_masks
 
     stored = [np.asarray(v, dtype=np.float64) for v in stored]
-    twins = fracture_vertex_masks(stored)
-    return [twin[cKDTree(s).query(np.asarray(v, dtype=np.float64))[1]] if len(s) else
-            np.zeros(len(v), dtype=bool) for s, v, twin in zip(stored, vertices, twins)]
+    return carry_masks(stored, fracture_vertex_masks(stored), vertices)
 
 
 def _face_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
@@ -264,6 +327,282 @@ def open_pieces(vertices: Sequence[np.ndarray], faces: Sequence[np.ndarray],
     return out
 
 
+# Isotropic remeshing is pymeshlab's explicit remesher (Botsch and Kobbelt's
+# split, collapse, flip, relax and reproject), three passes. On a 20k-face
+# ellipsoid remeshed to an edge of 0.03, three passes took 0.47 s against
+# 0.74 s for five, with the same spread of edges: 5th to 95th percentile 0.73
+# to 1.25 of the target against 0.76 to 1.24, median 1.03 either way.
+ISOTROPIC_ITERATIONS = 3
+# The remesher keeps creases sharper than its feature angle as they are. Kept,
+# a rough break's creases are kept on BOTH sides alike, and so are its shared
+# vertices: on the tests' fractured solid, remeshed to 0.12, 1,350 vertices
+# still coincided at the default 30 degrees and 686 at 90 (1,152 before), but
+# 18 with none kept, at 180 -- which also rounds the rim a little, as a scan's.
+ISOTROPIC_FEATURE_ANGLE = 180.0
+
+
+def _pymeshlab():
+    """pymeshlab with its remeshing filters loaded, or an error saying what is missing."""
+    try:
+        import pymeshlab
+    except ImportError as error:
+        raise ImportError("isotropic remeshing (--remesh_edge, --isotropic) needs pymeshlab: "
+                          "pip install pymeshlab") from error
+    if not hasattr(pymeshlab.MeshSet(verbose=False), "meshing_isotropic_explicit_remeshing"):
+        # Its meshing plugin links the OpenGL library; without it pymeshlab
+        # imports, prints that the plugin did not load, and has no filter.
+        raise ImportError("pymeshlab is installed but its remeshing filters did not load: on "
+                          "Linux they need the OpenGL library, apt-get install -y libopengl0")
+    return pymeshlab
+
+
+def remesh_isotropic(vertices: np.ndarray, faces: np.ndarray, edge: float,
+                     iterations: int = ISOTROPIC_ITERATIONS) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    One piece remeshed isotropically -- triangles close to equilateral, edges
+    close to ``edge`` everywhere, in the piece's own units -- then tidied as
+    :func:`collapse_pieces` tidies a collapse, keeping the piece's winding. A
+    piece the remesher would leave with fewer than
+    :data:`~reassembly.mesh.decimate.MIN_FACES` faces is returned as it is.
+
+    Why: an intra-fragment layer reaches one ring of the mesh, so what the
+    network sees around a vertex, in world units, is the number of layers
+    times the edge length. Breaking Bad's pieces are simulated, with long thin
+    triangles, and scanned pieces are meshed evenly; remeshed both to one edge
+    length, they are seen at one scale and in one triangulation.
+    """
+    from ..mesh.clean import clean_piece
+    from ..mesh.decimate import MIN_FACES
+
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    if len(faces) < MIN_FACES:
+        return vertices, faces
+    pymeshlab = _pymeshlab()
+    meshes = pymeshlab.MeshSet(verbose=False)
+    meshes.add_mesh(pymeshlab.Mesh(vertex_matrix=vertices, face_matrix=faces))
+    meshes.meshing_isotropic_explicit_remeshing(targetlen=pymeshlab.PureValue(float(edge)),
+                                                iterations=int(iterations),
+                                                featuredeg=ISOTROPIC_FEATURE_ANGLE)
+    out = meshes.current_mesh()
+    remeshed = np.asarray(out.face_matrix(), dtype=np.int64)
+    if len(remeshed) < MIN_FACES:
+        return vertices, faces
+    piece = clean_piece(np.asarray(out.vertex_matrix(), dtype=np.float64), remeshed,
+                        drop_debris=False)
+    if len(piece.faces) < MIN_FACES:
+        return vertices, faces
+    # As in collapse_pieces: the tidy turns a piece wound inward outward.
+    return piece.vertices, (np.ascontiguousarray(piece.faces[:, ::-1]) if piece.report.flipped
+                            else piece.faces)
+
+
+def isotropic_pieces(vertices: Sequence[np.ndarray], faces: Sequence[np.ndarray],
+                     rng: np.random.Generator, low: float, high: float,
+                     iterations: int = ISOTROPIC_ITERATIONS
+                     ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """
+    ``(vertices, faces)`` per piece, each remeshed isotropically on its own
+    (:func:`remesh_isotropic`) to an edge length drawn per piece from
+    ``[low, high]``, in world units -- drawn first, one per piece, so a piece's
+    edge does not depend on the pieces before it. The two sides of a break
+    come out tessellated independently, at the edge length the scans are
+    converted to (``scripts/convert_external.py --isotropic``).
+    """
+    edges = rng.uniform(low, high, size=len(vertices))
+    out_vertices, out_faces = [], []
+    for v, f, edge in zip(vertices, faces, edges):
+        v, f = remesh_isotropic(v, f, edge, iterations)
+        out_vertices.append(v)
+        out_faces.append(f)
+    return out_vertices, out_faces
+
+
+def _neighbour_mean(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """Each vertex's mean neighbour along the mesh's edges; itself when it has none."""
+    from ..mesh.topology import unique_edges
+
+    edges = unique_edges(faces, len(vertices))
+    source = np.concatenate([edges[:, 0], edges[:, 1]])
+    target = np.concatenate([edges[:, 1], edges[:, 0]])
+    total = np.zeros_like(vertices)
+    np.add.at(total, target, vertices[source])
+    count = np.bincount(target, minlength=len(vertices)).astype(np.float64)
+    return np.where(count[:, None] > 0, total / np.maximum(count, 1.0)[:, None], vertices)
+
+
+# Wear: each smoothing step moves a break vertex this share of the way to the
+# mean of its neighbours, and a vertex one edge from the break (the intact
+# side of the rim) half as far, so the rim rounds off instead of standing as a
+# ridge between a smoothed break and a sharp intact edge. A step is capped at
+# SMOOTH_CAP of the piece's median edge: the mean of a vertex's neighbours lies
+# far along a long thin triangle -- Breaking Bad's tessellation has them -- and
+# uncapped, a rim vertex next to one would be dragged across the surface.
+SMOOTH_STEP = 0.5
+SMOOTH_BESIDE = 0.5
+SMOOTH_CAP = 0.25
+
+
+def smooth_pieces(vertices: Sequence[np.ndarray], faces: Sequence[np.ndarray],
+                  breaks: Sequence[np.ndarray], rng: np.random.Generator,
+                  steps: int) -> List[np.ndarray]:
+    """
+    Every piece's break worn: ``k`` steps of Laplacian smoothing, ``k`` drawn
+    per piece from ``0..steps``, on the break vertices (``breaks``) and the
+    vertices one edge from them (:data:`SMOOTH_STEP`, :data:`SMOOTH_BESIDE`).
+    The sharp rim where a simulated break meets the intact surface rounds
+    off, and the break's finest roughness goes, as on a scanned break -- whose
+    rim the scanner and handling have rounded, and whose finest detail the
+    scan does not resolve. Each step is capped at :data:`SMOOTH_CAP` of the
+    piece's median edge, and no face ends up turned over from where it
+    started (:func:`_unturned`). Draws the same numbers whatever the masks
+    hold; 0 leaves the pieces as they are.
+    """
+    from ..mesh.decimate import edge_lengths
+    from ..mesh.topology import unique_edges
+
+    vertices = [np.asarray(v, dtype=np.float64) for v in vertices]
+    if not steps:
+        return vertices
+    counts = rng.integers(0, int(steps) + 1, size=len(vertices))
+    out = []
+    for start, f, mask, count in zip(vertices, faces, breaks, counts):
+        mask = np.asarray(mask, dtype=bool)
+        f = np.asarray(f, dtype=np.int64)
+        v = start
+        if count and mask.any() and len(f):
+            edges = unique_edges(f, len(v))
+            beside = np.zeros(len(v), dtype=bool)
+            beside[edges[mask[edges[:, 0]], 1]] = True
+            beside[edges[mask[edges[:, 1]], 0]] = True
+            weight = np.where(mask, 1.0, np.where(beside, SMOOTH_BESIDE, 0.0))
+            cap = SMOOTH_CAP * float(np.median(edge_lengths(start, f)))
+            for _ in range(int(count)):
+                step = SMOOTH_STEP * weight[:, None] * (_neighbour_mean(v, f) - v)
+                length = np.linalg.norm(step, axis=1, keepdims=True)
+                v = v + step * np.minimum(1.0, cap / np.maximum(length, 1e-30))
+            # Turned over is judged against the piece as it came, not step by
+            # step: small turns add up.
+            v = start + _unturned(start, f, v - start)
+        out.append(v)
+    return out
+
+
+# Scanner noise: a ripple along the normal, correlated between neighbouring
+# vertices rather than independent per vertex as jitter_pieces' is. A Gaussian
+# field of length scale NOISE_LENGTH -- about 1.4 of Breaking Bad's median
+# edge, 0.0145 of an object -- as NOISE_TERMS random Fourier features.
+NOISE_LENGTH = 0.02
+NOISE_TERMS = 32
+
+
+def noise_pieces(vertices: Sequence[np.ndarray], faces: Sequence[np.ndarray],
+                 rng: np.random.Generator, amplitude: float) -> List[np.ndarray]:
+    """
+    Every vertex moved along its normal by ``sigma g(x)``: ``g`` a smooth
+    unit-variance random field of length scale :data:`NOISE_LENGTH`, one per
+    piece, and ``sigma`` drawn once per scene from ``[0, amplitude]``, in world
+    units. No face turns over (:func:`_unturned`). Draws the same numbers
+    whatever the pieces hold; 0 leaves them where they are.
+    """
+    from ..mesh.topology import vertex_normals
+
+    vertices = [np.asarray(v, dtype=np.float64) for v in vertices]
+    if not amplitude:
+        return vertices
+    sigma = amplitude * rng.uniform()
+    out = []
+    for v, f in zip(vertices, faces):
+        omega = rng.normal(0.0, 1.0 / NOISE_LENGTH, (NOISE_TERMS, 3))
+        phase = rng.uniform(0.0, 2.0 * np.pi, NOISE_TERMS)
+        f = np.asarray(f, dtype=np.int64)
+        if len(v) and len(f):
+            field = np.sqrt(2.0 / NOISE_TERMS) * np.cos(v @ omega.T + phase).sum(axis=1)
+            v = v + _unturned(v, f, sigma * field[:, None] * vertex_normals(v, f))
+        out.append(v)
+    return out
+
+
+# A slow bend: each axis of the displacement a random Fourier field of length
+# scale DEFORM_LENGTH -- about a third of an object, whose largest side is 1 --
+# so the two sides of a break, each bent its own way, fit nowhere exactly.
+DEFORM_LENGTH = 0.3
+DEFORM_TERMS = 16
+
+
+def deform_pieces(vertices: Sequence[np.ndarray], rng: np.random.Generator,
+                  amplitude: float) -> List[np.ndarray]:
+    """
+    Every piece bent by its own slow displacement field (:data:`DEFORM_LENGTH`)
+    of standard deviation drawn once per scene from ``[0, amplitude]``, in
+    world units -- as two scans registered each with its own small error do
+    not fit exactly. Keep it well under stage two's RANSAC tolerance, 0.05 of
+    the largest piece's radius: the fit is rigid. Over a field this slow no
+    face can turn over at any amplitude worth using. 0 leaves the pieces
+    where they are.
+    """
+    vertices = [np.asarray(v, dtype=np.float64) for v in vertices]
+    if not amplitude:
+        return vertices
+    sigma = amplitude * rng.uniform()
+    out = []
+    for v in vertices:
+        omega = rng.normal(0.0, 1.0 / DEFORM_LENGTH, (3, DEFORM_TERMS, 3))
+        phase = rng.uniform(0.0, 2.0 * np.pi, (3, DEFORM_TERMS))
+        if len(v):
+            displacement = np.stack(
+                [np.sqrt(2.0 / DEFORM_TERMS) * np.cos(v @ omega[axis].T + phase[axis]).sum(axis=1)
+                 for axis in range(3)], axis=1)
+            v = v + sigma * displacement
+        out.append(v)
+    return out
+
+
+def remesh_scene(vertices: Sequence[np.ndarray], faces: Sequence[np.ndarray],
+                 rng: np.random.Generator, spec: Remesh, *, remesh: bool = True,
+                 perturb: bool = True):
+    """
+    ``(closed, surface, moved, faces)``, every piece through ``spec`` (see
+    :class:`Remesh`), all three sharing ``faces``:
+
+    * ``closed`` -- remeshed (:func:`collapse_pieces`, or with ``spec.edge``
+      :func:`isotropic_pieces`), nothing moved: where the positives of the
+      distance-based term are found;
+    * ``surface`` -- then opened, smoothed and bent: what the fracture labels
+      are computed on;
+    * ``moved`` -- then the correlated noise and the jitter: what the model
+      reads. The dihedral test reads noise as fracture (module docstring), so
+      the labels are computed before it.
+
+    ``remesh=False`` keeps the stored tessellation, ``perturb=False`` moves
+    nothing. One generator, drawn in that order -- with only ``gap`` and
+    ``jitter`` set, the numbers :func:`remesh_pieces` has always drawn.
+    """
+    vertices = [np.asarray(v, dtype=np.float64) for v in vertices]
+    faces = [np.asarray(f, dtype=np.int64) for f in faces]
+    if remesh:
+        if spec.edge is not None:
+            closed, faces = isotropic_pieces(vertices, faces, rng, *spec.edge)
+        else:
+            closed, faces = collapse_pieces(vertices, faces, rng, spec)
+    else:
+        closed = vertices
+    if not perturb:
+        return closed, closed, closed, faces
+    breaks = None
+    surface = closed
+    if spec.gap or spec.smooth:
+        breaks = break_masks(vertices, closed)
+    if spec.gap:
+        surface = open_pieces(surface, faces, breaks, rng, spec.gap)
+    if spec.smooth:
+        surface = smooth_pieces(surface, faces, breaks, rng, spec.smooth)
+    if spec.deform:
+        surface = deform_pieces(surface, rng, spec.deform)
+    moved = noise_pieces(surface, faces, rng, spec.noise) if spec.noise else surface
+    return closed, surface, jitter_pieces(moved, rng, spec.jitter), faces
+
+
 def remesh_pieces(vertices: Sequence[np.ndarray], faces: Sequence[np.ndarray],
                   rng: np.random.Generator, spec: Remesh
                   ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
@@ -272,13 +611,15 @@ def remesh_pieces(vertices: Sequence[np.ndarray], faces: Sequence[np.ndarray],
     docstring): :func:`collapse_pieces`; with ``spec.gap``, :func:`open_pieces`
     on the breaks the input pieces share (:func:`break_masks`); then
     :func:`jitter_pieces` with ``spec.jitter`` -- from the same generator. The
-    opening and the jitter move the vertices, never the faces.
+    opening and the jitter move the vertices, never the faces. The rest of
+    ``spec`` as :func:`remesh_scene` applies it.
     """
-    collapsed, faces = collapse_pieces(vertices, faces, rng, spec)
-    if spec.gap:
-        collapsed = open_pieces(collapsed, faces, break_masks(vertices, collapsed), rng, spec.gap)
-    return jitter_pieces(collapsed, rng, spec.jitter), faces
+    _closed, _surface, moved, faces = remesh_scene(vertices, faces, rng, spec)
+    return moved, faces
 
 
-__all__ = ["GAP_LENGTH", "GAP_REACH", "GAP_SPREAD", "GAP_TERMS", "Remesh", "break_masks",
-           "check_remesh", "collapse_pieces", "jitter_pieces", "open_pieces", "remesh_pieces"]
+__all__ = ["DEFORM_LENGTH", "GAP_LENGTH", "GAP_REACH", "GAP_SPREAD", "GAP_TERMS",
+           "ISOTROPIC_ITERATIONS", "NOISE_LENGTH", "Remesh", "break_masks", "carry_masks",
+           "check_augment", "check_remesh", "collapse_pieces", "deform_pieces",
+           "isotropic_pieces", "jitter_pieces", "noise_pieces", "open_pieces",
+           "remesh_isotropic", "remesh_pieces", "remesh_scene", "smooth_pieces"]

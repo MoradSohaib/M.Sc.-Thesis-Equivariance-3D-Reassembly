@@ -51,12 +51,40 @@ class Matches(NamedTuple):
     weight: Tensor       # (M,) in [0, 1]
 
 
-def subsample_per_fragment(point_fragment: Tensor, cap: int,
-                           candidates: Optional[Tensor] = None) -> Tensor:
+def farthest_points(points: Tensor, count: int) -> Tensor:
     """
-    Indices of at most ``cap`` points per fragment, evenly strided -- so the
-    same scene always gives the same subset (a random draw would make two
-    evaluations of one checkpoint disagree for no reason).
+    ``count`` indices into ``points`` ``(n, 3)`` by farthest-point sampling,
+    spread evenly over the space the points cover. Deterministic and
+    unchanged by a rotation of the points: the first is the point farthest
+    from their centroid, and each next one the point farthest from those
+    chosen.
+    """
+    n = points.shape[0]
+    if count >= n:
+        return torch.arange(n, device=points.device)
+    points = points.double()
+    chosen = torch.empty(count, dtype=torch.long, device=points.device)
+    chosen[0] = torch.argmax((points - points.mean(dim=0)).norm(dim=-1))
+    nearest = (points - points[chosen[0]]).norm(dim=-1)
+    for k in range(1, count):
+        chosen[k] = torch.argmax(nearest)
+        nearest = torch.minimum(nearest, (points - points[chosen[k]]).norm(dim=-1))
+    return chosen
+
+
+def subsample_per_fragment(point_fragment: Tensor, cap: int,
+                           candidates: Optional[Tensor] = None,
+                           points: Optional[Tensor] = None) -> Tensor:
+    """
+    Indices of at most ``cap`` points per fragment -- the same subset for the
+    same scene every time (a random draw would make two evaluations of one
+    checkpoint disagree for no reason).
+
+    With ``points`` (the coordinates, one row per point), a fragment holding
+    more than ``cap`` is thinned by :func:`farthest_points`, so the subset
+    covers its break evenly. Without, evenly strided by index, which is the
+    order the mesh stores its vertices in: on a dense scan that order follows
+    the scanner, and the stride keeps some regions and skips others.
 
     ``candidates`` (a boolean mask) restricts the choice, e.g. to the fracture
     surface; a fragment with no candidate at all falls back to every one of its
@@ -74,18 +102,33 @@ def subsample_per_fragment(point_fragment: Tensor, cap: int,
             pool = own
         index = torch.nonzero(pool, as_tuple=False).flatten()
         if cap > 0 and index.numel() > cap:
-            index = index[torch.linspace(0, index.numel() - 1, cap,
-                                         device=device).round().long()]
+            if points is not None:
+                index = index[farthest_points(points[index], cap)].sort().values
+            else:
+                index = index[torch.linspace(0, index.numel() - 1, cap,
+                                             device=device).round().long()]
         keep.append(index)
     return torch.cat(keep)
 
 
 def mutual_nearest_neighbours(embeddings: Tensor, point_fragment: Tensor,
-                              chunk: int = 2048) -> tuple:
+                              chunk: int = 2048, cosine: bool = False) -> tuple:
     """
     Mutual nearest neighbours in embedding space, between points of DIFFERENT
     fragments. Each pair is returned once. Chunked over rows, so the full
     pairwise matrix is never held.
+
+    By Euclidean distance between the raw embeddings, by default; with
+    ``cosine`` (``--match_metric cosine``), by their directions -- each made
+    unit length first, so the nearest neighbour is the most similar by
+    cosine, the similarity the contrastive term trains
+    (:func:`reassembly.nn.losses.correspondence_loss`). Nothing trains the
+    length, so on inputs unlike the training scenes it is free to drift --
+    the reason to try cosine. But it is not noise: it is the same function of
+    the geometry on both sides of a break, and Euclidean matching measured
+    better on the synthetic slabs of ``tests/test_contact.py`` (the same
+    trained model, three seeds: 20.8 against 59.8 deg on one, equal on two),
+    so Euclidean stays the default and cosine is a setting to measure.
     """
     device = embeddings.device
     n = embeddings.shape[0]
@@ -93,6 +136,8 @@ def mutual_nearest_neighbours(embeddings: Tensor, point_fragment: Tensor,
     if n < 2:
         return empty, empty
     embeddings = embeddings.float()
+    if cosine:
+        embeddings = torch.nn.functional.normalize(embeddings, dim=-1)
     best = torch.empty(n, dtype=torch.long, device=device)
     for start in range(0, n, chunk):
         stop = min(start + chunk, n)
@@ -182,7 +227,7 @@ def assemble(points: Tensor, normals: Tensor, point_fragment: Tensor,
              embeddings: Tensor, num_fragments: int, *,
              candidates: Optional[Tensor] = None, max_points: int = 2048,
              iterations: int = 5, huber: float = 0.05,
-             collision_radii: Optional[Tensor] = None) -> tuple:
+             collision_radii: Optional[Tensor] = None, cosine: bool = False) -> tuple:
     """
     Match, weight, solve -- for ONE scene.
 
@@ -192,8 +237,9 @@ def assemble(points: Tensor, normals: Tensor, point_fragment: Tensor,
     reporting, since an assembly resting on a handful of matches is not one
     to trust.
     """
-    keep = subsample_per_fragment(point_fragment, max_points, candidates)
-    source, target = mutual_nearest_neighbours(embeddings[keep], point_fragment[keep])
+    keep = subsample_per_fragment(point_fragment, max_points, candidates, points)
+    source, target = mutual_nearest_neighbours(embeddings[keep], point_fragment[keep],
+                                               cosine=cosine)
     source, target = keep[source], keep[target]
     weight = (normal_compatibility(normals[source], normals[target]) if source.numel()
               else points.new_zeros(0))

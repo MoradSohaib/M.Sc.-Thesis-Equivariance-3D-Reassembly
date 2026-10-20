@@ -1805,3 +1805,64 @@ so `last.pt` is scored too. The commands are in the README ("Real breaks").
 Not mixed with Breaking Bad yet: Breaking Bad's official split leaves every
 object it does not list out of every split, so a mixed run needs code; worth
 it if this one moves the scanned sets.
+
+## 22 · Sim to real — true breaks, scan-like training, a fracture head (Oct 2026)
+
+**Why.** Every run so far, the contact-radius fine-tune included, reaches
+chance on the scanned sets (§21). This section is the plan from the review of
+those runs, built. Every part is off by default and an old checkpoint
+evaluates as it did, except that candidates are now spread over the break
+(below). `docs/SIM2REAL.md` has the details and the run plan.
+
+1. **The oracle.** `convert_external` writes each scan's marked break
+   (`fractured_0/break_vertices.npy`; Fantastic Breaks' restoration takes the
+   vertices within 0.03 of the marked break). `--label_method marked` makes
+   the tokens and the matched vertices that true break, and with `--evaluate`
+   it overrides the checkpoint's labels. §21 found the ceramics and eggs
+   failing as completely as the bones and concluded that the labels are not
+   the main cause; the oracle tests that directly.
+2. **Stage two.** `--match_metric cosine` matches by direction, as the term
+   trains. It is not the default because it measured worse: the slab model of
+   `tests/test_contact.py`, trained once per seed and scored both ways, got
+   20.8 deg against 59.8 deg (acc@5 0.89 against 0.67) on seed 0 and equal
+   results on seeds 1 and 2 (9 pieces each). Candidates above 2,048 per
+   fragment are now thinned by farthest-point sampling (unchanged by a turn of
+   the fragment) instead of a stride through the vertex order.
+3. **Scan-like training scenes.**
+   - `--remesh_edge LOW HIGH` remeshes isotropically, using pymeshlab's
+     explicit remesher with three passes; a 20k-face test mesh took 0.47 s,
+     against 0.74 s for five passes, with the same edge spread.
+   - Its crease preservation is off, because kept creases keep the shared
+     vertices: of the fractured solid's 1,152, 1,350 still coincided at the
+     default 30 degrees, 686 at 90 and 18 at 180.
+   - `convert_external --isotropic` remeshes the scans to the same edge.
+   - `--remesh_smooth` (Laplacian wear of the break band, capped at a quarter
+     edge per step), `--remesh_noise` (normal ripple correlated over 0.02) and
+     `--remesh_deform` (a slow bend per piece) join the opening and the jitter.
+     The labels are read before the ripple and the jitter, and the positives
+     before anything moves.
+   - `--remesh_probability` and `--augment_probability`: one draw per scene.
+4. **The fracture head** (`segment` in `--schedule`):
+   - it reads VN invariants and is trained on the true break with a
+     class-balanced focal loss, which reads 0.173 untrained;
+   - it picks the tokens on the device, split by predicted-break counts and
+     spread by farthest-point sampling, with ties broken by vertex order so a
+     per-fragment turn changes nothing (float64);
+   - half of the training batches take their tokens from the truth
+     (`--segment_teacher`);
+   - stage two matches the predicted break;
+   - every scored epoch prints its precision and recall beside the dihedral
+     labels'.
+5. **Consistency** (`--w_consistency`). Each changed scene is also run as
+   stored without a gradient, and its break vertices' embeddings are pulled
+   toward their stored partners'. Between a scene and the same scene rotated
+   such a term is identically zero, since the embedding is invariant.
+6. **Fragment context** (`global` in `--schedule`): an equivariant pool per
+   fragment, handed back to its vertices.
+7. **`--init_partial`**: a v7 run's weights carried into such a schedule.
+
+**Checked here.** No Breaking Bad data and no GPU are available in this
+environment. `tests/test_sim2real.py` (24 tests) and the whole suite, slow tests
+included, pass on CPU, and `--preflight` runs clean with every change on the
+tests' fixture. Nothing above has been measured on Breaking Bad or on the scans
+yet; the first numbers come from the runs in `docs/SIM2REAL.md` §6.

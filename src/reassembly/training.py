@@ -170,10 +170,20 @@ class Config:
     """
     label_method: str = "dihedral"
     """
-    ``dihedral`` or ``coincidence``. Dihedral over-labels by ~3.9x but is what
-    exists at inference, so it keeps train and test consistent. Coincidence is
-    exact and training-time only -- use it to *measure* the gap, not to report
-    a number as if it were achievable.
+    ``dihedral``, ``coincidence`` or ``marked``. Dihedral over-labels by ~3.9x
+    but is what exists at inference, so it keeps train and test consistent.
+    Coincidence is exact and training-time only -- use it to *measure* the
+    gap, not to report a number as if it were achievable.
+
+    ``marked`` is the true break, wherever it is known: the vertices a
+    converted dataset marks (Fractura's ``shared_faces``, Fantastic Breaks'
+    ``mask``, written beside each scene by ``scripts/convert_external.py``),
+    else the vertices a Breaking Bad piece shares with another -- carried over
+    to remeshed pieces, which ``coincidence`` cannot be. It is the ORACLE
+    experiment (``--evaluate --label_method marked``): the tokens and the
+    vertices stage two matches are the true break, so if the matches recover
+    on scans the fracture labels were what failed there; if they stay at
+    chance, the embedding is. Nothing at inference provides it.
     """
     sharp_threshold: float = 0.9
     min_fracture_faces: int = 1
@@ -238,6 +248,53 @@ class Config:
     break stay each other's positives however far apart they are moved. 0:
     closed, as stored.
     """
+    remesh_edge: Optional[Sequence[float]] = None
+    """
+    ``--remesh_edge LOW HIGH``: each piece of every TRAINING scene remeshed
+    ISOTROPICALLY on its own -- triangles close to equilateral, at an edge
+    length drawn per piece from [LOW, HIGH] in world units -- in place of
+    ``--remesh``'s quadric collapse (:func:`reassembly.data.remesh.
+    isotropic_pieces`). An intra layer reaches one ring of the mesh, so what
+    the network sees around a vertex is so many EDGES wide; remeshed to one
+    edge length, as ``scripts/convert_external.py --isotropic`` converts the
+    scans, Breaking Bad and the scans are seen at one scale and in one
+    triangulation. ``0.012 0.018`` brackets Breaking Bad's median edge (0.0145
+    of an object). The break settings below apply after it as after
+    ``--remesh``. Needs pymeshlab (on Linux also libopengl0).
+    """
+    remesh_smooth: int = 0
+    """With ``--remesh`` or ``--remesh_edge``: wear every break by up to this
+    many smoothing steps, drawn per piece -- the sharp rim rounded and the
+    finest roughness gone, as on scanned breaks
+    (:func:`reassembly.data.remesh.smooth_pieces`). 0: none."""
+    remesh_noise: float = 0.0
+    """With ``--remesh`` or ``--remesh_edge``: a ripple along the normal,
+    correlated over about 0.02 -- a scanner's noise, where ``remesh_jitter``
+    is independent per vertex -- of a standard deviation drawn per scene from
+    [0, this], in world units (:func:`reassembly.data.remesh.noise_pieces`).
+    Added after the fracture labels are computed, like the jitter. 0: none."""
+    remesh_deform: float = 0.0
+    """With ``--remesh`` or ``--remesh_edge``: every piece bent by its own slow
+    field (length scale 0.3) of a standard deviation drawn per scene from
+    [0, this], in world units, so the two sides of a break fit nowhere exactly
+    (:func:`reassembly.data.remesh.deform_pieces`). Keep it well under stage
+    two's RANSAC tolerance (0.05 of the largest piece's radius); 0.003 is a
+    fifth of it on a piece of radius 0.3. 0: none."""
+    remesh_probability: float = 1.0
+    """The share of the training scenes remeshed by ``--remesh`` or
+    ``--remesh_edge``; the rest are left as stored. One draw per scene and
+    epoch decides this and ``augment_probability`` together."""
+    augment_probability: float = 1.0
+    """
+    The share of the training scenes whose breaks are perturbed -- opened,
+    worn, bent, rippled and jittered by the settings above; the others keep
+    them as remeshed, or as stored. The same draw as ``remesh_probability``:
+    with both at 0.625 a step is on average 37.5% scenes as stored and 62.5%
+    remeshed and perturbed (48 of 128); with ``remesh_probability 1`` every
+    scene is remeshed and 62.5% of them perturbed -- which keeps the stored
+    scenes' shared vertices and mirror-image tessellation, which no scan has,
+    out of training. Validation is never augmented.
+    """
     # No translation setting, and that is deliberate rather than an omission.
     # `build_scene` applies rotation only, then centres every fragment at its
     # own centroid -- which removes any translation that had been applied. A
@@ -272,17 +329,61 @@ class Config:
     what its tokens heard one hop further along the mesh. The schedule nrhl was
     trained with. ``intra intra intra intra intra`` is the ablation with no
     cross-fragment layer at all.
+
+    ``segment`` adds the fracture head (``nn/context.py``): once, before every
+    cross layer. The network then picks its tokens itself from the vertices
+    the head predicts, on the device, and stage two matches those vertices --
+    the dihedral labels are no longer used. ``global`` hands every vertex a
+    summary of its whole fragment. ``intra intra intra intra segment global
+    cross intra cross intra cross intra`` gives the head four hops of mesh
+    context and the cross layers a fragment-wide view.
+    """
+    segment_threshold: float = 0.5
+    """With a ``segment`` layer: the predicted probability of a break above
+    which a vertex is a token candidate and a vertex stage two matches."""
+    match_metric: str = "euclidean"
+    """
+    How stage two compares embeddings: ``euclidean`` (the default, v7's) or
+    ``cosine`` -- by direction, as the contrastive term trains them
+    (:func:`reassembly.assembly.translation.mutual_nearest_neighbours`). An
+    inference setting: never taken from a checkpoint, so one checkpoint can be
+    scored both ways. On the synthetic slabs of ``tests/test_contact.py``,
+    Euclidean was better on one seed in three and equal on two.
     """
 
     # -- the loss -----------------------------------------------------------
     w_embedding: float = 1.0
     """
-    The weight of the one term the network is trained on, the contrastive
-    embedding term. The four geometric terms -- rotation, position, normal,
-    face -- score the rotations stage two fits from the matches (anchor
-    protocol, ``nn/anchor.py``) and are never trained on, so they have no
-    weight: ``--w_rot``, ``--w_pos``, ``--w_normal`` and ``--w_face`` are
-    refused, as is ``--rotation_target``.
+    The weight of the contrastive embedding term, the term every run trains.
+    The four geometric terms -- rotation, position, normal, face -- score the
+    rotations stage two fits from the matches (anchor protocol,
+    ``nn/anchor.py``) and are never trained on, so they have no weight:
+    ``--w_rot``, ``--w_pos``, ``--w_normal`` and ``--w_face`` are refused, as is
+    ``--rotation_target``.
+    """
+    w_segment: float = 1.0
+    """With a ``segment`` layer: the weight of the fracture head's term
+    (:func:`reassembly.nn.context.segment_loss`), trained on the true break --
+    the vertices a Breaking Bad piece shares with another, carried over to a
+    remeshed piece. It reads about 0.17 untrained (``segment_gamma`` 2)."""
+    segment_gamma: float = 2.0
+    """The focal exponent of the fracture head's term; 0 is class-balanced
+    cross-entropy."""
+    segment_teacher: float = 0.5
+    """With a ``segment`` layer: the share of training batches whose tokens are
+    picked from the true break instead of the head's prediction, so the cross
+    layers learn on good tokens while the head is still poor and on its own
+    picks the rest of the time. Validation and ``--evaluate`` always use the
+    prediction (or, with ``--label_method marked``, the true break)."""
+    w_consistency: float = 0.0
+    """
+    The weight of the consistency term (:func:`reassembly.nn.losses.
+    consistency_loss`): every training scene that was remeshed or perturbed is
+    also run as stored, without a gradient, and each of its vertices'
+    embeddings is pulled toward that of the stored vertex it came from -- so
+    the embedding learns to ignore the tessellation and the perturbations. 0,
+    the default: off. Costs a second forward pass (no backward) and a second
+    copy of each scene in the loader. Needs ``--remesh`` or ``--remesh_edge``.
     """
     score_train: bool = False
     """
@@ -403,6 +504,12 @@ class Config:
     cover a session that is cut off without one.
     """
     resume: bool = True
+    init_partial: bool = False
+    """With ``init_from``: take only the weights whose names and shapes this
+    network shares with the checkpoint, and start the rest fresh -- to carry
+    a v7 run's weights into a schedule with ``segment`` or ``global`` layers.
+    Intra and cross layers are matched by their order among their own kind,
+    and every weight left fresh is named."""
     init_from: Optional[str] = None
     """
     A checkpoint whose weights a NEW run starts from -- fine-tuning. Only the
@@ -463,8 +570,20 @@ class Config:
             raise ValueError(
                 f"channels={self.channels} must be divisible by heads={self.heads}"
             )
-        if self.label_method not in ("dihedral", "coincidence"):
-            raise ValueError(f"label_method must be dihedral or coincidence")
+        if self.label_method not in ("dihedral", "coincidence", "marked"):
+            raise ValueError("label_method must be dihedral, coincidence or marked")
+        from .nn.schedule import check_schedule
+
+        check_schedule(self.schedule)
+        if self.match_metric not in ("euclidean", "cosine"):
+            raise ValueError(f"match_metric must be euclidean or cosine, got "
+                             f"{self.match_metric!r}")
+        if not 0.0 < self.segment_threshold < 1.0:
+            raise ValueError("segment_threshold is a probability: in (0, 1)")
+        if not 0.0 <= self.segment_teacher <= 1.0:
+            raise ValueError("segment_teacher is a share of the batches: in [0, 1]")
+        if self.w_segment < 0 or self.w_consistency < 0 or self.segment_gamma < 0:
+            raise ValueError("w_segment, w_consistency and segment_gamma must be >= 0")
         if self.batch_size < 1 or self.epochs < 1:
             raise ValueError("batch_size and epochs must be >= 1")
         if self.steps_per_epoch < 0:
@@ -497,16 +616,30 @@ class Config:
             raise ValueError("contact_radius must be >= 0 (0 = the coincidence clusters)")
         if self.contact_band < 1:
             raise ValueError("contact_band must be >= 1: it is counted in radii")
-        if self.remesh is not None:
-            from .data.remesh import check_remesh
+        from .data.remesh import check_augment, check_remesh
 
+        if self.remesh is not None and self.remesh_edge is not None:
+            raise ValueError("--remesh collapses each piece and --remesh_edge remeshes it "
+                             "isotropically: give one of them")
+        if self.remesh_edge is not None:
+            self.remesh_edge = tuple(float(value) for value in self.remesh_edge)
+        check_augment(self.remesh_edge, self.remesh_smooth, self.remesh_noise,
+                      self.remesh_deform, self.remesh_probability, self.augment_probability)
+        if self.remesh is not None:
             if len(self.remesh) != 2:
                 raise ValueError(f"remesh is two numbers, LOW HIGH, got {self.remesh!r}")
             self.remesh = tuple(float(value) for value in self.remesh)
             check_remesh(*self.remesh, self.remesh_jitter, self.remesh_gap)
-        elif self.remesh_jitter or self.remesh_gap:
-            raise ValueError("remesh_jitter and remesh_gap apply to remeshed pieces: give "
-                             "--remesh LOW HIGH")
+        elif self.remesh_edge is not None:
+            check_remesh(1.0, 1.0, self.remesh_jitter, self.remesh_gap)
+        elif (self.remesh_jitter or self.remesh_gap or self.remesh_smooth or self.remesh_noise
+              or self.remesh_deform):
+            raise ValueError("remesh_jitter, remesh_gap, remesh_smooth, remesh_noise and "
+                             "remesh_deform apply to remeshed pieces: give --remesh LOW HIGH "
+                             "or --remesh_edge LOW HIGH (--remesh 1 1 keeps every face)")
+        if self.w_consistency and self.remesh is None and self.remesh_edge is None:
+            raise ValueError("w_consistency compares each scene with itself as stored, so it "
+                             "needs scenes that are not: give --remesh or --remesh_edge")
         from .data.catalog import BALANCE_SCHEMES, SPLIT_MODES
 
         if self.split_by not in SPLIT_MODES:
@@ -661,12 +794,26 @@ class BreakingBadScenes:
         # Each piece remeshed on its own (`data/remesh.py`): the training
         # split's augmentation, or what an evaluation asks for (`remesh`, a
         # `Remesh`). Validation is never remeshed by the training settings.
-        if remesh is None and split == "train" and config.remesh is not None:
-            remesh = Remesh(*config.remesh, config.remesh_jitter, config.remesh_gap)
+        if remesh is None and split == "train" and (config.remesh is not None
+                                                    or config.remesh_edge is not None):
+            low, high = config.remesh if config.remesh is not None else (1.0, 1.0)
+            remesh = Remesh(low, high, config.remesh_jitter, config.remesh_gap,
+                            edge=config.remesh_edge, smooth=config.remesh_smooth,
+                            noise=config.remesh_noise, deform=config.remesh_deform,
+                            remesh_probability=config.remesh_probability,
+                            augment_probability=config.augment_probability)
         if remesh is not None and config.label_method == "coincidence":
             raise ValueError("--label_method coincidence finds a break by its coincident "
-                             "vertices, which remeshing removes: use dihedral with --remesh")
+                             "vertices, which remeshing removes: use dihedral (or marked) "
+                             "with --remesh")
         self.remesh = remesh
+        # A network with a fracture head picks its own tokens, on the device,
+        # and is trained on the true break; the oracle and the consistency
+        # term read the true break too.
+        self.segmenting = "segment" in tuple(config.schedule)
+        self.wants_truth = (self.segmenting or config.label_method == "marked"
+                            or config.w_consistency > 0)
+        self._last_mode = None
 
         scenes = find_scenes(config.root, config.subsets)
         if not scenes:
@@ -839,18 +986,49 @@ class BreakingBadScenes:
                     if part and not part.endswith("_compressed")]
         return "/".join([top, *category, entry.name, mode])
 
+    def _mode(self, i: int):
+        """Item ``i``'s fracture mode as loaded, the last one kept -- the
+        fragments and the true break are read from the same load."""
+        if self._last_mode is not None and self._last_mode[0] == i:
+            return self._last_mode[1]
+        scene_index, mode = self.items[i]
+        result = self._reader(self._directories[(scene_index, mode)]).load_mode(mode)
+        self._last_mode = (i, result)
+        return result
+
     def meshes(self, i: int) -> list:
         """Item ``i``'s fragments as loaded, in the ASSEMBLED frame (trimesh)."""
-        scene_index, mode = self.items[i]
-        return self._reader(self._directories[(scene_index, mode)]).load_mode(mode).fragments
+        return self._mode(i).fragments
 
-    def labels(self, meshes) -> list:
-        """Per-fragment boolean fracture masks, by ``config.label_method``."""
+    def breaks(self, i: int, meshes) -> list:
+        """
+        Per fragment of item ``i`` as loaded (``meshes``), its true break: the
+        vertices the converted dataset marks (:data:`reassembly.data.scene.
+        BREAK_FILE`), else -- Breaking Bad -- those it shares with another
+        fragment (:func:`~reassembly.mesh.fracture.fracture_vertex_masks`).
+        """
+        from .mesh.fracture import fracture_vertex_masks
+
+        scene_index, mode = self.items[i]
+        marked = self._reader(self._directories[(scene_index, mode)]).break_masks(self._mode(i))
+        return marked if marked is not None else fracture_vertex_masks(meshes)
+
+    def labels(self, meshes, truth=None) -> list:
+        """
+        Per-fragment boolean fracture masks, by ``config.label_method``;
+        ``marked`` returns ``truth``, the true break of these pieces
+        (:meth:`breaks`, carried over to them when remeshed), which it needs.
+        """
         from .mesh.fracture import fracture_face_mask, fracture_vertex_masks
 
         config = self.config
         if config.label_method == "coincidence":
             return fracture_vertex_masks(meshes)
+        if config.label_method == "marked":
+            if truth is None:
+                raise ValueError("label_method marked labels a scene by its true break: "
+                                 "pass it (BreakingBadScenes.breaks)")
+            return [np.asarray(mask, dtype=bool) for mask in truth]
         masks = []
         for mesh in meshes:
             v, f = np.asarray(mesh.vertices, dtype=np.float64), np.asarray(mesh.faces)
@@ -931,21 +1109,39 @@ class BreakingBadScenes:
             return Skipped(key, "non-finite vertex coordinates")
 
         draw = stable_seed(key, self.epoch_seed, config.seed) if seed is None else seed
+        stored, stored_vertices, stored_faces = meshes, vertices, faces
         closed = surface = meshes
         points = None
+        changed = False
+        # The true break of the pieces as stored, where something reads it.
+        truth = stored_truth = self.breaks(i, meshes) if self.wants_truth else None
         if self.remesh is not None:
             # Labelled before the jitter: the dihedral test reads the noise as
             # fracture (data/remesh.py). The positives are where the vertices
             # were before the opening and the jitter, so the two sides of an
             # opened break stay each other's. The model reads the moved pieces.
+            changed = any(self._decisions(key))
             closed, surface, meshes = self._remeshed(key, vertices, faces)
             vertices = [m.vertices for m in meshes]
             faces = [m.faces for m in meshes]
             if config.supervise_embedding and config.contact_radius > 0:
                 points = np.concatenate([m.vertices for m in closed])
-        return build_scene(
-            vertices, faces, self.labels(surface),
-            category=self.catalog.objects[scene_index].category or "(uncategorised)",
+            if truth is not None and changed:
+                from .data.remesh import carry_masks
+
+                truth = carry_masks(stored_vertices, truth, [m.vertices for m in closed])
+        if rotations is None:
+            # Drawn here rather than inside build_scene -- the same numbers, as
+            # the draw is the generator's first -- so the stored view below
+            # can be tumbled exactly as the scene is.
+            from .data.transforms import random_rotations
+
+            rotations = random_rotations(len(vertices), np.random.default_rng(draw))
+        category = self.catalog.objects[scene_index].category or "(uncategorised)"
+        perturb = (not config.perturb_on_device) if perturb is None else perturb
+        sample = build_scene(
+            vertices, faces, self.labels(surface, truth),
+            category=category,
             rotations=rotations,
             rng=np.random.default_rng(draw),
             normalize_mode=config.normalize_mode,
@@ -955,10 +1151,59 @@ class BreakingBadScenes:
             max_tokens_per_fragment=None,
             cluster=self.clusters(meshes),
             key=key,
-            perturb=(not config.perturb_on_device) if perturb is None else perturb,
+            perturb=perturb,
             contact=self.contact(closed),
             contact_points=points,
+            breaks=None if truth is None else np.concatenate(truth),
+            # A network with a fracture head picks its own tokens.
+            select_tokens=not self.segmenting,
         )
+        if changed and config.w_consistency > 0 and self.split == "train":
+            sample = sample._replace(**self._stored_view(
+                stored, stored_vertices, stored_faces, closed, rotations, draw, key,
+                category, perturb, truth=stored_truth))
+        return sample
+
+    def _stored_view(self, stored, vertices, faces, closed, rotations, draw, key, category,
+                     perturb, truth) -> dict:
+        """
+        The consistency term's view (:class:`~reassembly.data.features.SceneSample`
+        ``view`` and ``view_index``): the scene as stored, tumbled as the scene
+        is, and per vertex of the scene the stored vertex it came from -- the
+        nearest, to where it was before anything moved it (``closed``).
+        """
+        from scipy.spatial import cKDTree
+
+        from .data.features import build_scene
+
+        config = self.config
+        view = build_scene(
+            vertices, faces, self.labels(stored, truth), category=category,
+            rotations=rotations, rng=np.random.default_rng(draw),
+            normalize_mode=config.normalize_mode, token_mode=config.token_mode,
+            token_metric=config.token_metric, tokens_per_scene=config.tokens_per_scene,
+            max_tokens_per_fragment=None, key=key, perturb=perturb,
+            select_tokens=not self.segmenting)
+        offsets = np.cumsum([0] + [len(v) for v in vertices])
+        index = [cKDTree(np.asarray(v, dtype=np.float64)).query(
+                     np.asarray(m.vertices, dtype=np.float64))[1] + offset
+                 if len(v) else np.full(len(m.vertices), -1, np.int64)
+                 for v, m, offset in zip(vertices, closed, offsets[:-1])]
+        return dict(view=view, view_index=np.concatenate(index).astype(np.int64))
+
+    def _decisions(self, key: str) -> Tuple[bool, bool]:
+        """
+        Whether this epoch remeshes the scene ``key`` and whether it perturbs its
+        breaks: one draw per scene and epoch, against ``remesh_probability`` and
+        ``augment_probability``, from its own stream so the remeshing draws
+        what it always has. Both, whenever the shares are 1.
+        """
+        spec = self.remesh
+        if spec.remesh_probability >= 1.0 and spec.augment_probability >= 1.0:
+            return True, True
+        u = np.random.default_rng(stable_seed(key, self.epoch_seed, self.config.seed,
+                                              "augment")).uniform()
+        return bool(u < spec.remesh_probability), bool(u < spec.augment_probability)
 
     def __getitem__(self, i: int):
         return self.build(i)
@@ -969,22 +1214,22 @@ class BreakingBadScenes:
         the perturbation and the tokens draw what they would have -- and per
         epoch like them: every epoch remeshes a training scene afresh, and
         one epoch the same way every time it is asked. ``(closed, surface,
-        moved)``, all with the same faces: the collapsed pieces, where the
-        positives are found; after the opening (``gap``), which the fracture
-        labels are computed on; and after the jitter, what the model reads.
+        moved)``, all with the same faces: the remeshed pieces, where the
+        positives are found; after the opening, wear and bend, which the
+        fracture labels are computed on; and after the ripple and the jitter,
+        what the model reads (:func:`reassembly.data.remesh.remesh_scene`). A
+        scene this epoch leaves alone (:meth:`_decisions`) comes back as
+        stored, three times.
         """
-        from .data.remesh import break_masks, collapse_pieces, jitter_pieces, open_pieces
+        from .data.remesh import remesh_scene
 
         rng = np.random.default_rng(stable_seed(key, self.epoch_seed, self.config.seed,
                                                 "remesh"))
-        collapsed, faces = collapse_pieces(vertices, faces, rng, self.remesh)
-        opened = collapsed
-        if self.remesh.gap:
-            opened = open_pieces(collapsed, faces, break_masks(vertices, collapsed), rng,
-                                 self.remesh.gap)
-        moved = jitter_pieces(opened, rng, self.remesh.jitter)
+        remesh, perturb = self._decisions(key)
+        closed, surface, moved, faces = remesh_scene(vertices, faces, rng, self.remesh,
+                                                     remesh=remesh, perturb=perturb)
         return tuple([_Mesh(v, f) for v, f in zip(stage, faces)]
-                     for stage in (collapsed, opened, moved))
+                     for stage in (closed, surface, moved))
 
     def pieces(self, i: int) -> list:
         """
@@ -1193,8 +1438,58 @@ def _to_device(batch, device):
 
     moved = {}
     for name, value in batch._asdict().items():
-        moved[name] = value.to(device, non_blocking=True) if torch.is_tensor(value) else value
+        if torch.is_tensor(value):
+            moved[name] = value.to(device, non_blocking=True)
+        elif isinstance(value, type(batch)):
+            moved[name] = _to_device(value, device)      # the stored view
+        else:
+            moved[name] = value
     return type(batch)(**moved)
+
+
+def run_model(model, batch, config: Config, token_mask=None):
+    """
+    The network on a completed batch (:func:`reassembly.data.features.
+    complete_batch`), exactly as :func:`_forward` runs it -- one place, so
+    ``probe_val.py`` cannot drift from training. ``token_mask``: with a
+    fracture head, the vertices to pick the tokens among instead of the
+    predicted break (the true break: teacher forcing, or the oracle).
+    """
+    return model(
+        batch.node_features, batch.edge_index, batch.edge_attr,
+        batch.vertex_fragment, batch.num_fragments,
+        log_scale=batch.log_scale, token_index=batch.token_index,
+        token_query=batch.token_query, token_key=batch.token_key,
+        fragment_scene=batch.fragment_scene, num_scenes=batch.num_scenes,
+        token_mask=token_mask, tokens_per_scene=config.tokens_per_scene,
+        threshold=config.segment_threshold,
+    )
+
+
+def segments(model) -> bool:
+    """Whether ``model`` has a fracture head (a ``segment`` layer)."""
+    return bool(getattr(model, "segments", False))
+
+
+def predicted_batch(batch, prediction, config: Config):
+    """
+    ``batch`` as stage two should read it, given the network's ``prediction``:
+    with a fracture head, the vertices it predicts on a break replace the
+    labels as the fracture mask -- the vertices the matching may use -- and its
+    tokens replace the batch's; under ``--label_method marked`` (the oracle)
+    the mask stays the true break. Without a head, ``batch`` itself.
+    """
+    import torch
+
+    if prediction.fracture_logit is None:
+        return batch
+    changes = dict(token_index=prediction.token_index, token_query=None, token_key=None)
+    if config.label_method != "marked":
+        changes["fracture"] = (torch.sigmoid(prediction.fracture_logit.detach())
+                               > config.segment_threshold)
+    from .data.features import pair_on_device
+
+    return pair_on_device(batch._replace(**changes))
 
 
 def _forward(model, batch, criterion, config, keep=None, score=None, drop=0.0):
@@ -1225,21 +1520,36 @@ def _forward(model, batch, criterion, config, keep=None, score=None, drop=0.0):
     per fragment (``"fragments"``) -- for evaluation, which assembles from
     them and breaks them down by category. ``drop`` leaves that share of the
     break vertices out of the matching (``--evaluate --drop``).
+
+    With a fracture head (a ``segment`` layer) the network picks its own
+    tokens: among the true break in ``segment_teacher`` of the training
+    batches and under ``--label_method marked`` (the oracle), among its own
+    prediction otherwise; and stage two matches the vertices it predicts
+    (:func:`predicted_batch`), which is the batch ``keep`` receives. The head's
+    term and the consistency term are added to the loss (:func:`_extra_terms`).
     """
     import torch
 
     from .assembly.rotation import match_batch
     from .data.features import clustered_vertices, complete_batch
-    from .nn.anchor import anchor_alignment
+    from .nn.anchor import anchor_alignment, scored_count
     from .nn.model import apply_rotation
 
     batch = complete_batch(batch)
-    prediction = model(
-        batch.node_features, batch.edge_index, batch.edge_attr,
-        batch.vertex_fragment, batch.num_fragments,
-        log_scale=batch.log_scale, token_index=batch.token_index,
-        token_query=batch.token_query, token_key=batch.token_key,
-    )
+    token_mask = None
+    if segments(model):
+        if config.label_method == "marked" and batch.fracture is not None:
+            token_mask = batch.fracture              # the oracle: the true break
+        elif (model.training and batch.breaks is not None and config.segment_teacher > 0
+              and random.random() < config.segment_teacher):
+            token_mask = batch.breaks                # teacher forcing
+    prediction = run_model(model, batch, config, token_mask=token_mask)
+    # What the network was trained to predict, before the batch takes its picks.
+    truth = batch.breaks
+    known = (None if batch.breaks_known is None
+             else batch.breaks_known[batch.fragment_scene[batch.vertex_fragment]])
+    labels = batch.fracture
+    batch = predicted_batch(batch, prediction, config)
     if keep is not None:
         keep["batch"], keep["prediction"] = batch, prediction
     if score is None:
@@ -1272,7 +1582,8 @@ def _forward(model, batch, criterion, config, keep=None, score=None, drop=0.0):
     if score:
         with torch.no_grad():
             matched = match_batch(batch, prediction.vertex_embedding.detach(),
-                                  seed=config.seed, drop=drop)
+                                  seed=config.seed, drop=drop,
+                                  cosine=config.match_metric == "cosine")
             R = matched.rotation
             if keep is not None:
                 keep["matched"] = matched
@@ -1295,6 +1606,8 @@ def _forward(model, batch, criterion, config, keep=None, score=None, drop=0.0):
         embeddings=embeddings, cluster=cluster, num_clusters=clusters, **near,
         keep=scored, return_fragments=True,
     )
+    total = _extra_terms(model, batch, prediction, config, total, report, truth, known,
+                         labels, token_mask, weight=max(scored_count(batch), 1))
     if keep is not None:
         keep["fragments"] = fragments
     if score:
@@ -1312,6 +1625,56 @@ def _forward(model, batch, criterion, config, keep=None, score=None, drop=0.0):
             report["tilt_deg"] = float(tilt.mean()) if tilt.numel() else 0.0
             report["twist_deg"] = float(twist.mean()) if twist.numel() else 0.0
     return total, report, R
+
+
+def _extra_terms(model, batch, prediction, config, total, report, truth, known, labels,
+                 token_mask, weight):
+    """
+    The fracture head's term and the consistency term, added to ``total`` and
+    entered in ``report``; returns the new total.
+
+    The head is also scored against the true break wherever a scene knows it
+    -- and so are the labels it replaces, for comparison: ``seg_hit``,
+    ``seg_chosen``, ``seg_marked`` (and ``dihedral_hit``, ``dihedral_chosen``)
+    are counts divided by the batch's ``weight``, which the epoch sums back
+    into counts, so precision and recall come out exact over the epoch
+    (:func:`_summarise_tally`).
+    """
+    import torch
+
+    from .nn.context import segment_loss
+
+    if prediction.fracture_logit is not None and truth is not None and known is not None \
+            and bool(known.any()):
+        term = segment_loss(prediction.fracture_logit, truth, batch.vertex_fragment,
+                            batch.num_fragments, gamma=config.segment_gamma, keep=known)
+        total = total + config.w_segment * term
+        report["segment"] = float(term.detach())
+        with torch.no_grad():
+            predicted = torch.sigmoid(prediction.fracture_logit) > config.segment_threshold
+            target = truth.bool() & known
+            report["seg_hit"] = float((predicted & target).sum()) / weight
+            report["seg_chosen"] = float((predicted & known).sum()) / weight
+            report["seg_marked"] = float(target.sum()) / weight
+            if labels is not None and config.label_method == "dihedral":
+                report["dihedral_hit"] = float((labels & target).sum()) / weight
+                report["dihedral_chosen"] = float((labels & known).sum()) / weight
+    if (model.training and config.w_consistency > 0 and batch.view is not None
+            and batch.view_index is not None):
+        from .nn.losses import consistency_loss
+
+        with torch.no_grad():
+            # The stored scene picks its own tokens, from its own prediction.
+            seen = run_model(model, batch.view, config)
+        index = batch.view_index
+        if truth is not None:
+            # On the break, where the matches are made.
+            index = torch.where(truth.bool(), index, torch.full_like(index, -1))
+        term = consistency_loss(prediction.vertex_embedding, seen.vertex_embedding, index)
+        total = total + config.w_consistency * term
+        report["consistency"] = float(term.detach())
+    report["total"] = float(total.detach())
+    return total
 
 
 def _loss_fragments(batch, config) -> int:
@@ -1916,6 +2279,16 @@ def _summarise_tally(tally: Dict, axis: Optional[str] = None) -> Dict:
     fragments = tally["fragments"]
     weight = tally["weight"]
     summary = {name: value / max(weight, 1) for name, value in tally["sums"].items()}
+    # The fracture head against the true break, from the epoch's counts
+    # (`_extra_terms`): the weights cancel in each ratio.
+    for name in ("seg", "dihedral"):
+        chosen, hit = summary.get(f"{name}_chosen"), summary.get(f"{name}_hit")
+        if hit is None:
+            continue
+        marked = summary.get("seg_marked")
+        summary[f"{name}_precision"] = hit / chosen if chosen else 0.0
+        if marked:
+            summary[f"{name}_recall"] = hit / marked
     summary["batches"] = tally["batches"]
     summary["attempted"] = tally["attempted"]
     summary["fragments"] = fragments
@@ -2044,6 +2417,9 @@ def format_losses(summary: Dict[str, float]) -> str:
     if scores:
         parts.append("scores: " + "  ".join(scores))
     loss = [f"embedding={summary['embedding']:.4f}"] if "embedding" in summary else []
+    for name in ("segment", "consistency"):
+        if name in summary:
+            loss.append(f"{name}={summary[name]:.4f}")
     loss.append(f"TOTAL={summary.get('total', float('nan')):.4f}")
     parts.append("loss: " + "  ".join(loss))
     return "   ".join(parts)
@@ -2074,6 +2450,23 @@ def format_metrics(summary: Dict[str, float]) -> str:
         # about it not, against neither.
         line += (f"\n        tilt {summary['tilt_deg']:6.2f}  "
                  f"twist {summary['twist_deg']:6.2f}")
+    fracture = format_fracture(summary)
+    if fracture:
+        line += "\n        " + fracture
+    return line
+
+
+def format_fracture(summary: Dict[str, float]) -> str:
+    """The fracture head against the true break -- and the dihedral labels it
+    replaces, on the same vertices -- when the batches were scored on it."""
+    if "seg_precision" not in summary:
+        return ""
+    line = (f"fracture head: precision {summary['seg_precision']:.3f}"
+            + (f" recall {summary['seg_recall']:.3f}" if "seg_recall" in summary else ""))
+    if "dihedral_precision" in summary:
+        line += (f"   (dihedral labels: precision {summary['dihedral_precision']:.3f}"
+                 + (f" recall {summary['dihedral_recall']:.3f}"
+                    if "dihedral_recall" in summary else "") + ")")
     return line
 
 
@@ -2217,18 +2610,24 @@ _DATA = ("label_method", "sharp_threshold", "tokens_per_scene", "token_mode",
          # scenes. A resume onto one also resets the best-so-far (`train`).
          "max_fragments", "min_fragments",
          # What the embedding term is and what the training scenes look like.
-         "contact_radius", "contact_band", "remesh", "remesh_jitter", "remesh_gap")
+         "contact_radius", "contact_band", "remesh", "remesh_jitter", "remesh_gap",
+         "remesh_edge", "remesh_smooth", "remesh_noise", "remesh_deform",
+         "remesh_probability", "augment_probability")
 # Data fields added after checkpoints were first written, read as what those
 # runs did: a checkpoint without `max_fragments` or `min_fragments` used every
 # break pattern, and one without the rest trained on coincidence clusters,
 # with the pieces as stored.
 _DATA_BEFORE_IT_EXISTED = {"max_fragments": None, "min_fragments": None,
                            "contact_radius": 0.0, "contact_band": 2.0,
-                           "remesh": None, "remesh_jitter": 0.0, "remesh_gap": 0.0}
+                           "remesh": None, "remesh_jitter": 0.0, "remesh_gap": 0.0,
+                           "remesh_edge": None, "remesh_smooth": 0, "remesh_noise": 0.0,
+                           "remesh_deform": 0.0, "remesh_probability": 1.0,
+                           "augment_probability": 1.0}
 # Data fields that shape the TRAINING scenes only: a resume onto a change is
 # announced like any other, but an evaluation does not take them from the
 # checkpoint -- it is remeshed only when it is asked to be (`evaluate`).
-_TRAINING_ONLY = ("remesh", "remesh_jitter", "remesh_gap")
+_TRAINING_ONLY = ("remesh", "remesh_jitter", "remesh_gap", "remesh_edge", "remesh_smooth",
+                  "remesh_noise", "remesh_deform", "remesh_probability", "augment_probability")
 
 
 def _resume_path(config: Config, default: Path) -> Optional[Path]:
@@ -2468,7 +2867,8 @@ def _start_from(model, config: Config, device, announce: bool) -> None:
     state = torch.load(path, map_location=device, weights_only=False)
     stored, current = state.get("config") or {}, asdict(config)
     different = [(key, stored[key], current[key]) for key in _ARCHITECTURE
-                 if key in stored and _differs(stored[key], current[key])]
+                 if key in stored and _differs(stored[key], current[key])
+                 and not (config.init_partial and key == "schedule")]
     if different:
         def spelled(value):
             return " ".join(map(str, value)) if isinstance(value, (list, tuple)) else str(value)
@@ -2482,11 +2882,23 @@ def _start_from(model, config: Config, device, announce: bool) -> None:
     head = _head_keys(weights)
     if head:
         weights = {key: value for key, value in weights.items() if key not in head}
-    model.load_state_dict(weights)
+    fresh: List[str] = []
+    if config.init_partial:
+        own = model.state_dict()
+        taken = {key: value for key, value in weights.items()
+                 if key in own and tuple(own[key].shape) == tuple(value.shape)}
+        fresh = sorted(key for key in own if key not in taken)
+        model.load_state_dict(taken, strict=False)
+    else:
+        model.load_state_dict(weights)
     if announce:
         print(f"started from the weights of {path} (epoch {int(state.get('epoch', -1)) + 1})"
               + (f", leaving the rotation head it carries ({len(head)} tensors)" if head else "")
               + "; the optimizer, the schedule and the history start fresh")
+        if config.init_partial:
+            modules = sorted({".".join(key.split(".")[:2]) for key in fresh})
+            print(f"  --init_partial: {len(fresh)} tensor(s) start fresh"
+                  + (f" -- {', '.join(modules)}" if modules else ""))
 
 
 def _seed_everything(seed: int) -> None:
@@ -2701,13 +3113,16 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
     if not config.supervise_embedding:
         raise ValueError("supervise_embedding=False leaves nothing to train: the embedding "
                          "term is the only one, and it needs the coincidence clusters")
-    if (config.remesh_jitter or config.remesh_gap) and not config.contact_radius:
+    if (config.remesh_jitter or config.remesh_gap or config.remesh_smooth
+            or config.remesh_noise or config.remesh_deform) and not config.contact_radius:
         # Measured: jitter 0.001 left no coincident vertex in seven Breaking Bad
-        # scenes, and the opening moves every break vertex; coincidence is all
-        # the term reads without --contact_radius.
-        raise ValueError("--remesh_jitter and --remesh_gap leave no vertex where its twin was, "
-                         "and the coincidence term (--contact_radius 0) has nothing else to "
-                         "train on: give --contact_radius")
+        # scenes, and the opening moves every break vertex -- as do the wear,
+        # the ripple and the bend; coincidence is all the term reads without
+        # --contact_radius.
+        raise ValueError("--remesh_jitter, --remesh_gap, --remesh_smooth, --remesh_noise and "
+                         "--remesh_deform leave no vertex where its twin was, and the "
+                         "coincidence term (--contact_radius 0) has nothing else to train on: "
+                         "give --contact_radius")
     _seed_everything(config.seed + rank)
     out_dir = Path(config.out_dir)
     if main:
@@ -3150,14 +3565,12 @@ def _banner(config, train_set, val_set, parameters, device, world, per_epoch) ->
         *_epoch_lines(config, len(train_set), world, per_epoch),
         *_split_banner(config, train_set, val_set),
         *_balance_banner(config, train_set),
-        f"  labels        {config.label_method}"
-        + (f" @ {config.sharp_threshold}" if config.label_method == "dihedral" else ""),
-        f"  tokens        {config.tokens_per_scene}/scene, {config.token_mode}"
-        f" by {config.token_metric} distance",
+        *_label_banner(config),
         f"  precision     {'AMP' if config.amp else 'fp32'}",
         *_contact_banner(config),
-        "  loss          the embedding term alone; the rotations come from its matches",
-        "                (stage two), scored with rotation/position/normal/face on "
+        "  loss          " + _loss_line(config) + "; the rotations come from the",
+        "                embedding's matches (stage two), scored with "
+        "rotation/position/normal/face on "
         + ("every batch" if config.score_train else
            "validation\n                (--score_train True adds the training batches)"),
         f"  best.pt       the epoch with the highest val {_BEST_NAME}",
@@ -3178,6 +3591,33 @@ def _banner(config, train_set, val_set, parameters, device, world, per_epoch) ->
     return "\n".join(lines)
 
 
+def _label_banner(config: Config) -> List[str]:
+    """Where the fracture labels and the tokens come from."""
+    segmenting = "segment" in tuple(config.schedule)
+    if segmenting and config.label_method != "marked":
+        return [f"  labels        the fracture head's prediction (p > {config.segment_threshold:g}),"
+                f" trained on the true break",
+                f"  tokens        {config.tokens_per_scene}/scene, picked on the device from it"
+                f" ({config.segment_teacher:.0%} of training batches from the true break)"]
+    lines = [f"  labels        {config.label_method}"
+             + (f" @ {config.sharp_threshold}" if config.label_method == "dihedral" else "")
+             + (" -- the TRUE break (the oracle)" if config.label_method == "marked" else "")]
+    lines.append(f"  tokens        {config.tokens_per_scene}/scene, "
+                 + ("picked on the device from them" if segmenting else
+                    f"{config.token_mode} by {config.token_metric} distance"))
+    return lines
+
+
+def _loss_line(config: Config) -> str:
+    """The trained terms, by name and weight."""
+    terms = [f"embedding x{config.w_embedding:g}"]
+    if "segment" in tuple(config.schedule):
+        terms.append(f"fracture head x{config.w_segment:g} (focal gamma {config.segment_gamma:g})")
+    if config.w_consistency:
+        terms.append(f"consistency x{config.w_consistency:g}")
+    return " + ".join(terms)
+
+
 def _contact_banner(config: Config) -> List[str]:
     """What the embedding term's positives are, and what the training scenes look like."""
     if config.contact_radius > 0:
@@ -3185,15 +3625,28 @@ def _contact_banner(config: Config) -> List[str]:
                  f"(world units); out to {config.contact_band:g} radii neither"]
     else:
         lines = ["  positives     the coincident vertices across each break (exact twins)"]
-    if config.remesh is not None:
-        low, high = config.remesh
-        lines.append(f"  remeshed      each training piece on its own: {low:.0%}-{high:.0%} of its "
-                     f"faces kept" + (f", breaks opened up to {config.remesh_gap:g}"
-                                      if config.remesh_gap else "")
-                     + (f", jitter {config.remesh_jitter:g}" if config.remesh_jitter else "")
-                     + "; validation as stored")
+    if config.remesh is not None or config.remesh_edge is not None:
+        if config.remesh_edge is not None:
+            low, high = config.remesh_edge
+            how = f"isotropically to an edge of {low:g}-{high:g}"
+        else:
+            low, high = config.remesh
+            how = f"{low:.0%}-{high:.0%} of its faces kept"
+        moves = "".join(text for value, text in (
+            (config.remesh_gap, f", breaks opened up to {config.remesh_gap:g}"),
+            (config.remesh_smooth, f", worn by up to {config.remesh_smooth} smoothing steps"),
+            (config.remesh_deform, f", bent by up to {config.remesh_deform:g}"),
+            (config.remesh_noise, f", rippled by up to {config.remesh_noise:g}"),
+            (config.remesh_jitter, f", jitter {config.remesh_jitter:g}")) if value)
+        lines.append(f"  remeshed      each training piece on its own: {how}{moves}"
+                     "; validation as stored")
+        if config.remesh_probability < 1 or config.augment_probability < 1:
+            lines.append(f"                in {config.remesh_probability:.0%} of the scenes "
+                         f"remeshed, {config.augment_probability:.0%} perturbed (one draw "
+                         f"per scene), the rest as stored")
     if config.init_from:
-        lines.append(f"  init from     {config.init_from} (weights only)")
+        lines.append(f"  init from     {config.init_from} (weights only"
+                     + (", where they fit" if config.init_partial else "") + ")")
     return lines
 
 
@@ -3246,7 +3699,8 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
              jitter: float = 0.0, drop: float = 0.0,
              predictions: Optional[str] = None,
              remesh: Optional[Sequence[float]] = None,
-             remesh_jitter: float = 0.0, remesh_gap: float = 0.0) -> Dict[str, float]:
+             remesh_jitter: float = 0.0, remesh_gap: float = 0.0,
+             remesh_edge: Optional[Sequence[float]] = None) -> Dict[str, float]:
     """
     Score a saved checkpoint on a held-out split: the rotations stage two fits
     from its embedding matches, their four geometric scores, and -- with
@@ -3291,7 +3745,13 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
     scenes have. The draws are fixed per
     scene and ``config.seed``; the assembly is scored on the remeshed pieces.
     A checkpoint's own ``--remesh``, the training augmentation, never applies
-    here.
+    here. ``remesh_edge`` (``LOW, HIGH``) remeshes isotropically instead, as
+    ``--remesh_edge`` does in training.
+
+    ``config.label_method == "marked"`` -- with ``"label_method"`` in
+    ``override`` -- is the oracle: the tokens and the vertices stage two
+    matches are the true break the scenes store (``scripts/convert_external.py``
+    writes it), not what the checkpoint's labels or fracture head find.
 
     ``predictions``, a folder: every scored scene's prediction is written too,
     in ``scripts/dump_prediction.py``'s format, into one zip there --
@@ -3334,15 +3794,24 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
     placement = check_placement(placement)
     check_noise(jitter, drop)
     spec = None
+    if remesh is not None and remesh_edge is not None:
+        raise ValueError("remesh and remesh_edge are two ways to remesh: give one of them")
     if remesh is not None:
         if len(remesh) != 2:
             raise ValueError(f"remesh is two numbers, LOW HIGH, got {remesh!r}")
         check_remesh(float(remesh[0]), float(remesh[1]), remesh_jitter, remesh_gap)
         spec = Remesh(float(remesh[0]), float(remesh[1]), float(remesh_jitter),
                       float(remesh_gap))
+    elif remesh_edge is not None:
+        from .data.remesh import check_augment
+
+        edge = tuple(float(value) for value in remesh_edge)
+        check_augment(edge)
+        check_remesh(1.0, 1.0, remesh_jitter, remesh_gap)
+        spec = Remesh(1.0, 1.0, float(remesh_jitter), float(remesh_gap), edge=edge)
     elif remesh_jitter or remesh_gap:
         raise ValueError("remesh_jitter and remesh_gap apply to remeshed pieces: give remesh "
-                         "LOW HIGH")
+                         "LOW HIGH (or remesh_edge LOW HIGH)")
     if predictions and not assemble:
         raise ValueError("predictions are placed scenes: they need the assembly, so not "
                          "with --no_assemble")
@@ -3368,7 +3837,8 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
 
     def collect(batch, prediction, shown=None, matched=None) -> None:
         scores = score_batch(batch, prediction, collision=collision, seed=config.seed,
-                             placement=placement, observed=shown, drop=drop, matched=matched)
+                             placement=placement, observed=shown, drop=drop, matched=matched,
+                             cosine=config.match_metric == "cosine")
         if writer is not None:
             writer.add(batch, scores)
         for key, category, score in zip(batch.scene_keys, batch.categories, scores):
@@ -3401,6 +3871,8 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
     if spec is not None:
         summary["remesh"] = {"low": spec.low, "high": spec.high, "jitter": spec.jitter,
                              "gap": spec.gap}
+        if spec.edge is not None:
+            summary["remesh"]["edge"] = list(spec.edge)
     # What was scored, and with what: the report's header, kept in the file so
     # a report rebuilt from it (scripts/report_metrics.py) reads the same.
     summary["evaluation"] = {
@@ -3410,6 +3882,8 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
         "fragment_line": _fragment_line(config, dataset),
         "objects": len(dataset.catalog.objects),
         "trained_shapes": _trained_shapes(dataset, state.get("config") or {}, config),
+        "labels": config.label_method,
+        "fracture_head": segments(model),
     }
     if writer is not None:
         summary["evaluation"]["predictions"] = writer.close()
@@ -3571,6 +4045,13 @@ def format_evaluation(summary: Dict) -> str:
         lines.append(_noise_line(summary["noise"]))
     if summary.get("remesh"):
         lines.append(_remesh_line(summary["remesh"]))
+    if info.get("labels") == "marked":
+        lines.append("  labels: the TRUE break the scenes store (--label_method marked), as the "
+                     "tokens and\n  the vertices matched -- the oracle: nothing at inference "
+                     "provides it")
+    elif info.get("fracture_head"):
+        lines.append("  labels: the fracture head's prediction, as the tokens and the vertices "
+                     "matched")
     if summary.get("rotation_head", True):
         lines.append("  (written before v7 removed the rotation head: the four terms below "
                      "were its losses)")
@@ -3826,19 +4307,24 @@ def _noise_line(noise: Dict[str, float]) -> str:
 
 
 def _remesh_suffix(spec) -> str:
-    """``_remesh0.5-0.9`` (``j0.001`` for a jitter, ``g0.03`` for an opening) for
-    output file names; empty without."""
+    """``_remesh0.5-0.9`` (``j0.001`` for a jitter, ``g0.03`` for an opening;
+    ``_iso0.012-0.018`` remeshed isotropically) for output file names; empty
+    without."""
     if spec is None:
         return ""
-    return (f"_remesh{spec.low:g}-{spec.high:g}" + (f"j{spec.jitter:g}" if spec.jitter else "")
+    head = (f"_iso{spec.edge[0]:g}-{spec.edge[1]:g}" if getattr(spec, "edge", None) is not None
+            else f"_remesh{spec.low:g}-{spec.high:g}")
+    return (head + (f"j{spec.jitter:g}" if spec.jitter else "")
             + (f"g{spec.gap:g}" if spec.gap else ""))
 
 
 def _remesh_line(remesh: Dict[str, float]) -> str:
     """The report's line for an evaluation on remeshed scenes."""
-    return (f"  remeshed          each piece on its own, {remesh['low']:.0%}-{remesh['high']:.0%} "
-            f"of its faces kept" + (f", breaks opened up to {remesh['gap']:g}"
-                                    if remesh.get("gap") else "")
+    how = (f"isotropically to an edge of {remesh['edge'][0]:g}-{remesh['edge'][1]:g}"
+           if remesh.get("edge") else
+           f"{remesh['low']:.0%}-{remesh['high']:.0%} of its faces kept")
+    return (f"  remeshed          each piece on its own, {how}"
+            + (f", breaks opened up to {remesh['gap']:g}" if remesh.get("gap") else "")
             + (f", jitter {remesh['jitter']:g}" if remesh.get("jitter") else "")
             + "\n                    (data/remesh.py): the breaks no longer share their "
               "vertices; scored on the remeshed pieces")
@@ -4168,7 +4654,13 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
             continue
         built.append(item)
         vertices = sum(len(f.target_vertices) for f in item.fragments)
-        tokens = sum(len(f.token_vertices) for f in item.fragments)
+        if train_set.segmenting:
+            # Picked on the device from the head's prediction; the true break
+            # it is trained toward bounds them.
+            tokens = min(int(item.breaks.sum()) if item.breaks is not None else 0,
+                         config.tokens_per_scene)
+        else:
+            tokens = sum(len(f.token_vertices) for f in item.fragments)
         sizes.append((vertices, tokens, len(item.fragments)))
     build_time = (time.time() - began) / max(samples, 1)
     if not built:
@@ -4184,7 +4676,10 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
           f"{int(np.median(vertices)):,}  max {vertices.max():,}")
     print(f"  tokens/scene     min {tokens.min()}  median "
           f"{int(np.median(tokens))}  max {tokens.max()}  "
-          f"(budget {config.tokens_per_scene})")
+          f"(budget {config.tokens_per_scene})"
+          + ("\n                   (the fracture head picks them on the device; counted "
+             "here: the true break it learns, capped at the budget)"
+             if train_set.segmenting else ""))
 
     # How far cross-fragment information can travel by the last layer.
     #
@@ -4199,7 +4694,9 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
         if kind != "intra":
             break
         trailing += 1
-    reached = _token_reach(built, max(trailing, 1) + 1)
+    reached = _token_reach(
+        [_true_tokens(item) for item in built] if train_set.segmenting else built,
+        max(trailing, 1) + 1)
     token_share = 100 * tokens.sum() / max(vertices.sum(), 1)
     spread = "  ".join(f"+{h}: {100 * r:.0f}%" for h, r in enumerate(reached, start=1))
     print(f"  cross-fragment reach   tokens alone: {token_share:.0f}%   {spread}")
@@ -4225,7 +4722,9 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
     if tokens.max() == 0:
         problems.append("every scene produced ZERO cross-fragment tokens -- the "
                         "fracture mask is empty, so the cross layers do nothing. "
-                        "Check --label_method and --sharp_threshold.")
+                        + ("The true break the fracture head learns is empty: check the "
+                           "data." if train_set.segmenting else
+                           "Check --label_method and --sharp_threshold."))
     elif np.median(tokens) < 16:
         warnings.append(f"median {int(np.median(tokens))} tokens/scene is very "
                         f"low; the cross-fragment layers have little to attend over")
@@ -4569,6 +5068,17 @@ def _summarise(problems: List[str], warnings: List[str]) -> bool:
     print("\n  ready to train." + ("  Read the warnings first." if warnings else ""))
     print("=" * 74)
     return True
+
+
+def _true_tokens(sample):
+    """``sample`` with its true break as its tokens -- for preflight's reach,
+    when the network picks its own (a fracture head) from what it predicts."""
+    if sample.breaks is None:
+        return sample
+    offsets = np.cumsum([0] + [len(f.target_vertices) for f in sample.fragments])
+    fragments = [f._replace(token_vertices=np.flatnonzero(sample.breaks[a:b]))
+                 for f, a, b in zip(sample.fragments, offsets[:-1], offsets[1:])]
+    return sample._replace(fragments=fragments)
 
 
 def _token_reach(samples, hops: int) -> List[float]:

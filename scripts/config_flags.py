@@ -43,7 +43,8 @@ CHOICES = {
     "fracture_pool": ("train", "all"),
     "balance": ("none", "category", "object"),
     "symmetry_axis": ("x", "y", "z"),
-    "label_method": ("dihedral", "coincidence"),
+    "label_method": ("dihedral", "coincidence", "marked"),
+    "match_metric": ("euclidean", "cosine"),
     "normalize_mode": ("scene", "fragment"),
     "lr_schedule": ("cosine", "constant"),
 }
@@ -102,6 +103,41 @@ HELP = {
     "init_from": "start a NEW run from this checkpoint's weights (fine-tuning): the "
                  "optimizer, the schedule and the history start fresh; ignored when "
                  "the run resumes from its own checkpoint",
+    "init_partial": "with --init_from: take only the weights this network shares with the "
+                    "checkpoint (by name and shape) and start the rest fresh -- to carry a "
+                    "v7 run into a schedule with segment or global layers",
+    "label_method": "dihedral: a sharp crease marks a break (what inference has); "
+                    "coincidence: the vertices two pieces share (Breaking Bad only, not "
+                    "with --remesh); marked: the TRUE break -- a converted dataset's own "
+                    "marks, else the shared vertices, carried over to remeshed pieces -- "
+                    "the oracle experiment with --evaluate",
+    "remesh_edge": "remesh each TRAINING piece ISOTROPICALLY on its own, to an edge length "
+                   "drawn per piece from [LOW, HIGH] in world units, in place of --remesh's "
+                   "collapse (0.012 0.018 brackets Breaking Bad's 0.0145); with --evaluate, "
+                   "score scenes remeshed so. Needs pymeshlab (on Linux also libopengl0)",
+    "remesh_smooth": "with --remesh/--remesh_edge: wear every break by up to this many "
+                     "smoothing steps, drawn per piece (rounded rims, as scanned)",
+    "remesh_noise": "with --remesh/--remesh_edge: a scanner-like ripple along the normal, "
+                    "correlated over ~0.02, standard deviation drawn per scene from "
+                    "[0, this], in world units",
+    "remesh_deform": "with --remesh/--remesh_edge: bend every piece by its own slow field "
+                     "of up to this standard deviation (world units); keep it well under "
+                     "stage two's RANSAC tolerance",
+    "remesh_probability": "the share of training scenes remeshed; the rest as stored",
+    "augment_probability": "the share of training scenes whose breaks are perturbed "
+                           "(opened, worn, bent, rippled, jittered); one draw per scene "
+                           "decides both shares, so 0.625 and 0.625 is 48 of 128 as stored",
+    "match_metric": "how stage two compares embeddings: euclidean (v7's) or cosine (by "
+                    "direction, as the contrastive term trains them); never taken from a "
+                    "checkpoint, so one checkpoint can be scored both ways",
+    "segment_threshold": "with a segment layer: the predicted break probability above "
+                         "which a vertex is a token candidate and is matched",
+    "w_segment": "with a segment layer in --schedule: the fracture head's loss weight",
+    "segment_gamma": "the fracture head's focal exponent; 0 = class-balanced cross-entropy",
+    "segment_teacher": "with a segment layer: the share of training batches whose tokens "
+                       "come from the true break instead of the head's prediction",
+    "w_consistency": "pull each remeshed/perturbed training scene's embeddings toward the "
+                     "same scene's as stored (a second forward pass, no backward); 0 = off",
 }
 
 # Config fields that only the converted flags below set.
@@ -200,7 +236,7 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         elif name == "subsets":
             parser.add_argument(option, dest=name, nargs="+", default=None,
                                 metavar=metavar, help=text)
-        elif name == "remesh":
+        elif name in ("remesh", "remesh_edge"):
             parser.add_argument(option, dest=name, nargs=2, type=float, default=None,
                                 metavar=("LOW", "HIGH"), help=text + "; default off")
         elif name in CHOICES:

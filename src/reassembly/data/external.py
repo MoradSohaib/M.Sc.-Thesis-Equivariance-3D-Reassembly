@@ -41,7 +41,7 @@ import numpy as np
 
 from ..mesh.clean import MERGE_TOLERANCE, clean_piece, copies_of_pieces, edge_counts, \
     identical_pieces
-from ..mesh.decimate import TOLERANCE, median_edge, object_extent, thin_assembly, \
+from ..mesh.decimate import TOLERANCE, ThinReport, median_edge, object_extent, thin_assembly, \
     transfer_face_labels
 
 SCALES = ("object", "piece")
@@ -58,6 +58,15 @@ _MODE_PREFIXES = ("fractured", "mode")
 # checked once vert8's stored copy is gone (copies_of_pieces). Fantastic
 # Breaks was not measured at full resolution.
 SHARED_BREAKS = 0.01
+# A piece the dataset marks no break on -- Fantastic Breaks' restoration, whose
+# meta file marks the broken object only -- takes as its break the vertices
+# within this distance (an object's largest side being 1) of another piece's
+# marked ones. Fractura's real pieces, converted, stand 0.011 to 0.029 apart
+# where they face each other (median 0.0184), so this reaches across the gap.
+BREAK_REACH = 0.03
+# Passes of the isotropic remesher when converting (Preparation.isotropic): once
+# per object, so the two more than training's three are cheap.
+ISOTROPIC_PASSES = 5
 
 
 @dataclass
@@ -83,12 +92,16 @@ class Preparation:
     scale: str = "object"            # "object": largest side 1 (Breaking Bad);
                                      # "piece": GARF's loader, largest piece at most 1
     merge_tolerance: float = MERGE_TOLERANCE
+    isotropic: bool = False          # remesh every piece isotropically to `edge`
+                                     # instead of thinning it
 
     def __post_init__(self):
         if self.scale not in SCALES:
             raise ValueError(f"scale must be one of {SCALES}, got {self.scale!r}")
         if self.edge is not None and self.faces is not None:
             raise ValueError("give edge or faces, not both")
+        if self.isotropic and self.edge is None:
+            raise ValueError("isotropic remeshing needs the edge length to remesh to (edge)")
 
 
 # ---------------------------------------------------------------- reading --
@@ -261,7 +274,46 @@ def _without_debris(piece, merge_tolerance: float):
                        merge_tolerance=merge_tolerance)
 
 
-def prepare(assembly: Assembly, settings: Preparation = Preparation()):
+def vertex_breaks(pieces: Sequence, breaks: Sequence,
+                  reach: float = BREAK_REACH) -> Optional[List[np.ndarray]]:
+    """
+    Per piece, which vertices lie on a break the dataset marks: the corners of
+    its marked faces (``breaks``, per face, or ``None``). A piece with no
+    marks takes the vertices within ``reach`` of another piece's marked ones
+    (:data:`BREAK_REACH`). ``None`` when no piece is marked at all.
+    """
+    from scipy.spatial import cKDTree
+
+    masks: List[Optional[np.ndarray]] = []
+    for (vertices, faces), marked in zip(pieces, breaks):
+        faces = np.asarray(faces)
+        if marked is None or len(marked) != len(faces):
+            masks.append(None)
+            continue
+        mask = np.zeros(len(vertices), dtype=bool)
+        mask[faces[np.asarray(marked, dtype=bool)].ravel()] = True
+        masks.append(mask)
+    if all(mask is None for mask in masks):
+        return None
+    points = [np.asarray(v, dtype=np.float64)[m] for (v, _), m in zip(pieces, masks)
+              if m is not None]
+    points = np.concatenate(points) if points else np.zeros((0, 3))
+    tree = cKDTree(points) if len(points) else None
+    out = []
+    for (vertices, _), mask in zip(pieces, masks):
+        if mask is None:
+            if tree is None:
+                mask = np.zeros(len(vertices), dtype=bool)
+            else:
+                distance, _ = tree.query(np.asarray(vertices, dtype=np.float64),
+                                         distance_upper_bound=reach)
+                mask = np.isfinite(distance)
+        out.append(mask)
+    return out
+
+
+def prepare(assembly: Assembly, settings: Preparation = Preparation(),
+            return_breaks: bool = False):
     """
     ``(pieces, row)``: the assembly cleaned, scaled and thinned, and what was
     done to it; ``pieces`` is ``None`` when it cannot be used (``row["status"]``
@@ -269,7 +321,20 @@ def prepare(assembly: Assembly, settings: Preparation = Preparation()):
     stored twice. A piece stored again inside another is removed from it
     (:func:`~reassembly.mesh.clean.copies_of_pieces`), and pieces that share
     their breaks (:data:`SHARED_BREAKS`) are not thinned.
+
+    ``return_breaks`` adds a third value: per piece of ``pieces``, which
+    vertices lie on the break the dataset marks (:func:`vertex_breaks`), or
+    ``None`` when it marks none -- what ``scripts/convert_external.py`` writes
+    beside the scene for the oracle evaluation (``--label_method marked``).
     """
+    if return_breaks:
+        pieces, row, breaks = _prepare(assembly, settings)
+        return pieces, row, breaks
+    return _prepare(assembly, settings)[:2]
+
+
+def _prepare(assembly: Assembly, settings: Preparation):
+    """:func:`prepare`, with the marked break vertices as a third value."""
     row: Dict[str, object] = dict(
         entry=assembly.entry, scene=f"{assembly.category}/{assembly.name}".strip("/"),
         split=assembly.split, pieces=len(assembly.pieces),
@@ -321,12 +386,12 @@ def prepare(assembly: Assembly, settings: Preparation = Preparation()):
     breaks = [p.face_labels for p in chosen]
     if len(cleaned) < 2:
         row["status"] = f"skipped: {len(cleaned)} piece(s) after cleaning"
-        return None, row
+        return None, row, None
     twins = identical_pieces(cleaned)
     if twins:
         row["status"] = "skipped: pieces " + ", ".join(f"{i} and {j}" for i, j in twins) + \
             " are the same mesh"
-        return None, row
+        return None, row, None
 
     extent = object_extent(cleaned)
     if settings.scale == "object":
@@ -342,7 +407,21 @@ def prepare(assembly: Assembly, settings: Preparation = Preparation()):
                precision_full=precision, recall_full=recall)
 
     row.update(shared_full=shared_vertices(cleaned), shares_breaks=keep)
-    if keep:                             # no target: measured, returned as it is
+    if settings.isotropic:
+        # Every piece, sharing its breaks or not: the point is that the scans
+        # and the training scenes (--remesh_edge) are triangulated alike, and a
+        # model trained that way does not rest on shared vertices.
+        from .remesh import remesh_isotropic
+
+        target = settings.edge * object_extent(cleaned)
+        thinned = [remesh_isotropic(v, f, target, iterations=ISOTROPIC_PASSES)
+                   for v, f in cleaned]
+        before = median_edge(cleaned) / object_extent(cleaned)
+        report = ThinReport(True, before, median_edge(thinned) / object_extent(thinned),
+                            sum(len(f) for _, f in cleaned), sum(len(f) for _, f in thinned),
+                            0)
+        row["isotropic"] = settings.edge
+    elif keep:                           # no target: measured, returned as it is
         thinned, report = thin_assembly(cleaned)
     else:
         thinned, report = thin_assembly(cleaned, edge=settings.edge, faces=settings.faces,
@@ -354,7 +433,10 @@ def prepare(assembly: Assembly, settings: Preparation = Preparation()):
         # exactly what the model gets.
         kept = []
         for v, f in thinned:
-            piece = clean_piece(v, f, merge_tolerance=settings.merge_tolerance)
+            # Pieces that share their breaks keep their debris, as cleaned
+            # (simulated islands are the object's own geometry).
+            piece = clean_piece(v, f, merge_tolerance=settings.merge_tolerance,
+                                drop_debris=not keep)
             tidied += len(f) - len(piece.faces)
             kept.append((piece.vertices, piece.faces))
         thinned = kept
@@ -372,18 +454,26 @@ def prepare(assembly: Assembly, settings: Preparation = Preparation()):
                flagged=float(np.mean(np.concatenate(flagged))), precision=precision,
                recall=recall, boundary_edges=boundary, nonmanifold_edges=nonmanifold,
                shared_vertices=shared_vertices(thinned), status="ok")
-    return thinned, row
+    marked = vertex_breaks(thinned, breaks)
+    row.update(marked_pieces=sum(b is not None and len(b) == len(f)
+                                 for (_, f), b in zip(thinned, breaks)),
+               marked_vertices=float(np.mean(np.concatenate(marked))) if marked else float("nan"))
+    return thinned, row, marked
 
 
-def write(pieces: Sequence, scene_dir) -> Path:
-    """The pieces as one Breaking Bad scene folder, replacing what was there."""
+def write(pieces: Sequence, scene_dir, breaks: Optional[Sequence[np.ndarray]] = None) -> Path:
+    """
+    The pieces as one Breaking Bad scene folder, replacing what was there;
+    ``breaks``, per piece the vertices on a marked break (:func:`prepare`),
+    written beside it (:data:`reassembly.data.scene.BREAK_FILE`).
+    """
     from .scene import write_scene
 
     scene_dir = Path(scene_dir)
     partial = scene_dir.with_name(scene_dir.name + ".part")
     if partial.exists():
         shutil.rmtree(partial)
-    write_scene(partial, pieces, MODE)
+    write_scene(partial, pieces, MODE, breaks=breaks)
     if scene_dir.exists():
         shutil.rmtree(scene_dir)
     os.replace(partial, scene_dir)

@@ -31,7 +31,9 @@ Every assembly is read with its pieces in the assembled pose, then
    over its pieces by area, to Breaking Bad's density: ``--reference DATA``
    measures it on your Breaking Bad scenes (the median edge over the object's
    largest side); ``--edge E`` sets it, ``--faces N`` fixes the budget
-   instead, ``--no_thinning`` keeps every mesh as it is. An object within a
+   instead, ``--no_thinning`` keeps every mesh as it is; ``--isotropic``
+   remeshes every piece isotropically to that edge length instead -- the
+   triangulation a model trained with ``--remesh_edge`` sees. An object within a
    factor of ``--tolerance`` (2) of the density is left alone, and so is one
    whose pieces share their breaks (at least 1% of their vertices in a
    coincidence cluster: simulated sets such as Fractura's synthetic bones):
@@ -42,6 +44,21 @@ Each scene is one folder, ``<out>/<subset>/<category>/<object>/fractured_0``;
 ``<out>/<subset>.csv`` records, per assembly, what was done and the faces the
 model's dihedral test flags before and after, against the break faces the
 dataset marks where it marks them.
+
+Where the dataset marks its breaks (Fractura's ``shared_faces``, Fantastic
+Breaks' ``mask``), the vertices on them are written beside the scene too
+(``fractured_0/break_vertices.npy``; a piece with no marks of its own, Fantastic
+Breaks' restoration, takes the vertices within 0.03 of the other piece's), so
+the evaluation can be run with the true breaks in place of the dihedral test --
+the oracle experiment::
+
+    python -m scripts.train --root_dir external --evaluate --checkpoint path/to/best.pt \\
+        --data_subsets bone_real --split all --modes_per_scene 0 --max_fragments 20 \\
+        --label_method marked --checkpoint_dir eval/bone_real_oracle
+
+If the matches improve a great deal, the fracture labels are what fails on
+scans; if they stay at chance, the embedding is. Scenes converted before this
+file existed have to be converted again for it.
 """
 from __future__ import annotations
 
@@ -88,6 +105,11 @@ def build_parser() -> argparse.ArgumentParser:
                          help="a fixed face budget per object instead, split by area")
     density.add_argument("--no_thinning", action="store_true",
                          help="keep every mesh at its own density")
+    parser.add_argument("--isotropic", action="store_true",
+                        help="with --reference or --edge: remesh every piece isotropically "
+                             "to that edge length instead of thinning it -- the triangulation "
+                             "a model trained with --remesh_edge sees. Every piece, sharing "
+                             "its breaks or not. Needs pymeshlab (on Linux also libopengl0)")
     parser.add_argument("--reference_subsets", nargs="+", default=["everyday_compressed"],
                         help="with --reference: the subsets measured (default "
                              "everyday_compressed, what the model was trained on)")
@@ -129,9 +151,10 @@ def _convert(task, out: str, subset: str, settings: Preparation) -> dict:
     try:
         assembly = (read_garf(source, entry, extra) if kind == "hdf5"
                     else read_fantastic_breaks(source, entry, extra))
-        pieces, row = prepare(assembly, settings)
+        pieces, row, breaks = prepare(assembly, settings, return_breaks=True)
         if pieces is not None:
-            row["folder"] = write(pieces, Path(out) / subset / row["scene"]).as_posix()
+            row["folder"] = write(pieces, Path(out) / subset / row["scene"],
+                                  breaks=breaks).as_posix()
     except Exception as error:                      # noqa: BLE001 -- named in the report
         row = dict(entry=entry, status=f"failed: {type(error).__name__}: {error}")
     row["seconds"] = round(time.perf_counter() - started, 2)
@@ -193,7 +216,17 @@ def main(argv=None) -> int:
         raise SystemExit("choose the density: --reference DATA (measures your Breaking Bad "
                          "scenes), --edge E, --faces N or --no_thinning. For scale, "
                          f"{_MEASURED}.")
-    if not args.no_thinning:
+    if args.isotropic and not (args.reference or args.edge):
+        raise SystemExit("--isotropic remeshes to an edge length: give --reference DATA or "
+                         "--edge E with it")
+    if args.isotropic:
+        from reassembly.data.remesh import _pymeshlab
+
+        try:                     # checked now, not after cleaning every assembly
+            _pymeshlab()
+        except ImportError as error:
+            raise SystemExit(str(error)) from None
+    elif not args.no_thinning:
         try:                     # checked now, not after cleaning every assembly
             import fast_simplification  # noqa: F401
         except ImportError:
@@ -212,7 +245,7 @@ def main(argv=None) -> int:
               f"median edge {edge:.4f} of the object's largest side "
               f"(quartiles {low:.4f}, {high:.4f})")
     settings = Preparation(edge=edge, faces=args.faces, tolerance=args.tolerance,
-                           scale=args.scale)
+                           scale=args.scale, isotropic=args.isotropic)
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)

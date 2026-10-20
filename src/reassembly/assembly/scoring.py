@@ -90,7 +90,8 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
                 seed: int = 0, placement: Optional[str] = None,
                 agreement_deg: float = AGREEMENT_DEG, observed=None,
                 drop: float = 0.0,
-                matched: Optional[MatchedRotations] = None) -> List[Dict[str, float]]:
+                matched: Optional[MatchedRotations] = None,
+                cosine: bool = False) -> List[Dict[str, float]]:
     """
     One dict per scene: ``geodesic_deg`` and ``euler_rmse_deg`` (the scene's
     own means), ``rmse_t``, ``chamfer``, ``part_chamfer``, ``part_accuracy``,
@@ -144,7 +145,8 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
     if matched is None:
         matched = match_batch(seen, prediction.vertex_embedding, seed=seed, drop=drop,
                               max_points=max_match_points, min_matches=min_matches,
-                              tau=inlier_distance, iterations=ransac_iterations)
+                              tau=inlier_distance, iterations=ransac_iterations,
+                              cosine=cosine)
     fragment = batch.vertex_fragment
     unit = batch.unit.to(batch.node_features.dtype)[fragment, None]
     rotation = matched.rotation.to(batch.node_features.dtype)
@@ -183,6 +185,7 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
                 rotation[f0:f1], reached, matched.roots[scene], candidates=candidates,
                 max_points=max_match_points, iterations=iterations, huber=huber,
                 min_inliers=min_matches, agreement=agreement_deg, collision_radii=radii,
+                cosine=cosine,
             )
             t_pred, matches, links = placed_scene
         else:
@@ -190,7 +193,7 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
                 points[v0:v1], normals[v0:v1], local, embedding[v0:v1], count,
                 candidates=candidates,
                 max_points=max_match_points, iterations=iterations, huber=huber,
-                collision_radii=radii,
+                collision_radii=radii, cosine=cosine,
             )
         centroid = batch.centroid[f0:f1].double()
         t_pred = t_pred.double()

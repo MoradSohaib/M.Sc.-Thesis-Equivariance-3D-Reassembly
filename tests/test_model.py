@@ -125,12 +125,16 @@ def test_a_perfect_rotation_scores_zero():
 # --------------------------------------------------------------------------
 
 def test_forward_produces_an_embedding_and_features_per_vertex():
-    """And nothing else: no rotation comes out of the network any more."""
+    """And nothing else: no rotation comes out of the network any more. (The
+    fracture head's logits and the tokens it picked come out only with a
+    ``segment`` layer, ``tests/test_sim2real.py``.)"""
     batch = collate([_sample(1), _sample(2)], dtype=DTYPE)
     prediction = _forward(_net(), batch)
 
     vertices = batch.vertex_fragment.numel()
-    assert Prediction._fields == ("vertex_embedding", "vertex_features")
+    assert Prediction._fields == ("vertex_embedding", "vertex_features", "fracture_logit",
+                                  "token_index")
+    assert prediction.fracture_logit is None and prediction.token_index is None
     assert prediction.vertex_embedding.shape == (vertices, 32)
     assert prediction.vertex_features.shape == (vertices, 16, 3)
     assert torch.isfinite(prediction.vertex_embedding).all()

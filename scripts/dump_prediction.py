@@ -77,8 +77,8 @@ def dump(dataset, index, model, config, device, seed: int, out: Path,
     keep = {}
     with torch.no_grad():
         _forward(model, batch, build_criterion(config), config, keep=keep, score=True)
-    scene = score_batch(batch, keep["prediction"], seed=config.seed, placement=method,
-                        matched=keep["matched"])[0]
+    scene = score_batch(keep["batch"], keep["prediction"], seed=config.seed, placement=method,
+                        matched=keep["matched"], cosine=config.match_metric == "cosine")[0]
 
     # Placed the way the scorer placed them: with the largest fragment set to
     # its true pose (reassembly.nn.anchor), so the anchor's error is 0 and the

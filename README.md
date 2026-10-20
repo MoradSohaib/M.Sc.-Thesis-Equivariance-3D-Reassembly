@@ -267,7 +267,8 @@ src/reassembly/
 │   ├── sampling.py                weighted + distributed + reproducible sampler
 │   ├── scene.py                   SceneReader — caches the intact mesh across modes; write_scene
 │   ├── external.py                Fractura (GARF's HDF5) and Fantastic Breaks, read and prepared
-│   ├── remesh.py                  each training piece remeshed on its own, its breaks opened: as scans' are
+│   ├── remesh.py                  each training piece remeshed on its own (collapse or isotropic), its breaks
+│   │                              opened, worn, rippled and bent: as scans' are
 │   ├── transforms.py              SE(3) perturbation, centring, normalisation
 │   └── features.py                meshes → tensors, and the batch collate
 ├── training.py                 ★  config, dataset, loops, checkpoints, metrics
@@ -283,7 +284,9 @@ src/reassembly/
 │   ├── segment.py                 scatter reductions (no torch_scatter)
 │   ├── gat.py                     intra-fragment attention along mesh edges
 │   ├── cross.py               ★   cross-fragment attention — read its docstring
-│   ├── losses.py                  the contrastive objective; the four scores, verified chance values
+│   ├── losses.py                  the contrastive objective, the consistency term; the four scores
+│   ├── context.py                 the fracture head and the tokens it picks; each fragment's context
+│   ├── schedule.py                the layer kinds a --schedule may name, and their order (no torch)
 │   └── model.py                   the backbone and the rotation convention
 ├── evaluation/
 │   ├── metrics.py                 reported-only: tilt/twist, Chamfer, PA
@@ -313,7 +316,7 @@ scripts/
 ├── tune_sharp_threshold.py        pick --sharp-threshold by F1
 └── visualize.py                   render or describe one scene
 
-tests/                             589 tests
+tests/                             620 tests
 ```
 
 Only `reassembly` is packaged; `scripts/` and `tests/` are entry points and
@@ -978,6 +981,44 @@ never applies to an evaluation. Training refuses `--remesh_jitter` or
 `--remesh_gap` without `--contact_radius` (no vertex would coincide, and
 coincidence is all v7's term reads) and `--remesh` with `--label_method
 coincidence`.
+
+### Sim to real: true breaks, isotropic remeshing, the fracture head (`docs/SIM2REAL.md`)
+
+Everything above still reaches chance on scanned pieces. The changes below
+attack that. Each is off by default, and with none of them a run is v7's.
+`docs/SIM2REAL.md` has the reasons, the measurements and the full run plan.
+
+1. **The oracle (`--label_method marked`).** `convert_external` now writes the
+   break each scan marks beside the scene (`fractured_0/break_vertices.npy`).
+   With `--evaluate --label_method marked`, the tokens and the vertices stage
+   two matches are that true break. It says whether the fracture labels or the
+   descriptors fail on scans. **Convert the scans again** to get the file.
+2. **Stage two.** `--match_metric cosine` matches embeddings by direction. The
+   default stays Euclidean, which measured better on the synthetic slabs.
+   Candidates are now spread over the break by farthest-point sampling instead
+   of being strided by vertex index.
+3. **Scan-like training.** `--remesh_edge LOW HIGH` remeshes each piece
+   isotropically to a fixed edge in world units (`convert_external --isotropic`
+   does the same to the scans; needs `pymeshlab` and, on Linux, `libopengl0`).
+   `--remesh_smooth`, `--remesh_noise` and `--remesh_deform` wear, ripple and
+   bend the breaks. `--remesh_probability` and `--augment_probability` decide,
+   with one draw per scene, which scenes are remeshed and perturbed and which
+   stay as stored.
+4. **The fracture head.** `segment` in `--schedule` learns the true break and
+   picks the cross-fragment tokens on the GPU from its prediction. Stage two
+   matches the vertices it predicts. Each epoch prints its precision and recall
+   beside the dihedral labels'.
+5. **`--w_consistency`.** Each remeshed or perturbed scene's embedding is pulled
+   toward the same scene's as stored.
+6. **`global` in `--schedule`.** Every vertex hears its whole fragment.
+7. **`--init_partial`** carries a v7 run's weights into such a schedule.
+
+```bash
+pip install fast-simplification pymeshlab h5py && apt-get install -y libopengl0
+python -m scripts.convert_external Fractura/bone_real.hdf5 path/to/FB_v1 --out external --reference data
+python -m scripts.train --root_dir external --evaluate --checkpoint checkpoint-final/best.pt --data_subsets bone_real --split all --modes_per_scene 0 --max_fragments 0 --label_method marked --checkpoint_dir eval/v7-bone_real-oracle
+python -m scripts.train --root_dir data --checkpoint_dir checkpoint-s2r --schedule intra intra intra intra segment global cross intra cross intra cross intra --contact_radius 0.015 --remesh_edge 0.012 0.018 --remesh_gap 0.03 --remesh_smooth 3 --remesh_deform 0.003 --remesh_noise 0.001 --remesh_jitter 0.0005 --augment_probability 0.625 --w_consistency 0.5
+```
 
 ### Real breaks: fine-tuning on Fantastic Breaks
 

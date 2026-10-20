@@ -41,6 +41,13 @@ from scipy.sparse import load_npz
 from ..mesh.repair import resolve_duplicated_faces
 from .paths import CELL_MATRIX_FILE, FRACTURE_FILE, MESH_FILE
 
+BREAK_FILE = "break_vertices.npy"
+"""Per fracture mode, beside its labels: which vertices of ``compressed_mesh.obj``
+lie on a break, as the dataset it was converted from marks them
+(``scripts/convert_external.py``) -- one bool per vertex of the file, in its
+order. Breaking Bad's own scenes have none: their breaks are the coincident
+vertices (:func:`reassembly.mesh.fracture.fracture_vertex_masks`)."""
+
 
 @dataclass
 class FractureModeResult:
@@ -158,6 +165,36 @@ class SceneReader:
         vertices, faces = igl.remove_unreferenced(merged, faces)[:2]
         return vertices, faces
 
+    def break_masks(self, result: FractureModeResult) -> Optional[List[np.ndarray]]:
+        """
+        Per fragment of ``result`` (:meth:`load_mode`), which of its vertices
+        the converted dataset marks as break (:data:`BREAK_FILE`), or ``None``
+        when the mode has no such file. Loading cleans each piece and may
+        reorder its vertices, so each is found again by position among its own
+        piece's stored vertices.
+        """
+        from scipy.spatial import cKDTree
+
+        path = self.scene_dir / result.mode / BREAK_FILE
+        if not path.is_file():
+            return None
+        marked = np.load(path).astype(bool)
+        if len(marked) != len(self.vertices):
+            raise ValueError(f"{path}: {len(marked)} marks for {len(self.vertices)} vertices")
+        # The stored vertices each piece's triangles use, chosen as load_mode
+        # chooses them -- a piece's own copies, where two pieces hold a point.
+        triangle_labels = self.vertex_labels(result.mode)[self._triangles[:, 0]]
+        masks = []
+        for piece, fragment in zip(result.piece_ids, result.fragments):
+            own = np.unique(self._triangles[triangle_labels == piece])
+            vertices = np.asarray(fragment.vertices, dtype=np.float64)
+            if not len(own):
+                masks.append(np.zeros(len(vertices), dtype=bool))
+                continue
+            nearest = cKDTree(self.vertices[own]).query(vertices)[1]
+            masks.append(marked[own][nearest])
+        return masks
+
     def iter_modes(self, modes: Optional[Sequence[str]] = None) -> Iterator[FractureModeResult]:
         """
         Yield every fracture mode in sorted order, one at a time.
@@ -213,7 +250,8 @@ def load_scene(scene_dir: str | Path, mode: Optional[str] = None,
 
 
 def write_scene(scene_dir: str | Path, pieces: Sequence,
-                mode: str = "fractured_0") -> Path:
+                mode: str = "fractured_0",
+                breaks: Optional[Sequence[np.ndarray]] = None) -> Path:
     """
     One fracture mode, written in the layout :class:`SceneReader` reads:
     ``pieces`` (``(vertices, faces)`` each, in the assembled pose) as one
@@ -225,6 +263,9 @@ def write_scene(scene_dir: str | Path, pieces: Sequence,
 
     Coordinates are written to 9 significant digits, so vertices two pieces
     hold at the same point stay at the same point.
+
+    ``breaks``, one bool per vertex of each piece, are written beside the
+    labels as :data:`BREAK_FILE`, for :meth:`SceneReader.break_masks`.
     """
     from scipy.sparse import identity, save_npz
 
@@ -240,4 +281,9 @@ def write_scene(scene_dir: str | Path, pieces: Sequence,
     save_npz(scene_dir / CELL_MATRIX_FILE, identity(int(offsets[-1]), format="csr"))
     np.save(scene_dir / mode / FRACTURE_FILE,
             np.repeat(np.arange(len(pieces), dtype=np.int64), np.diff(offsets)))
+    if breaks is not None:
+        marks = [np.asarray(b, dtype=bool) for b in breaks]
+        if [len(b) for b in marks] != [len(v) for v in vertices]:
+            raise ValueError("breaks: one bool per vertex of each piece")
+        np.save(scene_dir / mode / BREAK_FILE, np.concatenate(marks))
     return scene_dir
