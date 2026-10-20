@@ -309,6 +309,8 @@ MARKERS = [
      'if config.label_method == "marked":'),
     ("isotropic remeshing (--remesh_edge, --isotropic)", "src/reassembly/data/remesh.py",
      "def remesh_isotropic("),
+    ("a remesh worse than its input is refused", "src/reassembly/data/remesh.py",
+     "def try_isotropic("),
     ("breaks worn, rippled and bent", "src/reassembly/data/remesh.py",
      "def remesh_scene("),
     ("one draw per scene: remeshed, perturbed or as stored", "src/reassembly/training.py",

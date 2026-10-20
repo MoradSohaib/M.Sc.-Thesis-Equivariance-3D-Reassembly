@@ -200,6 +200,10 @@ def _summary(subset: str, rows: list) -> str:
             f"  faces the dihedral test flags (median share): {middle('flagged_full')} before "
             f"thinning, {middle('flagged')} after",
         ]
+        failed = sum(int(r.get("isotropic_failed") or 0) for r in ok)
+        if any(r.get("isotropic") for r in ok):
+            lines.append(f"  remeshed isotropically; pieces the remesher could not work on, kept "
+                         f"as cleaned: {failed}")
         marked = [r for r in ok if not math.isnan(float(r["break_share"]))]
         if marked and any(float(r["break_share"]) > 0 for r in marked):
             lines.append(f"  against the dataset's break faces ({middle('break_share')} of "

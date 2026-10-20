@@ -65,8 +65,10 @@ SHARED_BREAKS = 0.01
 # where they face each other (median 0.0184), so this reaches across the gap.
 BREAK_REACH = 0.03
 # Passes of the isotropic remesher when converting (Preparation.isotropic): once
-# per object, so the two more than training's three are cheap.
+# per object, so the two more than training's three are cheap. A scan denser
+# than the target edge by more than ISOTROPIC_DENSER is thinned first.
 ISOTROPIC_PASSES = 5
+ISOTROPIC_DENSER = 3.0
 
 
 @dataclass
@@ -411,16 +413,30 @@ def _prepare(assembly: Assembly, settings: Preparation):
         # Every piece, sharing its breaks or not: the point is that the scans
         # and the training scenes (--remesh_edge) are triangulated alike, and a
         # model trained that way does not rest on shared vertices.
-        from .remesh import remesh_isotropic
+        from .remesh import try_isotropic
 
-        target = settings.edge * object_extent(cleaned)
-        thinned = [remesh_isotropic(v, f, target, iterations=ISOTROPIC_PASSES)
-                   for v, f in cleaned]
-        before = median_edge(cleaned) / object_extent(cleaned)
+        extent = object_extent(cleaned)
+        target = settings.edge * extent
+        before = median_edge(cleaned) / extent
+        source = cleaned
+        if before < settings.edge / ISOTROPIC_DENSER:
+            # A full-resolution scan: thinned first, by quadric collapse --
+            # seconds where the remesher would take minutes -- to half the
+            # edge, leaving it detail to work from.
+            source, _ = thin_assembly(cleaned, edge=settings.edge / 2.0)
+        thinned, failed = [], 0
+        for (v, f), (v0, f0) in zip(source, cleaned):
+            result = try_isotropic(v, f, target, iterations=ISOTROPIC_PASSES, fidelity=True)
+            if result is None:
+                # Not a surface the remesher can work on (ISOTROPIC_SLIVERS in
+                # data/remesh.py): kept as cleaned, and counted.
+                failed += 1
+                result = (v0, f0)
+            thinned.append(result)
         report = ThinReport(True, before, median_edge(thinned) / object_extent(thinned),
                             sum(len(f) for _, f in cleaned), sum(len(f) for _, f in thinned),
                             0)
-        row["isotropic"] = settings.edge
+        row.update(isotropic=settings.edge, isotropic_failed=failed)
     elif keep:                           # no target: measured, returned as it is
         thinned, report = thin_assembly(cleaned)
     else:

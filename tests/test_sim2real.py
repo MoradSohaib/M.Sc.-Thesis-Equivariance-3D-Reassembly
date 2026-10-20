@@ -314,6 +314,52 @@ def test_isotropic_remeshing_evens_the_edges_and_takes_the_twins_away(fractured_
     assert len(other[0]) != len(other[1])
 
 
+def _finned_sphere():
+    """A sphere with 300 fins: triangles hung on its edges, each edge then
+    shared by three faces -- a stand-in for a boolean cut's mesh, such as
+    Fantastic Breaks' restorations, which no remesher can make even."""
+    sphere = trimesh.creation.icosphere(subdivisions=3)
+    v, f = np.asarray(sphere.vertices), np.asarray(sphere.faces)
+    tips, fins = [], []
+    for k in range(300):
+        a, b = f[k % len(f)][:2]
+        tips.append((v[a] + v[b]) / 2 + np.random.default_rng(k).normal(0, 0.3, 3))
+        fins.append([a, b, len(v) + k])
+    return np.vstack([v, tips]), np.vstack([f, fins])
+
+
+@isotropic
+def test_a_piece_the_remesher_cannot_work_on_is_refused_and_handled(tmp_path):
+    from reassembly.data.external import Assembly
+    from reassembly.data.remesh import remesh_isotropic, try_isotropic
+
+    vertices, faces = _finned_sphere()
+    assert edge_counts(faces)[1] == 300
+    # Training: collapsed instead, to the faces an even mesh of that edge has --
+    # or, the piece already coarser than that, kept as it is.
+    assert try_isotropic(vertices, faces, 0.3) is None
+    v, f = remesh_isotropic(vertices, faces, 0.3)
+    assert len(f) < len(faces) / 2
+    assert try_isotropic(vertices, faces, 0.08) is None
+    v, f = remesh_isotropic(vertices, faces, 0.08)
+    assert np.array_equal(f, faces) and np.array_equal(v, vertices)
+    # A manifold piece passes the gate.
+    sphere = trimesh.creation.icosphere(subdivisions=4)
+    assert try_isotropic(np.asarray(sphere.vertices), np.asarray(sphere.faces), 0.08) is not None
+    # The converter keeps the piece as cleaned, and counts it.
+    good = trimesh.creation.icosphere(subdivisions=4)
+    good.apply_translation([2.2, 0.0, 0.0])
+    pieces = [(np.asarray(good.vertices), np.asarray(good.faces)), (vertices, faces)]
+    marks = [np.zeros(len(good.faces), bool), np.zeros(len(faces), bool)]
+    marks[0][:40] = True
+    assembly = Assembly("test", "fins", "", "fins", "", pieces, marks)
+    out, row, breaks = prepare(assembly, Preparation(edge=0.018, isotropic=True),
+                               return_breaks=True)
+    assert row["status"] == "ok" and row["isotropic_failed"] == 1
+    assert edge_counts(out[1][1])[1] > 0                     # kept as it came
+    assert edge_counts(out[0][1]) == (0, 0) and breaks[0].any()
+
+
 def test_one_draw_per_scene_decides_remeshed_perturbed_or_stored(tmp_path):
     root = _dataset(tmp_path / "data")
     config = _config(root, remesh=(1.0, 1.0), remesh_gap=0.3, contact_radius=0.35,

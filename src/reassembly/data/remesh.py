@@ -339,6 +339,25 @@ ISOTROPIC_ITERATIONS = 3
 # still coincided at the default 30 degrees and 686 at 90 (1,152 before), but
 # 18 with none kept, at 180 -- which also rounds the rim a little, as a scan's.
 ISOTROPIC_FEATURE_ANGLE = 180.0
+# Without the remesher's check of the distance to the input surface a Breaking
+# Bad scene (15 pieces, 34k faces) remeshed in 0.50 s against 1.38 s, at the
+# same edges (median 1.03 of the target, 0.1% slivers); what the check buys is
+# the sharpest corners, rounded by up to 0.8 of an edge at the 99th percentile
+# of the input's vertices instead of 0.4 -- as a scan rounds them. So training
+# remeshes without it, and the converter (once per scan) with it.
+#
+# A remesh is refused, and the piece handled otherwise, when it comes out
+# worse than it went in: more than ISOTROPIC_SLIVERS of its faces slivers
+# (longest edge over 5 times its altitude), a median edge outside
+# ISOTROPIC_EDGE_RANGE of the target, or non-manifold edges grown by more than
+# ISOTROPIC_NONMANIFOLD of its edges. Fantastic Breaks' restoration of 00002 --
+# 91% slivers, 341 edges shared by four or six faces, an Euler characteristic
+# of -861, a boolean cut's mesh -- came out of every setting tried with 36-49%
+# slivers and a median edge of 0.28-0.45 of the target; its broken piece, a
+# manifold scan, with 0.2% and 1.02.
+ISOTROPIC_SLIVERS = 0.2
+ISOTROPIC_EDGE_RANGE = (0.6, 1.6)
+ISOTROPIC_NONMANIFOLD = 0.002
 
 
 def _pymeshlab():
@@ -356,14 +375,68 @@ def _pymeshlab():
     return pymeshlab
 
 
-def remesh_isotropic(vertices: np.ndarray, faces: np.ndarray, edge: float,
-                     iterations: int = ISOTROPIC_ITERATIONS) -> Tuple[np.ndarray, np.ndarray]:
+def _sliver_share(vertices: np.ndarray, faces: np.ndarray) -> float:
+    """The share of faces whose longest edge is more than 5 times its altitude."""
+    corners = vertices[faces]
+    sides = np.stack([np.linalg.norm(corners[:, (k + 1) % 3] - corners[:, k], axis=1)
+                      for k in range(3)], axis=1)
+    doubled = np.linalg.norm(np.cross(corners[:, 1] - corners[:, 0],
+                                      corners[:, 2] - corners[:, 0]), axis=1)
+    longest = sides.max(axis=1)
+    return float(np.mean(5.0 * doubled < longest * longest)) if len(faces) else 0.0
+
+
+def try_isotropic(vertices: np.ndarray, faces: np.ndarray, edge: float,
+                  iterations: int = ISOTROPIC_ITERATIONS, *, fidelity: bool = False):
     """
     One piece remeshed isotropically -- triangles close to equilateral, edges
     close to ``edge`` everywhere, in the piece's own units -- then tidied as
-    :func:`collapse_pieces` tidies a collapse, keeping the piece's winding. A
-    piece the remesher would leave with fewer than
-    :data:`~reassembly.mesh.decimate.MIN_FACES` faces is returned as it is.
+    :func:`collapse_pieces` tidies a collapse, keeping the piece's winding.
+    ``(vertices, faces)``, or ``None`` when the remesh failed: fewer than
+    :data:`~reassembly.mesh.decimate.MIN_FACES` faces, or worse than the input
+    (:data:`ISOTROPIC_SLIVERS`). ``fidelity`` keeps the remesher's check of the
+    distance to the input surface (:data:`ISOTROPIC_FEATURE_ANGLE`'s note).
+    """
+    from ..mesh.clean import clean_piece, edge_counts
+    from ..mesh.decimate import MIN_FACES, edge_lengths
+
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    if len(faces) < MIN_FACES:
+        return None
+    pymeshlab = _pymeshlab()
+    meshes = pymeshlab.MeshSet(verbose=False)
+    meshes.add_mesh(pymeshlab.Mesh(vertex_matrix=vertices, face_matrix=faces))
+    meshes.meshing_isotropic_explicit_remeshing(targetlen=pymeshlab.PureValue(float(edge)),
+                                                iterations=int(iterations),
+                                                featuredeg=ISOTROPIC_FEATURE_ANGLE,
+                                                checksurfdist=bool(fidelity))
+    out = meshes.current_mesh()
+    remeshed = np.asarray(out.face_matrix(), dtype=np.int64)
+    if len(remeshed) < MIN_FACES:
+        return None
+    piece = clean_piece(np.asarray(out.vertex_matrix(), dtype=np.float64), remeshed,
+                        drop_debris=False)
+    if len(piece.faces) < MIN_FACES:
+        return None
+    ratio = float(np.median(edge_lengths(piece.vertices, piece.faces))) / float(edge)
+    grown = edge_counts(piece.faces)[1] - edge_counts(faces)[1]
+    if (_sliver_share(piece.vertices, piece.faces) > ISOTROPIC_SLIVERS
+            or not ISOTROPIC_EDGE_RANGE[0] <= ratio <= ISOTROPIC_EDGE_RANGE[1]
+            or grown > ISOTROPIC_NONMANIFOLD * 1.5 * len(piece.faces)):
+        return None
+    # As in collapse_pieces: the tidy turns a piece wound inward outward.
+    return piece.vertices, (np.ascontiguousarray(piece.faces[:, ::-1]) if piece.report.flipped
+                            else piece.faces)
+
+
+def remesh_isotropic(vertices: np.ndarray, faces: np.ndarray, edge: float,
+                     iterations: int = ISOTROPIC_ITERATIONS, *, fidelity: bool = False
+                     ) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    One piece remeshed isotropically (:func:`try_isotropic`); where that
+    fails, collapsed instead to the faces an even mesh of edge ``edge`` would
+    have -- its tessellation still its own -- or, already that coarse, kept.
 
     Why: an intra-fragment layer reaches one ring of the mesh, so what the
     network sees around a vertex, in world units, is the number of layers
@@ -372,27 +445,20 @@ def remesh_isotropic(vertices: np.ndarray, faces: np.ndarray, edge: float,
     length, they are seen at one scale and in one triangulation.
     """
     from ..mesh.clean import clean_piece
-    from ..mesh.decimate import MIN_FACES
+    from ..mesh.decimate import MIN_FACES, simplify, surface_area
 
+    result = try_isotropic(vertices, faces, edge, iterations, fidelity=fidelity)
+    if result is not None:
+        return result
     vertices = np.asarray(vertices, dtype=np.float64)
     faces = np.asarray(faces, dtype=np.int64)
-    if len(faces) < MIN_FACES:
+    # Faces of an even mesh of that edge: the area over an equilateral triangle's.
+    target = int(round(surface_area(vertices, faces) / (np.sqrt(3.0) / 4.0 * edge * edge)))
+    if len(faces) < MIN_FACES or target >= len(faces):
         return vertices, faces
-    pymeshlab = _pymeshlab()
-    meshes = pymeshlab.MeshSet(verbose=False)
-    meshes.add_mesh(pymeshlab.Mesh(vertex_matrix=vertices, face_matrix=faces))
-    meshes.meshing_isotropic_explicit_remeshing(targetlen=pymeshlab.PureValue(float(edge)),
-                                                iterations=int(iterations),
-                                                featuredeg=ISOTROPIC_FEATURE_ANGLE)
-    out = meshes.current_mesh()
-    remeshed = np.asarray(out.face_matrix(), dtype=np.int64)
-    if len(remeshed) < MIN_FACES:
+    piece = clean_piece(*simplify(vertices, faces, max(MIN_FACES, target)), drop_debris=False)
+    if not len(piece.faces):
         return vertices, faces
-    piece = clean_piece(np.asarray(out.vertex_matrix(), dtype=np.float64), remeshed,
-                        drop_debris=False)
-    if len(piece.faces) < MIN_FACES:
-        return vertices, faces
-    # As in collapse_pieces: the tidy turns a piece wound inward outward.
     return piece.vertices, (np.ascontiguousarray(piece.faces[:, ::-1]) if piece.report.flipped
                             else piece.faces)
 
@@ -622,4 +688,5 @@ __all__ = ["DEFORM_LENGTH", "GAP_LENGTH", "GAP_REACH", "GAP_SPREAD", "GAP_TERMS"
            "ISOTROPIC_ITERATIONS", "NOISE_LENGTH", "Remesh", "break_masks", "carry_masks",
            "check_augment", "check_remesh", "collapse_pieces", "deform_pieces",
            "isotropic_pieces", "jitter_pieces", "noise_pieces", "open_pieces",
-           "remesh_isotropic", "remesh_pieces", "remesh_scene", "smooth_pieces"]
+           "remesh_isotropic", "remesh_pieces", "remesh_scene", "smooth_pieces",
+           "try_isotropic"]

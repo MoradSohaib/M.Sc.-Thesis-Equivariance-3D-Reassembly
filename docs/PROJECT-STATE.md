@@ -1861,8 +1861,26 @@ evaluates as it did, except that candidates are now spread over the break
    fragment, handed back to its vertices.
 7. **`--init_partial`**: a v7 run's weights carried into such a schedule.
 
-**Checked here.** No Breaking Bad data and no GPU are available in this
-environment. `tests/test_sim2real.py` (24 tests) and the whole suite, slow tests
-included, pass on CPU, and `--preflight` runs clean with every change on the
-tests' fixture. Nothing above has been measured on Breaking Bad or on the scans
-yet; the first numbers come from the runs in `docs/SIM2REAL.md` §6.
+**Two samples** (`docs/SIM2REAL.md` §7) are one Breaking Bad scene and
+Fantastic Breaks' `00002`, decimated to 5%:
+
+- Breaking Bad's edges spread 14.8× (the scan's 4.2×), with 39% slivers.
+- Its breaks are 2–3.5× smoother than the scan's at 0.02 of the object; the
+  intact surfaces are alike.
+- The scan pair is flush: the restoration's break lies a median 0.0003 from the
+  broken piece's surface.
+- The restoration is a boolean cut's mesh: 91% slivers, 341 edges shared by four
+  or six faces. No remesher setting could even it out, so a remesh worse than
+  its input is now refused: collapsed instead in training, and kept and counted
+  by the converter.
+- Training remeshes without the remesher's surface check, at 0.50 s a scene
+  against 1.38 s and the same edges.
+- §6.3's settings bring the Breaking Bad scene's break roughness to the scan's
+  (0.0037 against 0.0025–0.0040) and its edge spread to 1.8–1.9.
+
+**Checked here.** No Breaking Bad dataset and no GPU are available in this
+environment, beyond the samples above. `tests/test_sim2real.py` (25 tests) and
+the whole suite, slow tests included, pass on CPU, and `--preflight` runs clean
+with every change on the tests' fixture. No model has been trained or scored on
+Breaking Bad or on the scans with these changes yet; the first numbers come from
+the runs in `docs/SIM2REAL.md` §6.

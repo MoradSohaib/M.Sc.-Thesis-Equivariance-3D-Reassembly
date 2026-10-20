@@ -125,6 +125,26 @@ before), the number still shared after remeshing to 0.12 was:
 | 90° | 686 |
 | 180° (none kept) | 18 |
 
+Training remeshes without pymeshlab's check of the distance to the input
+surface. On the Breaking Bad sample (15 pieces, 34k faces) that took 0.50 s
+against 1.38 s, at the same edges (median 1.03 of the target, 0.1% slivers). All
+it gives up is the sharpest corners, rounded by up to 0.8 of an edge at the 99th
+percentile instead of 0.4, as a scan rounds them. The converter remeshes once
+per scan, so it keeps the check, and it thins a scan more than 3× denser than
+the target by quadric collapse first.
+
+A remesh that comes out worse than its input is refused:
+
+- more than 20% slivers;
+- a median edge outside 0.6–1.6× the target;
+- more than 0.2% more non-manifold edges.
+
+In training the piece is then collapsed to the faces an even mesh of that edge
+would have; the converter keeps it as cleaned and counts it (`isotropic_failed`
+in the CSV). This catches Fantastic Breaks' restorations: in the sample (§7), a
+boolean cut's mesh with 91% slivers and 341 edges shared by four or six faces,
+which no setting of the remesher could even out.
+
 It needs `pip install pymeshlab`. On Linux the remeshing plugin also needs the
 OpenGL library: `apt-get install -y libopengl0`. Without it, the error message
 says so.
@@ -382,9 +402,52 @@ Ablations, one change at a time against `checkpoint-s2r`:
 - `--augment_probability 1`;
 - both shares at 0.625 (the original 48/80 plan).
 
-## 7. Tests
+## 7. Two samples, measured
 
-`tests/test_sim2real.py` (24 tests) checks:
+One Breaking Bad scene (15 pieces) and one Fantastic Breaks pair (`00002`, two
+pieces in GARF's per-piece layout, decimated to 5% of the scan). This is one
+sample each, so the numbers are indications, not dataset statistics. Lengths are
+fractions of the object's largest side.
+
+| | Breaking Bad (stored) | Fantastic Breaks |
+|---|---|---|
+| median edge | 0.0079 | 0.0085 |
+| edge spread (p90/p10) | 14.8 | 4.2 |
+| triangle shape: median / slivers | 3.76 / 39% | 3.08 / 30% |
+| pieces closed and manifold | all 15 | broken piece: closed, 8 non-manifold edges; restoration: 341 non-manifold edges, 91% slivers |
+| break (share of vertices) | 9–91% per piece (coincident) | 3.8% and 29.3% (`shared_faces`) |
+| dihedral labels vs the true break: precision / recall | 0.62 / 1.00 | 0.28 / 0.70 |
+| vertices shared across the break | 3,478 | 0 |
+| gap, break to the other piece's surface (median) | 0 | 0.0003 (restoration to broken), 0.0065 (broken to the coarser restoration) |
+| roughness of the break, at 0.02 / 0.05 | 0.00115 / 0.0061 | 0.0025–0.0040 / 0.0054–0.0086 |
+| roughness of the intact surface, at 0.02 | 0.00031 | 0.00020–0.00034 |
+
+Roughness is the median distance from a fitted plane of points sampled evenly
+over the surface, so the tessellation does not enter it.
+
+- **The two datasets' tessellations differ most.** Breaking Bad's edges spread
+  14.8× and four in ten of its triangles are slivers.
+- **Its breaks are smoother than a real break** at the 0.02 scale, by 2–3.5×.
+  Their intact surfaces are alike.
+- **This Fantastic Breaks pair is flush:** the restoration's break lies on the
+  broken piece's surface. Fractura's real bones stand 0.011–0.029 apart (§21).
+
+What the training settings make of the Breaking Bad scene:
+
+| | edge spread | slivers | shared | break / intact roughness (0.02) | gap, contact region (median) | dihedral P / R |
+|---|---|---|---|---|---|---|
+| v7's recipe: collapse 0.5–0.9, jitter 0.001, gap 0.03 | 8.4 | 33% | 0 | 0.0035 / 0.0007 | 0.0045–0.0064 | 0.21 / 1.00 |
+| `--remesh_edge 0.012 0.018` alone | 1.7 | 0% | 8 | 0.0012 / 0.0003 | 0.0008–0.0010 | 0.46 / 0.97 |
+| §6.3's settings | 1.8–1.9 | 0–1% | 0 | 0.0037 / 0.00045 | 0.0085–0.0138 | 0.43 / 0.95–0.97 |
+
+The recommended settings even out the tessellation and bring the break's
+roughness to the scan's. The opening (`--remesh_gap`) is what roughens it, since
+its field varies over 0.026. Intact surfaces stay near the scan's; v7's
+independent jitter makes them three times rougher.
+
+## 8. Tests
+
+`tests/test_sim2real.py` (25 tests) checks:
 
 - **Stage two:** cosine against Euclidean matching on scrambled lengths, and
   candidate spread and pose independence.
@@ -394,7 +457,8 @@ Ablations, one change at a time against `checkpoint-s2r`:
 - **The augmentations:** wear, ripple and bend with no face turned over and only
   the break band moving; and the label and positive order.
 - **Isotropic remeshing:** closed, edges near the target, almost no shared
-  vertex left, long thin triangles evened out.
+  vertex left, long thin triangles evened out; a remesh worse than its input
+  refused, then collapsed in training and kept and counted by the converter.
 - **The per-scene draw and refused settings.**
 - **The network:** per-fragment equivariance with `segment` and `global`,
   float64 and ties included; token budget and mask; the fracture term's and the

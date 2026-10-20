@@ -316,7 +316,7 @@ scripts/
 ├── tune_sharp_threshold.py        pick --sharp-threshold by F1
 └── visualize.py                   render or describe one scene
 
-tests/                             620 tests
+tests/                             621 tests
 ```
 
 Only `reassembly` is packaged; `scripts/` and `tests/` are entry points and
