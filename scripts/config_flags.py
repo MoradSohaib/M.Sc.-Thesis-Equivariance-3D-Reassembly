@@ -123,10 +123,13 @@ HELP = {
     "remesh_deform": "with --remesh/--remesh_edge: bend every piece by its own slow field "
                      "of up to this standard deviation (world units); keep it well under "
                      "stage two's RANSAC tolerance",
-    "remesh_probability": "the share of training scenes remeshed; the rest as stored",
-    "augment_probability": "the share of training scenes whose breaks are perturbed "
-                           "(opened, worn, bent, rippled, jittered); one draw per scene "
-                           "decides both shares, so 0.625 and 0.625 is 48 of 128 as stored",
+    "remesh_probability": "the share of each optimizer step's training scenes remeshed; "
+                          "the rest as stored",
+    "augment_probability": "the share of each optimizer step's training scenes whose breaks "
+                           "are perturbed (opened, worn, bent, rippled, jittered); the "
+                           "sampler deals every scene one number for both shares, exactly "
+                           "per step: 0.625 and 0.625 with --batch_size 128 is 80 remeshed "
+                           "and perturbed and 48 as stored in every step",
     "match_metric": "how stage two compares embeddings: euclidean (v7's) or cosine (by "
                     "direction, as the contrastive term trains them); never taken from a "
                     "checkpoint, so one checkpoint can be scored both ways",

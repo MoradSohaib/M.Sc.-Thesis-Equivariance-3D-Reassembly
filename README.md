@@ -316,7 +316,7 @@ scripts/
 ├── tune_sharp_threshold.py        pick --sharp-threshold by F1
 └── visualize.py                   render or describe one scene
 
-tests/                             625 tests
+tests/                             627 tests
 ```
 
 Only `reassembly` is packaged; `scripts/` and `tests/` are entry points and
@@ -988,7 +988,10 @@ coincidence`.
 
 Everything above still reaches chance on scanned pieces. The changes below
 attack that. Each is off by default, and with none of them a run is v7's.
-`docs/SIM2REAL.md` has the reasons, the measurements and the full run plan.
+`docs/SIM2REAL.md` has the reasons, the measurements and the full run plan;
+`docs/V8-RUN.md` has V8's run, command by command: convert Fractura and
+Fantastic Breaks, train, test on Breaking Bad's unseen objects, draw the figures
+per category, test on the scans.
 
 1. **The oracle (`--label_method marked`).** `convert_external` now writes the
    break each scan marks beside the scene (`fractured_0/break_vertices.npy`).
@@ -1003,9 +1006,10 @@ attack that. Each is off by default, and with none of them a run is v7's.
    isotropically to a fixed edge in world units (`convert_external --isotropic`
    does the same to the scans; needs `pymeshlab` and, on Linux, `libopengl0`).
    `--remesh_smooth`, `--remesh_noise` and `--remesh_deform` wear, ripple and
-   bend the breaks. `--remesh_probability` and `--augment_probability` decide,
-   with one draw per scene, which scenes are remeshed and perturbed and which
-   stay as stored.
+   bend the breaks. `--remesh_probability` and `--augment_probability` decide
+   which scenes are remeshed and perturbed and which stay as stored, exactly per
+   optimizer step: the sampler deals the shares, so 0.625 and 0.625 is 80
+   remeshed and perturbed and 48 as stored in every step of 128.
 4. **The fracture head.** `segment` in `--schedule` learns the true break and
    picks the cross-fragment tokens on the GPU from its prediction. Stage two
    matches the vertices it predicts. Each epoch prints its precision and recall

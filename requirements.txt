@@ -33,5 +33,10 @@ pillow>=10.0
 h5py
 fast-simplification>=0.2.0
 
+# Isotropic remeshing (--remesh_edge in training, convert_external --isotropic).
+# Optional. On Linux its remeshing plugin also needs the OpenGL library:
+# apt-get install -y libopengl0. Tested with pymeshlab 2025.7.
+pymeshlab
+
 # Tests.
 pytest>=7.4

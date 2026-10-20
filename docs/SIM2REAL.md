@@ -19,7 +19,7 @@ as before.
 | 1 | True breaks written beside converted scenes; the oracle | `--label_method marked` | `data/scene.py`, `data/external.py`, `training.py` |
 | 2 | Isotropic remeshing, in training and conversion | `--remesh_edge LOW HIGH`, `convert_external --isotropic` | `data/remesh.py`, `data/external.py` |
 | 2 | Breaks worn, rippled, bent (plus v7's opening and jitter) | `--remesh_smooth`, `--remesh_noise`, `--remesh_deform` | `data/remesh.py` |
-| 2 | One draw per scene: stored, remeshed, or perturbed | `--remesh_probability`, `--augment_probability` | `training.py` |
+| 2 | Exact shares per optimizer step: stored, remeshed, or perturbed | `--remesh_probability`, `--augment_probability` | `data/sampling.py`, `training.py` |
 | 3 | Fracture head: learns the break, picks the tokens and the matched vertices | `segment` in `--schedule`, `--w_segment`, `--segment_gamma`, `--segment_teacher`, `--segment_threshold` | `nn/context.py`, `nn/model.py`, `training.py` |
 | 4 | Consistency between a scene and itself as stored | `--w_consistency` | `nn/losses.py`, `training.py` |
 | 5 | Fragment context for every vertex | `global` in `--schedule` | `nn/context.py` |
@@ -233,25 +233,35 @@ before it. The distance-based term's positives are taken before anything
 moved. Validation is never augmented. With `--evaluate`, `--remesh_edge` (plus
 `--remesh_gap` and `--remesh_jitter`) scores remeshed scenes.
 
-### 2.3 One draw per scene (`--remesh_probability`, `--augment_probability`)
+### 2.3 Exact shares per step (`--remesh_probability`, `--augment_probability`)
 
-One uniform draw per scene and epoch is compared with both shares:
+Each training scene gets one number in [0, 1) per epoch, compared with both
+shares:
 
-- the scene is remeshed if the draw is below `--remesh_probability`;
-- its breaks are perturbed (opened, worn, bent, rippled, jittered) if the draw is
-  below `--augment_probability`.
+- the scene is remeshed if the number is below `--remesh_probability`;
+- its breaks are perturbed (opened, worn, bent, rippled, jittered) if the number
+  is below `--augment_probability`.
 
 The rest are left as stored.
 
-- **Both at 0.625:** 48 of 128 scenes as stored and 80 remeshed and perturbed,
-  as originally planned.
-- **`--remesh_probability 1 --augment_probability 0.625`:** every scene is
-  remeshed and 62.5% are perturbed. This is the recommended variant. It keeps
-  the stored scenes' shared vertices and mirror-image tessellation out of
-  training, since no scan has them.
+The sampler deals those numbers (`DealtShares`, `data/sampling.py`). It knows
+where each optimizer step starts: a step is `batch_size × accumulate`
+consecutive scenes on one GPU. Within each step it spreads the numbers evenly,
+`(k + u) / step` for a shuffled `k`. So every step holds exactly the planned
+count, not just on average. One independent draw per scene would give 80 of 128
+give or take 5.5. Every GPU deals its own steps. An interrupted epoch restarts
+from its first step and is dealt the same again.
 
-The draw has its own random stream, so with both shares at 1 the remeshing
-draws what it always drew.
+- **Both at 0.625:** 48 of 128 scenes as stored and 80 remeshed and perturbed in
+  every step, as originally planned. This is V8's setting (`docs/V8-RUN.md`).
+- **`--remesh_probability 1 --augment_probability 0.625`:** every scene is
+  remeshed and 62.5% are perturbed. This keeps the stored scenes' shared
+  vertices and mirror-image tessellation out of training, since no scan has
+  them.
+
+The banner prints the counts per step. A scene rebuilt outside training, by a
+script, draws its own number from its own stream, as before. With both shares at
+1 nothing is dealt, and the remeshing draws what it always drew.
 
 ---
 
@@ -350,6 +360,11 @@ the same network; training from scratch is the clean comparison.
 ---
 
 ## 6. Running it
+
+**V8's run** — convert, train from scratch with 48 stored and 80 perturbed scenes
+in every step of 128, test on Breaking Bad's unseen objects, draw the figures,
+test on the converted scans — is in `docs/V8-RUN.md`, command by command. This
+section is the general plan it follows.
 
 ### 6.0 Setup (Kaggle or any Linux machine)
 
@@ -596,7 +611,7 @@ Converted with `--isotropic` at 0.0145:
 
 ## 8. Tests
 
-`tests/test_sim2real.py` (27 tests) checks:
+`tests/test_sim2real.py` (28 tests) checks:
 
 - **Stage two:** cosine against Euclidean matching on scrambled lengths, and
   candidate spread and pose independence.
@@ -609,7 +624,10 @@ Converted with `--isotropic` at 0.0145:
   vertex left, long thin triangles evened out; a remesh worse than its input
   refused, then collapsed, in training and by the converter, which counts it;
   a dense scan thinned with its topology kept before it is remeshed.
-- **The per-scene draw and refused settings.**
+- **The shares and refused settings:** one draw per scene where nothing is
+  dealt; through the training loader, every step dealt its exact split of
+  stored and perturbed scenes, honoured by the scene (`tests/test_sampling.py`
+  checks the dealing itself).
 - **The network:** per-fragment equivariance with `segment` and `global`,
   float64 and ties included; token budget and mask; the fracture term's and the
   consistency term's reference values; stage two matching the predicted break;

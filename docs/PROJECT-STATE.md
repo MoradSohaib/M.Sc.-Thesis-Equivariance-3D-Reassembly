@@ -1936,9 +1936,33 @@ What they show:
 `piece_<i>_shared_faces`), is now read by `convert_external`, given one such
 file or a folder of them.
 
+**V8's run** (`docs/V8-RUN.md`) trains this from scratch: four intra layers,
+the fracture head and the fragment context, three cross–intra pairs, on Everyday
+with 48 stored and 80 perturbed scenes in every optimizer step of 128. Two
+changes make that exact and reportable:
+
+- **The sampler deals each scene its share** (`DealtShares`, `data/sampling.py`).
+  Every step of `batch_size × accumulate` scenes on one GPU gets its shares
+  spread evenly, so the split is exact in every step. One draw per scene gives
+  80 of 128 give or take 5.5. The banner prints the counts per step.
+- **The converter's report** prints, per subset, the break each assembly is
+  scored against (marked or estimated) and the dihedral labels' precision and
+  recall against it, at full resolution and converted. Where the dataset marks
+  its break, it also prints the estimate's own precision and recall against the
+  marks. The CSV has all of it per assembly.
+
+The sequence was run end to end on the samples, on CPU and scaled down:
+
+1. both datasets converted into their own folders;
+2. preflight and one epoch of training with V8's flags;
+3. Everyday val and an unseen subset scored, with their predictions zipped;
+4. the converted Fractura objects and Fantastic Breaks scored, the oracle
+   included;
+5. figures and per-category tables drawn from all of it.
+
 **Checked here.** No Breaking Bad dataset and no GPU are available in this
-environment, beyond the samples above. `tests/test_sim2real.py` (27 tests) and
+environment, beyond the samples above. `tests/test_sim2real.py` (28 tests) and
 the whole suite, slow tests included, pass on CPU, and `--preflight` runs clean
 with every change on the tests' fixture. No model has been trained or scored on
 Breaking Bad or on the scans with these changes yet; the first numbers come from
-the runs in `docs/SIM2REAL.md` §6.
+the run in `docs/V8-RUN.md`.

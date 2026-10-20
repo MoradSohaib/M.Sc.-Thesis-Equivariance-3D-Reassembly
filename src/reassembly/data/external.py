@@ -456,7 +456,9 @@ def prepare(assembly: Assembly, settings: Preparation = Preparation(),
     what ``scripts/convert_external.py`` writes beside the scene for the
     oracle evaluation (``--label_method marked``). A dataset that marks no
     break at all has it estimated from the assembled pose instead
-    (:func:`estimated_breaks`), and ``row["break_source"]`` says which.
+    (:func:`estimated_breaks`), and ``row["break_source"]`` says which; where
+    it is marked, ``row["estimate_precision"]`` and ``["estimate_recall"]``
+    score the estimate against the marks, face by face.
     """
     if return_breaks:
         pieces, row, breaks = _prepare(assembly, settings)
@@ -538,6 +540,10 @@ def _prepare(assembly: Assembly, settings: Preparation):
         row["break_source"] = "estimated"
     else:
         row["break_source"] = "marked"
+        # The estimate checked where it is not needed -- against the marks --
+        # so the report says how far to trust it where it is.
+        _, row["estimate_precision"], row["estimate_recall"] = _agreement(
+            estimated_breaks(cleaned), breaks)
 
     flagged = _flagged(cleaned)
     share, precision, recall = _agreement(flagged, breaks)

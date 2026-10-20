@@ -233,11 +233,17 @@ def _summary(subset: str, rows: list) -> str:
         if marked and any(float(r["break_share"]) > 0 for r in marked):
             whose = "the break faces, marked or estimated" if estimated else \
                 "the dataset's break faces"
-            lines.append(f"  against {whose} ({middle('break_share')} of "
-                         f"faces): recall {middle('recall_full')} -> {middle('recall')}, "
-                         f"precision {middle('precision_full')} -> {middle('precision')}")
+            lines.append(f"  the dihedral labels against {whose} ({middle('break_share')} "
+                         f"of faces), full resolution -> converted: recall "
+                         f"{middle('recall_full')} -> {middle('recall')}, precision "
+                         f"{middle('precision_full')} -> {middle('precision')}")
         elif marked:
             lines.append("  the dataset marks no break face on these pieces")
+        checked = [r for r in ok if r.get("estimate_precision") not in (None, "")]
+        if checked:
+            lines.append(f"  the break estimate against the marks, where marked ({len(checked)} of "
+                         f"{len(ok)}): precision {middle('estimate_precision')}, recall "
+                         f"{middle('estimate_recall')}")
     return "\n".join(lines)
 
 

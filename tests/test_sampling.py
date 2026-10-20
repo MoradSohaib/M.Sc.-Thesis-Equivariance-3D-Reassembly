@@ -15,7 +15,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from reassembly.data.sampling import WeightedDistributedSampler
+from reassembly.data.sampling import DealtShares, EpochSampler, WeightedDistributedSampler
 
 
 def _all_ranks(weights, world, **kwargs):
@@ -121,3 +121,37 @@ def test_epoch_length_matches_the_unbalanced_run():
     """
     weights = [1.0, 9.0, 1.0, 1.0, 1.0]
     assert len(WeightedDistributedSampler(weights, seed=0)) == len(weights)
+
+
+def test_every_step_is_dealt_its_exact_share():
+    """
+    48 as stored and 80 perturbed in every optimizer step of 128 scenes: the
+    shares of each block of 128 are stratified, so exactly 80 fall below
+    0.625 -- where one draw per scene gives 80 only on average. Each GPU deals
+    its own blocks, the same again when the epoch is restarted, and new ones
+    the next epoch; the indices are the base sampler's, untouched.
+    """
+    base = EpochSampler(500, per_rank=4 * 128, num_replicas=2, rank=1, seed=3)
+    dealt = DealtShares(base, block=128, seed=3, rank=1)
+    dealt.set_epoch(2)
+    pairs = list(dealt)
+    assert len(pairs) == len(dealt) == 4 * 128
+    assert [i for i, _ in pairs] == list(base)            # base.set_epoch(2) was passed on
+    shares = [share for _, share in pairs]
+    assert all(0.0 <= share < 1.0 for share in shares)
+    for start in range(0, len(shares), 128):
+        block = shares[start:start + 128]
+        assert sum(share < 0.625 for share in block) == 80
+        assert sum(share < 0.5 for share in block) == 64
+    again = DealtShares(EpochSampler(500, per_rank=4 * 128, num_replicas=2, rank=1, seed=3),
+                        block=128, seed=3, rank=1)
+    again.set_epoch(2)
+    assert list(again) == pairs                            # a restarted epoch: the same
+    again.set_epoch(3)
+    assert [s for _, s in again] != shares
+    other = DealtShares(EpochSampler(500, per_rank=4 * 128, num_replicas=2, rank=0, seed=3),
+                        block=128, seed=3, rank=0)
+    other.set_epoch(2)
+    assert [s for _, s in other] != shares                 # each GPU its own deal
+    with pytest.raises(ValueError, match="block"):
+        DealtShares(base, block=0)

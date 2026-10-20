@@ -435,6 +435,49 @@ def test_one_draw_per_scene_decides_remeshed_perturbed_or_stored(tmp_path):
     assert all(np.array_equal(a.vertices, b.vertices) for a, b in zip(closed, seen))
 
 
+def test_the_training_loader_deals_every_step_its_share_of_stored_scenes(tmp_path):
+    """
+    With both shares at 0.625, every optimizer step -- ``batch_size *
+    accumulate`` scenes on one GPU -- holds exactly 5 of 8 remeshed and
+    perturbed and 3 as stored: the sampler deals each scene its number, and the
+    scene honours it. Validation, and a run that perturbs every scene, are not
+    dealt anything.
+    """
+    from reassembly.data.sampling import DealtShares
+    from reassembly.training import _contact_banner, _loader
+
+    root = _dataset(tmp_path / "data")
+    config = _config(root, remesh=(1.0, 1.0), remesh_gap=0.3, contact_radius=0.35,
+                     remesh_probability=0.625, augment_probability=0.625,
+                     batch_size=2, accumulate=4, steps_per_epoch=12)
+    scenes = BreakingBadScenes(config, "train", epoch_seed=1)
+    loader = _loader(scenes, config, True, 0, 1, epoch=1)
+    assert isinstance(loader.sampler, DealtShares) and loader.sampler.block == 8
+    pairs = list(loader.sampler)
+    assert len(pairs) == 12 * 2
+    for start in range(0, len(pairs), 8):
+        decided = [scenes._decisions(scenes.key(i), share) for i, share in pairs[start:start + 8]]
+        assert decided.count((True, True)) == 5 and decided.count((False, False)) == 3
+    index = pairs[0][0]
+    stored = scenes.meshes(index)
+    for share, changed in ((0.1, True), (0.9, False)):
+        _closed, _surface, seen = scenes._remeshed(scenes.key(index), *_pieces(stored), share)
+        same = all(np.array_equal(np.asarray(a.vertices), np.asarray(b.vertices))
+                   for a, b in zip(seen, stored))
+        assert same is not changed
+    built, again = scenes[(index, 0.9)], scenes.build(index, share=0.9)
+    assert all(np.array_equal(a.target_vertices, b.target_vertices)
+               for a, b in zip(built.fragments, again.fragments))
+    assert "of each optimizer step's 8 scenes per GPU, 5 remeshed and 5 perturbed" in \
+        "\n".join(_contact_banner(config))
+    assert not isinstance(_loader(BreakingBadScenes(config, "val"), config, False, 0, 1,
+                                  epoch=1).sampler, DealtShares)
+    every = _config(root, remesh=(1.0, 1.0), remesh_gap=0.3, contact_radius=0.35,
+                    batch_size=2, accumulate=4, steps_per_epoch=12)
+    assert not isinstance(_loader(BreakingBadScenes(every, "train"), every, True, 0, 1,
+                                  epoch=1).sampler, DealtShares)
+
+
 def test_settings_that_cannot_work_are_refused(tmp_path):
     root = _dataset(tmp_path / "data")
     with pytest.raises(ValueError, match="after segment"):

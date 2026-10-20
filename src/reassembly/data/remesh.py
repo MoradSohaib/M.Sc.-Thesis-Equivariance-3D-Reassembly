@@ -70,9 +70,10 @@ class Remesh(NamedTuple):
     by Gaussian noise of ``jitter``.
 
     ``remesh_probability`` and ``augment_probability`` are the shares of the
-    scenes remeshed and perturbed (one draw per scene and epoch decides both:
+    scenes remeshed and perturbed (one number per scene and epoch decides both:
     a scene is perturbed only if it is also remeshed, unless the perturbing
-    share is the larger); the rest are the scenes as stored.
+    share is the larger; in training the sampler deals those numbers so every
+    optimizer step holds its exact shares); the rest are the scenes as stored.
     """
 
     low: float

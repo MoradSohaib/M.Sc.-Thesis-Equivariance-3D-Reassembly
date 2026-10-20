@@ -1071,12 +1071,14 @@ class BreakingBadScenes:
                                  config.contact_radius)
         return np.concatenate(masks) if masks else None
 
-    def build(self, i: int, *, rotations=None, seed=None, perturb=None):
+    def build(self, i: int, *, rotations=None, seed=None, perturb=None, share=None):
         """
         Item ``i`` as the loop sees it, with the perturbation overridable:
         ``rotations`` (per fragment) or ``seed`` replace the item's own stable
         draw, ``perturb`` overrides ``config.perturb_on_device``. The scripts
         use this to rebuild exactly what training saw, or a chosen variant.
+        ``share`` is the one the training sampler dealt this item
+        (:meth:`_decisions`); without it the scene draws its own.
         """
         from .data.features import build_scene
 
@@ -1120,8 +1122,8 @@ class BreakingBadScenes:
             # fracture (data/remesh.py). The positives are where the vertices
             # were before the opening and the jitter, so the two sides of an
             # opened break stay each other's. The model reads the moved pieces.
-            changed = any(self._decisions(key))
-            closed, surface, meshes = self._remeshed(key, vertices, faces)
+            changed = any(self._decisions(key, share))
+            closed, surface, meshes = self._remeshed(key, vertices, faces, share)
             vertices = [m.vertices for m in meshes]
             faces = [m.faces for m in meshes]
             if config.supervise_embedding and config.contact_radius > 0:
@@ -1191,24 +1193,41 @@ class BreakingBadScenes:
                  for v, m, offset in zip(vertices, closed, offsets[:-1])]
         return dict(view=view, view_index=np.concatenate(index).astype(np.int64))
 
-    def _decisions(self, key: str) -> Tuple[bool, bool]:
+    def _decisions(self, key: str, share: Optional[float] = None) -> Tuple[bool, bool]:
         """
         Whether this epoch remeshes the scene ``key`` and whether it perturbs its
-        breaks: one draw per scene and epoch, against ``remesh_probability`` and
-        ``augment_probability``, from its own stream so the remeshing draws
-        what it always has. Both, whenever the shares are 1.
+        breaks: one number in [0, 1) against ``remesh_probability`` and
+        ``augment_probability``. In training it is the ``share`` the sampler
+        dealt the scene (:class:`~reassembly.data.sampling.DealtShares`), so
+        that every optimizer step holds an exact number of each -- with both
+        at 0.625, 80 of 128 remeshed and perturbed and 48 as stored. Without
+        one, one draw per scene and epoch from its own stream, so the
+        remeshing draws what it always has. Both, whenever the shares are 1.
         """
         spec = self.remesh
         if spec.remesh_probability >= 1.0 and spec.augment_probability >= 1.0:
             return True, True
-        u = np.random.default_rng(stable_seed(key, self.epoch_seed, self.config.seed,
-                                              "augment")).uniform()
+        u = share
+        if u is None:
+            u = np.random.default_rng(stable_seed(key, self.epoch_seed, self.config.seed,
+                                                  "augment")).uniform()
         return bool(u < spec.remesh_probability), bool(u < spec.augment_probability)
 
-    def __getitem__(self, i: int):
+    @property
+    def deals_shares(self) -> bool:
+        """Whether the training sampler should deal each scene its share
+        (:meth:`_decisions`): only when some scenes are left as stored or
+        unperturbed."""
+        return (self.split == "train" and self.remesh is not None
+                and min(self.remesh.remesh_probability, self.remesh.augment_probability) < 1.0)
+
+    def __getitem__(self, i):
+        if isinstance(i, tuple):           # (index, share), from DealtShares
+            i, share = i
+            return self.build(int(i), share=float(share))
         return self.build(i)
 
-    def _remeshed(self, key: str, vertices, faces) -> tuple:
+    def _remeshed(self, key: str, vertices, faces, share: Optional[float] = None) -> tuple:
         """
         The pieces remeshed by ``self.remesh``, from their own stream -- so
         the perturbation and the tokens draw what they would have -- and per
@@ -1225,7 +1244,7 @@ class BreakingBadScenes:
 
         rng = np.random.default_rng(stable_seed(key, self.epoch_seed, self.config.seed,
                                                 "remesh"))
-        remesh, perturb = self._decisions(key)
+        remesh, perturb = self._decisions(key, share)
         closed, surface, moved, faces = remesh_scene(vertices, faces, rng, self.remesh,
                                                      remesh=remesh, perturb=perturb)
         return tuple([_Mesh(v, f) for v, f in zip(stage, faces)]
@@ -2936,7 +2955,7 @@ def _loader(dataset, config: Config, shuffle: bool, rank: int, world: int,
     import torch
     from torch.utils.data import DataLoader, DistributedSampler
 
-    from .data.sampling import EpochSampler, ShardSampler, WeightedDistributedSampler
+    from .data.sampling import DealtShares, EpochSampler, ShardSampler, WeightedDistributedSampler
 
     world = max(int(world), 1)
     rank = rank if world > 1 else 0
@@ -2960,6 +2979,16 @@ def _loader(dataset, config: Config, shuffle: bool, rank: int, world: int,
                                          shuffle=True, drop_last=False,
                                          seed=config.seed)
         if sampler is not None:
+            sampler.set_epoch(epoch)
+        if getattr(dataset, "deals_shares", False):
+            # One optimizer step on one GPU is batch_size * accumulate scenes,
+            # consecutive in the sampler's order: dealt so each step holds its
+            # exact share of remeshed and perturbed scenes (data/sampling.py).
+            from torch.utils.data import RandomSampler
+
+            base = sampler if sampler is not None else RandomSampler(dataset)
+            sampler = DealtShares(base, config.batch_size * config.accumulate,
+                                  seed=config.seed, rank=rank)
             sampler.set_epoch(epoch)
     elif world > 1:
         sampler = ShardSampler(len(dataset), num_replicas=world, rank=rank)
@@ -3641,9 +3670,16 @@ def _contact_banner(config: Config) -> List[str]:
         lines.append(f"  remeshed      each training piece on its own: {how}{moves}"
                      "; validation as stored")
         if config.remesh_probability < 1 or config.augment_probability < 1:
-            lines.append(f"                in {config.remesh_probability:.0%} of the scenes "
-                         f"remeshed, {config.augment_probability:.0%} perturbed (one draw "
-                         f"per scene), the rest as stored")
+            step = config.batch_size * config.accumulate
+
+            def count(share: float) -> str:
+                scenes = step * share
+                return f"{scenes:.0f}" if scenes == round(scenes) else f"~{scenes:.1f}"
+
+            lines.append(f"                of each optimizer step's {step} scenes per GPU, "
+                         f"{count(config.remesh_probability)} remeshed and "
+                         f"{count(config.augment_probability)} perturbed, the rest as stored "
+                         f"(dealt by the sampler)")
     if config.init_from:
         lines.append(f"  init from     {config.init_from} (weights only"
                      + (", where they fit" if config.init_partial else "") + ")")

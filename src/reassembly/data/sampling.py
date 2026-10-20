@@ -1,7 +1,7 @@
 """
 Samplers.
 
-Three, each for a combination torch does not provide:
+Four, each for a combination torch does not provide:
 
 * :class:`WeightedDistributedSampler` -- weighted *and* distributed *and*
   reproducible, for a full pass over a balanced training set.
@@ -9,6 +9,9 @@ Three, each for a combination torch does not provide:
   weighted or not, for fixed-length epochs (``Config.steps_per_epoch``).
 * :class:`ShardSampler` -- every index exactly once across the ranks, with no
   padding, for validation.
+* :class:`DealtShares` -- any of them with a share dealt to every index,
+  stratified over each optimizer step, so a step holds an exact number of
+  remeshed and perturbed scenes.
 
 ``WeightedRandomSampler`` is not distributed, ``DistributedSampler`` is not
 weighted and pads by repeating samples, and stacking them gives each rank a
@@ -19,8 +22,9 @@ every rank the same count.
 """
 from __future__ import annotations
 
-from typing import Iterator, Optional, Sequence
+from typing import Iterator, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 from torch.utils.data import Sampler
 
@@ -213,3 +217,53 @@ class ShardSampler(Sampler[int]):
 
     def __iter__(self) -> Iterator[int]:
         return iter(self.indices)
+
+
+class DealtShares(Sampler[Tuple[int, float]]):
+    """
+    The indices of ``base``, each with a share in [0, 1) dealt to it,
+    stratified over every ``block`` consecutive indices -- one optimizer step
+    on one GPU. A block's shares are ``(k + u_k) / block`` for ``k`` the
+    numbers ``0 .. block - 1`` shuffled and ``u_k`` uniform, so exactly
+    ``p * block`` of them fall below ``p`` whenever that is a whole number
+    (its floor or ceiling otherwise).
+
+    The training dataset compares the share with its remeshing and perturbing
+    probabilities instead of drawing one per scene
+    (:meth:`reassembly.training.BreakingBadScenes._decisions`). With both at
+    0.625, every step of 128 scenes holds exactly 80 remeshed and perturbed and
+    48 as stored; one draw per scene gives 80 on average, give or take 5.5.
+
+    Yields ``(index, share)``. Seeded by ``seed``, the epoch (:meth:`set_epoch`,
+    passed on to ``base``) and ``rank``, so every GPU deals its own blocks and
+    a restarted epoch -- resume restarts an interrupted one from its first
+    step -- deals the same again. A last block left short by the epoch's end
+    holds a random part of a full block's shares.
+    """
+
+    def __init__(self, base, block: int, seed: int = 0, rank: int = 0) -> None:
+        if int(block) < 1:
+            raise ValueError("block must be >= 1")
+        self.base = base
+        self.block = int(block)
+        self.seed = int(seed)
+        self.rank = int(rank)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+        if hasattr(self.base, "set_epoch"):
+            self.base.set_epoch(epoch)
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __iter__(self) -> Iterator[Tuple[int, float]]:
+        shares = None
+        for position, index in enumerate(self.base):
+            within = position % self.block
+            if within == 0:
+                rng = np.random.default_rng(          # a seed sequence takes no negatives
+                    [self.seed % 2 ** 32, self.epoch, self.rank, position // self.block])
+                shares = (rng.permutation(self.block) + rng.uniform(size=self.block)) / self.block
+            yield int(index), float(shares[within])
