@@ -79,26 +79,44 @@ The marks are carried through the cleaning and thinning. The folder layout marks
 the broken object only, so the restoration takes the vertices within 0.03 of the
 marked break (`BREAK_REACH`); real gaps are 0.011–0.029.
 
-**Fractura's real bones mark nothing.** In the sample, `pig_bone_1`, the
-`shared_faces` mark 24 faces per piece. They are the same faces in all four
-pieces, around the origin: the debris the cleaning drops. So an assembly that
-marks no break gets one estimated from its assembled pose (`estimated_breaks`).
-A face counts as break when each of its corners has its nearest vertex on
-another piece within 0.03, with the two vertex normals facing each other (dot
-product below −0.5). Proximity alone would not do: the bone's shards are thin
-and lie against each other, and 44–91% of each one's vertices are within 0.03
-of another piece.
+**Fractura's real bones mark nothing.** In `pig_bone_1` the `shared_faces`
+mark 24 faces per piece: the same faces in all four pieces, around the origin,
+which are the debris the cleaning drops. In `limb1`, `limb4`, `vert1` and
+`vert6` they are −1 throughout. Their `full_mesh` is only the pieces put
+together, so it does not help either.
+
+So an assembly that marks no break gets one estimated from its assembled pose
+(`estimated_breaks`). A face counts as break when the nearest face of another
+piece, centroid to centroid, is within 0.03 and faces it: the two face normals'
+dot product is below −0.5. Two choices in that rule matter:
+
+- **Face normals, not vertex normals.** A vertex on a break's rim averages the
+  break and the intact surface. Judged by vertex normals, the rims and every
+  narrow break went unmarked: recall 0.11–0.62 on five Breaking Bad scenes and
+  0.21 on Fantastic Breaks.
+- **Facing, not proximity alone.** The shards of `pig_bone_1` are thin and lie
+  against each other, and 44–91% of each one's vertices are within 0.03 of
+  another piece.
 
 The estimate was checked where the break is known:
 
 | Sample | Precision | Recall |
 |---|---|---|
-| Breaking Bad (the coincident vertices) | 1.00 | 0.62 |
-| Fantastic Breaks `00002` (its marks) | 0.92 | 0.21 |
+| Breaking Bad, five scenes (the coincident vertices) | 0.91–0.98 | 1.00 |
+| Fantastic Breaks `00002` (its marks) | 0.94 | 0.67 |
 
-It is conservative: what it calls break is break, which is what an oracle needs,
-but it misses part of the break. **On the real bones, the oracle and the fracture
-head's precision and recall are measured against this estimate.**
+Breaking Bad is the easy case: the two sides of a simulated break are mirror
+images. Fantastic Breaks is a scan, and the better test.
+
+On the five real bones, drawn piece by piece, the estimate covers the limb
+bones' broken ends, the vertebrae's pedicles (where the arch broke from the
+body), and the shards' split edges. It is conservative: what it calls break is
+break, which is what an oracle needs. But it misses the parts of a break whose
+two sides stand more than 0.03 apart. At a reach of 0.05, the estimates of the
+vertebrae and of `limb4` grow by a quarter to two thirds (limb1's not at all).
+**On the real bones, the oracle and the fracture head's precision and recall are
+measured against this estimate**, so the head's precision there is a lower
+bound.
 
 The CSV report gains `marked_pieces`, `marked_vertices` and `break_source`
 (`marked` or `estimated`), and the summary counts the estimated assemblies.
@@ -450,45 +468,54 @@ Ablations, one change at a time against `checkpoint-s2r`:
 - `--augment_probability 1`;
 - both shares at 0.625 (the original 48/80 plan).
 
-## 7. Three samples, measured
+## 7. The samples, measured
 
 The samples:
 
-- one Breaking Bad scene (15 pieces);
-- one Fantastic Breaks pair, `00002`: two pieces in one `.npz` in GARF's
-  per-piece layout, decimated to 5% of the scan;
-- one Fractura real bone, `pig_bone_1` from `bone_real_small.hdf5`: four pieces.
+- **Breaking Bad**: five scenes, of 2 to 64 pieces.
+- **Fantastic Breaks**: one pair, `00002`. Its two pieces come in one `.npz` in
+  GARF's per-piece layout, decimated to 5% of the scan; the full-resolution
+  pairs were too large to share.
+- **Fractura real**: five bones.
+  - `pig_bone_1`, from `bone_real_small.hdf5`: four thin shards.
+  - `limb1`, `limb4`, `vert1` and `vert6`, from `fractura_real.hdf5`: two pieces
+    each. That file's 27 objects (16 bones, 8 ceramics, 3 eggs) are all in its
+    `val` split.
 
-This is one sample each, so the numbers are indications, not dataset
-statistics. Lengths are fractions of the object's largest side.
+That is a handful per dataset, so the numbers are ranges over these samples, not
+dataset statistics. Lengths are fractions of the object's largest side.
 
 ### 7.1 As stored
 
-| | Breaking Bad | Fantastic Breaks `00002` | Fractura `pig_bone_1` |
+| | Breaking Bad (5) | Fantastic Breaks `00002` | Fractura real (5) |
 |---|---|---|---|
-| vertices / faces | 17,155 / 34,250 | 58,771 / 119,998 | 825,331 / 1,650,918, once cleaned |
-| median edge | 0.0079 | 0.0085 | 0.0014 |
-| edge spread (p90/p10) | 14.8 | 4.2 | 3.0 |
-| triangle shape: median / slivers | 3.76 / 39% | 3.08 / 30% | 2.04 / 6% |
-| closed and manifold | all 15 pieces | broken piece: closed, 8 non-manifold edges; restoration: 341 non-manifold edges, 91% slivers | all 4, once cleaned (stored as one vertex per face corner, plus Blender's cube) |
-| marked break (share of vertices) | 9–91% per piece (coincident) | 3.8% and 29.3% (`shared_faces`) | none; estimated at 7–28% (§1.3) |
-| dihedral labels vs that break: precision / recall | 0.62 / 1.00 | 0.28 / 0.70 | 0.17 / 0.30 |
-| vertices shared across the break | 3,478 | 0 | 0 |
-| gap across the break (median) | 0 | 0.0003 (restoration to broken), 0.0065 (broken to the coarser restoration) | 0.0043 (quartiles 0.0017–0.0101) |
-| wall thickness (median per piece) | 0.02–0.05 (one piece 0.002) | 0.044 and 0.028 | 0.011–0.016 |
+| pieces | 2–64 | 2 | 2–4 |
+| median edge | 0.0079–0.0232 | 0.0085 | 0.0014–0.0058 |
+| edge spread (p90/p10) | 10.8–15.7 | 4.2 | 3.0–3.1 |
+| triangle shape: median / slivers | 3.6–4.9 / 36–50% | 3.1 / 30% | 2.0 / 6–7% |
+| closed and manifold | all | broken piece: closed, 8 non-manifold edges; restoration: 341 non-manifold edges, 91% slivers | all, once cleaned |
+| break marked | coincident vertices, 7–44% | `shared_faces`: 3.8% and 29.3% | none; estimated at 1–34% per piece (§1.3) |
+| dihedral labels vs that break: precision / recall | 0.10–0.68 / 1.00 | 0.28 / 0.70 | 0.03–0.27 / 0.10–0.49 |
+| vertices shared across the break | 272–6,539 | 0 | 0 |
+| gap across the break (median) | 0 | 0.0003 (restoration to broken), 0.0065 (broken to the coarser restoration) | 0.0049–0.0185 |
+| wall thickness (median per piece) | 0.012–0.066 | 0.028 and 0.044 | 0.012–0.016 (`pig_bone_1`), 0.03–0.10 (the others) |
 
 Wall thickness is the distance from a surface point to the nearest point of the
-same piece that faces the other way.
+same piece that faces the other way. `pig_bone_1` is stored as one vertex per
+face corner, plus Blender's cube; the four from `fractura_real.hdf5` are stored
+as closed meshes.
 
-- **The tessellations differ most.** Breaking Bad's edges spread 14.8×, and four
+- **The tessellations differ most.** Breaking Bad's edges spread 11–16×, and four
   in ten of its triangles are slivers. The scans are meshed evenly.
-- **This Fantastic Breaks pair is flush:** the restoration's break lies on the
-  broken piece's surface. The bone's pieces stand apart: 0.0043 across the
-  estimated break, and 0.011–0.029 over 27 real Fractura scenes
-  (`docs/PROJECT-STATE.md` §21).
-- **The bone's walls are thin**, a third of the Breaking Bad sample's. At full
-  resolution the dihedral test is of no use on it: it flags 8–41% of each
-  piece's vertices, with precision 0.17 and recall 0.30 against the estimate.
+- **The real pieces stand apart.** Across the estimated break, Fractura's are a
+  median 0.005–0.019 apart, and only 1–3% of the four solid bones' vertices are
+  within 0.005 of the other piece. The Fantastic Breaks pair is flush. Training's
+  opening (`--remesh_gap 0.03`, calibrated on 27 Fractura scenes) covers that
+  range.
+- **Walls vary.** `pig_bone_1`'s shards are as thin as the thinnest Breaking Bad
+  scene's pieces (64 pieces, 0.012). The other bones are solid.
+- **At full resolution the dihedral test is of no use on the scans:** precision
+  0.03–0.27 against the estimate.
 
 ### 7.2 Roughness, measured so geometry stays out
 
@@ -503,31 +530,34 @@ The measure below fixes that in two ways:
 - only neighbours facing within 60° of the centre count;
 - a quadric is fitted instead of a plane, so curvature drops out.
 
-With it, neither reading holds. The table is at the resolution the model reads,
-every sample remeshed isotropically to about 0.0145.
+The table is at the resolution the model reads, every sample remeshed
+isotropically to about 0.0145. The scans' break is the one they mark, or the
+estimate.
 
-| Quadric residual within 0.02, edge ~0.0145 | break | intact | break / intact |
-|---|---|---|---|
-| Fractura `pig_bone_1`, `--isotropic` | 0.00071 | 0.00023 | 3.1 |
-| Fantastic Breaks `00002`, `--isotropic` | 0.00118 | 0.00006 | 20 |
-| Breaking Bad, `--remesh_edge 0.012 0.018` alone | 0.00039–0.00042 | 0.00009 | 4.4–4.7 |
-| Breaking Bad, §6.3's settings | 0.00037–0.00055 | 0.00024–0.00029 | 1.5–1.9 |
+| Quadric residual within 0.02, edge ~0.0145 | break | intact |
+|---|---|---|
+| Fractura real, five bones, `--isotropic` | 0.00040–0.00091 | 0.00021–0.00037 |
+| Fantastic Breaks `00002`, `--isotropic` | 0.00118 | 0.00006 |
+| Breaking Bad, five scenes, `--remesh_edge 0.012 0.018` alone | 0.00038–0.00057 | 0.00005–0.00053 |
+| Breaking Bad, five scenes, §6.3's settings | 0.00031–0.00058 | 0.00022–0.00057 |
 
-- **The intact surfaces are covered.** The bone's is as rough as §6.3's scenes,
-  which their ripple and jitter roughen, and Fantastic Breaks' is as smooth as
-  Breaking Bad's before them. At full resolution the bone's intact surface is as
-  textured as its break (0.00062 against 0.00068), but that texture is finer
-  than the edge, and remeshing removes it. So no roughening of intact surfaces
-  is needed for it.
-- **The scans' breaks are 1.3–3× rougher than the training breaks** at this
-  resolution, because Breaking Bad's simulated fracture surfaces are smoother
-  than real ones. No setting closes the gap: without the wear (`--remesh_smooth
-  0`) the training breaks measure 0.00043–0.00061, and without the opening
-  0.00037–0.00041. A fracture detector forgives this direction, since a scan's
-  break stands out from its intact surface more than a training break does.
-  §6.4's fracture-head report measures it on the scans directly.
+- **The intact surfaces are covered.** The bones' fall within §6.3's range, and
+  Fantastic Breaks' is smoother than any training scene's. At full resolution
+  `pig_bone_1`'s intact surface is four times as textured as Breaking Bad's
+  (0.00051 against 0.00013). But that texture is finer than the edge, and
+  remeshing removes it (0.00021). So no roughening of intact surfaces is needed.
+- **The scans' breaks are as rough as the training breaks, or rougher.** Three
+  of the bones match them (0.00040–0.00044). `pig_bone_1` (0.00081), `limb4`
+  (0.00091) and Fantastic Breaks (0.00118) are rougher than any training scene
+  (0.00031–0.00058). No setting closes that: on the first scene, without the
+  wear (`--remesh_smooth 0`) the training breaks measure 0.00043–0.00061, and
+  without the opening 0.00037–0.00041. A fracture detector forgives this
+  direction, and §6.4's fracture-head report measures it on the scans directly.
+- **Roughness alone does not tell break from intact, even in training.** Two of
+  the five Breaking Bad scenes have intact surfaces as textured as their breaks
+  (0.00042–0.00057).
 
-### 7.3 What the training settings make of the Breaking Bad scene
+### 7.3 What the training settings make of the first Breaking Bad scene
 
 | | edge spread | slivers | shared | roughness, break / intact | gap, contact region (median) | dihedral P / R |
 |---|---|---|---|---|---|---|
@@ -539,28 +569,28 @@ every sample remeshed isotropically to about 0.0145.
 Roughness is §7.2's measure, at each setting's own resolution.
 
 The recommended settings do three things: they even out the tessellation,
-remove the shared vertices, and open the contact as the scans' is open. Their
-breaks are as rough as Breaking Bad's own, and their intact surfaces at most as
-rough as the bone's. V7's independent jitter makes intact surfaces 2× the bone's
-and 8× Fantastic Breaks'.
+remove the shared vertices, and open the contact as the scans' is open. V7's
+independent jitter roughens intact surfaces past every scan's (0.00050 against
+at most 0.00037).
 
 ### 7.4 The scans as the model gets them
 
 Converted with `--isotropic` at 0.0145:
 
-- **The bone** takes 72 s and comes out as 7,062 vertices, closed and manifold,
-  with 1% slivers and an edge spread of 2.7.
-  - Its break is one or two edges across: 81% of the break vertices are one
-    edge from the intact side, as in Breaking Bad's training scenes (81–83% at
-    `--remesh_edge 0.012 0.018`). The walls are thin, but no finer edge is
-    called for. At 0.007 the bone and Breaking Bad widen alike (63% against
-    48–50%), and the vertex count quadruples.
-  - The dihedral test floods. It flags 42–86% of each piece's vertices, with
-    precision 0.35 and recall 0.96 against the estimate. V7's thinned conversion
-    floods as much (47–91%, precision 0.31). This is what the fracture head
-    (§3) and the oracle (§1.3) are for.
-- **Fantastic Breaks** comes out as 20,249 vertices. Its break is wider (18% of
-  its break vertices one edge from the intact side). The remesher refuses the
+- **Fractura's bones** come out closed and manifold, in 4–72 s each. `limb4` has
+  1,632 vertices, `vert6` 10,713 and `pig_bone_1` 7,062.
+  - **A break is one or two edges across.** 43–71% of the break vertices are one
+    edge from the intact side; the solid bones' breaks are wider than the
+    shards'. In Breaking Bad's training scenes the figure is 81–83% (the first
+    scene, at `--remesh_edge 0.012 0.018`). So no finer edge is called for. At
+    0.007, `pig_bone_1` and Breaking Bad widen alike (63% against 48–50%), and
+    the vertex count quadruples.
+  - **The dihedral test floods.** It flags 30–86% of each piece's vertices, with
+    precision 0.07–0.41 against the estimate and recall 0.53–0.99. V7's thinned
+    conversion of `pig_bone_1` floods as much (47–91% of each piece's vertices).
+    This is what the fracture head (§3) and the oracle (§1.3) are for.
+- **Fantastic Breaks** comes out as 20,249 vertices. Its break is wider: 18% of
+  its break vertices are one edge from the intact side. The remesher refuses the
   restoration, so it is collapsed to the density (§2.1), and the dihedral test
   flags 90% of it (14% of the broken piece).
 

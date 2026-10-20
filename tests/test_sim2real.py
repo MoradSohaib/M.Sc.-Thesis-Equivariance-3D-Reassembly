@@ -193,9 +193,11 @@ def test_the_converter_returns_the_marked_break_with_the_pieces(real_like):  # n
 def test_a_dataset_that_marks_nothing_has_its_break_estimated(fractured_solid):
     """
     Fractura's real bones mark no break (their shared_faces mark the debris the
-    cleaning drops). The estimate -- nearest vertex on another piece within
-    reach, the normals opposed -- is checked where the truth is known: the
-    fixture's coincident interface, and the tube's caps opened a little apart.
+    cleaning drops, or nothing). The estimate -- the nearest face of another
+    piece within reach, the face normals opposed -- is checked where the truth
+    is known: the fixture's coincident interface, and the tube's caps opened a
+    little apart. By vertex normals, which a rim vertex averages over the break
+    and the intact side, the fixture's recall was 0.84; by faces, all of it.
     """
     from reassembly.data.external import Assembly, estimated_breaks
     from reassembly.mesh.fracture import fracture_vertex_masks
@@ -207,7 +209,7 @@ def test_a_dataset_that_marks_nothing_has_its_break_estimated(fractured_solid):
         estimated = np.zeros(len(v), bool)
         estimated[np.unique(f[face_mask])] = True
         precision = (estimated & t).sum() / max(estimated.sum(), 1)
-        assert precision > 0.95 and (estimated & t).sum() > 0.5 * t.sum()
+        assert precision > 0.95 and (estimated & t).sum() > 0.95 * t.sum()
     pieces, breaks = tube_pieces([0.4])
     pieces[1] = (pieces[1][0] + [0.0, 0.0, 0.02], pieces[1][1])       # opened by 0.02 of 6
     assembly = Assembly("test", "tube", "", "tube", "", list(pieces), [None, None])
@@ -216,7 +218,7 @@ def test_a_dataset_that_marks_nothing_has_its_break_estimated(fractured_solid):
     for (v, f), b, mask in zip(pieces, breaks, marks):
         cap = np.zeros(len(v), bool)
         cap[np.unique(f[b >= 0])] = True
-        assert (mask & cap).sum() / max(mask.sum(), 1) > 0.9 and (mask & cap).sum() > 0.5 * cap.sum()
+        assert (mask & cap).sum() / max(mask.sum(), 1) > 0.9 and (mask & cap).sum() > 0.95 * cap.sum()
     marked = Assembly("test", "tube", "", "tube", "", list(pieces), [b >= 0 for b in breaks])
     assert prepare(marked, Preparation())[1]["break_source"] == "marked"
 

@@ -72,18 +72,23 @@ SHARED_BREAKS = 0.01
 # marked ones. Fractura's real pieces, converted, stand 0.011 to 0.029 apart
 # where they face each other (median 0.0184), so this reaches across the gap.
 BREAK_REACH = 0.03
-# A dataset that marks no break at all -- Fractura's real bones: their
-# shared_faces mark 24 faces per piece, the same ones in all four pieces of
-# pig_bone_1, around the origin: the debris the cleaning drops -- gets its break
-# estimated (`estimated_breaks`): the faces each of whose corners has its
-# nearest vertex on another piece within BREAK_REACH, facing it, the two vertex
-# normals' dot below ESTIMATE_OPPOSED. Checked where the break is known, the
-# vertices of those faces against the true break's: on a Breaking Bad scene
-# (the coincident vertices) precision 1.00, recall 0.62; on Fantastic Breaks'
-# 00002 (its marks) 0.92 and 0.21 -- a conservative estimate, what an oracle
-# needs: the vertices it calls break are break. Not proximity alone: the four
-# shards of pig_bone_1 are thin and lie against each other, and 44% to 91% of
-# each one's vertices are within 0.03 of another piece; facing, 7% to 28%.
+# A dataset that marks no break at all -- Fractura's real bones: the
+# shared_faces of pig_bone_1 mark 24 faces per piece, the same ones in all four
+# pieces, around the origin: the debris the cleaning drops; those of limb1,
+# limb4, vert1 and vert6 mark nothing -- gets its break estimated
+# (`estimated_breaks`): the faces whose nearest face of another piece is within
+# BREAK_REACH and faces them, the two face normals' dot below ESTIMATE_OPPOSED.
+# Checked where the break is known, the vertices of those faces against the
+# true break's: on five Breaking Bad scenes (the coincident vertices) precision
+# 0.91 to 0.98, recall 1.00 -- the two sides of a simulated break are mirror
+# images, so it is easy there; on Fantastic Breaks' 00002 (its marks), a scan,
+# 0.94 and 0.67. Drawn, it covers the limb bones' broken ends, the vertebrae's
+# pedicles and the shards' split edges. Conservative, as an oracle needs: what
+# it calls break is break. Where real pieces stand further apart than the
+# reach it misses some -- at 0.05, the vertebrae's and limb4's estimates grow by
+# a quarter to two thirds. Not proximity alone: the four shards of pig_bone_1
+# are thin and lie against each other, and 44% to 91% of each one's vertices
+# are within 0.03 of another piece; facing, 10% to 34%.
 ESTIMATE_OPPOSED = -0.5
 # Passes of the isotropic remesher when converting (Preparation.isotropic): once
 # per object, so the two more than training's three are cheap. A scan denser
@@ -400,32 +405,39 @@ def vertex_breaks(pieces: Sequence, breaks: Sequence,
 def estimated_breaks(pieces: Sequence, reach: float = BREAK_REACH,
                      opposed: float = ESTIMATE_OPPOSED) -> List[np.ndarray]:
     """
-    Per piece, per FACE, the break estimated from the assembled pose: faces all
-    of whose corners have their nearest vertex on another piece within
-    ``reach``, with an opposed normal (dot below ``opposed``) -- the two sides
-    of a break face each other. For pieces in the assembled pose at full
-    resolution, where the nearest vertex stands in for the nearest point.
+    Per piece, per FACE, the break estimated from the assembled pose: the faces
+    whose centroid has the nearest face centroid of another piece within
+    ``reach``, the two face normals opposed (dot below ``opposed``) -- the two
+    sides of a break face each other. For pieces in the assembled pose at full
+    resolution, where the nearest centroid stands in for the nearest point.
+
+    Face normals, not vertex normals: a vertex on a break's rim averages the
+    break and the intact surface, and judged by vertex normals the rims and
+    every narrow break went unmarked -- recall 0.11 to 0.62 on five Breaking
+    Bad scenes and 0.21 on Fantastic Breaks' 00002, where by faces it is 1.00
+    and 0.67, at precision 0.91 to 0.98 and 0.94 (:data:`ESTIMATE_OPPOSED`).
     """
     from scipy.spatial import cKDTree
 
-    from ..mesh.topology import vertex_normals
-
-    pieces = [(np.asarray(v, dtype=np.float64), np.asarray(f, dtype=np.int64)) for v, f in pieces]
-    normals = [vertex_normals(v, f) for v, f in pieces]
-    every = np.concatenate([v for v, _ in pieces]) if pieces else np.zeros((0, 3))
-    every_normal = np.concatenate(normals) if pieces else np.zeros((0, 3))
-    owner = np.repeat(np.arange(len(pieces)), [len(v) for v, _ in pieces])
+    centroids, normals = [], []
+    for v, f in pieces:
+        corners = np.asarray(v, dtype=np.float64)[np.asarray(f, dtype=np.int64)].reshape(-1, 3, 3)
+        normal = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+        normals.append(normal / np.maximum(np.linalg.norm(normal, axis=1, keepdims=True), 1e-30))
+        centroids.append(corners.mean(axis=1))
+    every = np.concatenate(centroids) if centroids else np.zeros((0, 3))
+    every_normal = np.concatenate(normals) if normals else np.zeros((0, 3))
+    owner = np.repeat(np.arange(len(pieces)), [len(c) for c in centroids])
     out = []
-    for i, (v, f) in enumerate(pieces):
+    for i, (centroid, normal) in enumerate(zip(centroids, normals)):
         others = owner != i
-        mask = np.zeros(len(v), dtype=bool)
-        if others.any() and len(v):
-            distance, nearest = cKDTree(every[others]).query(v, distance_upper_bound=reach)
+        mask = np.zeros(len(centroid), dtype=bool)
+        if others.any() and len(centroid):
+            distance, nearest = cKDTree(every[others]).query(centroid, distance_upper_bound=reach)
             near = np.isfinite(distance)
-            facing = np.einsum("ij,ij->i", normals[i][near],
-                               every_normal[others][nearest[near]]) < opposed
-            mask[np.flatnonzero(near)[facing]] = True
-        out.append(mask[f].all(axis=1) if len(f) else np.zeros(0, dtype=bool))
+            mask[near] = np.einsum("ij,ij->i", normal[near],
+                                   every_normal[others][nearest[near]]) < opposed
+        out.append(mask)
     return out
 
 
