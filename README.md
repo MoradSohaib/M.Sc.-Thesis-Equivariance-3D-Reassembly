@@ -1008,8 +1008,8 @@ per category, test on the scans.
    `--remesh_smooth`, `--remesh_noise` and `--remesh_deform` wear, ripple and
    bend the breaks. `--remesh_probability` and `--augment_probability` decide
    which scenes are remeshed and perturbed and which stay as stored, exactly per
-   optimizer step: the sampler deals the shares, so 0.625 and 0.625 is 80
-   remeshed and perturbed and 48 as stored in every step of 128.
+   optimizer step: the sampler deals the shares, so 0.625 and 0.625 is 5
+   remeshed and perturbed and 3 as stored in every step of 8.
 4. **The fracture head.** `segment` in `--schedule` learns the true break and
    picks the cross-fragment tokens on the GPU from its prediction. Stage two
    matches the vertices it predicts. Each epoch prints its precision and recall

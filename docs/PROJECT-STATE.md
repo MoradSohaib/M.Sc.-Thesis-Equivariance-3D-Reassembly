@@ -1938,8 +1938,11 @@ file or a folder of them.
 
 **V8's run** (`docs/V8-RUN.md`) trains this from scratch: four intra layers,
 the fracture head and the fragment context, three cross–intra pairs, on Everyday
-with 48 stored and 80 perturbed scenes in every optimizer step of 128. Two
-changes make that exact and reportable:
+with 3 stored and 5 perturbed scenes in every optimizer step of 8 (the 48/80 of
+128 planned). A first run in steps of 128 stayed flat for 30 epochs: 750 steps,
+2% of v7's. On the synthetic slabs the schedule itself learns (four seeds: 1–66°
+against v7's 21–91° on dihedral labels), so the steps went back to v7's size.
+Two changes make the split exact and reportable:
 
 - **The sampler deals each scene its share** (`DealtShares`, `data/sampling.py`).
   Every step of `batch_size × accumulate` scenes on one GPU gets its shares

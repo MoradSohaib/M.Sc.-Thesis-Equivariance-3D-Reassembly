@@ -252,8 +252,9 @@ count, not just on average. One independent draw per scene would give 80 of 128
 give or take 5.5. Every GPU deals its own steps. An interrupted epoch restarts
 from its first step and is dealt the same again.
 
-- **Both at 0.625:** 48 of 128 scenes as stored and 80 remeshed and perturbed in
-  every step, as originally planned. This is V8's setting (`docs/V8-RUN.md`).
+- **Both at 0.625:** 3 of every 8 scenes as stored and 5 remeshed and perturbed
+  in every step: 48 and 80 of 128, as originally planned. This is V8's setting,
+  in steps of 8 (`docs/V8-RUN.md`: steps of 128 left too few of them).
 - **`--remesh_probability 1 --augment_probability 0.625`:** every scene is
   remeshed and 62.5% are perturbed. This keeps the stored scenes' shared
   vertices and mirror-image tessellation out of training, since no scan has
