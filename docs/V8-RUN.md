@@ -106,10 +106,18 @@ assembly, and the largest Fractura objects have 3–6M faces, so raise
 The architecture is four intra layers, then the fracture head (`segment`) and
 the fragment context (`global`), then three cross–intra pairs.
 
-Five of every eight scenes in each optimizer step are remeshed and perturbed,
-and three are as stored: the 80/48 of 128 planned, in steps of 8. The split is
-exact in every step, not just on average: the sampler deals each scene its share
-per step (`docs/SIM2REAL.md` §2.3). "Perturbed" means every setting of §6.3:
+**Every training scene is remeshed.** None is used as stored: stored scenes
+teach the network to match by mesh rather than by shape (below, and
+`docs/SIM2REAL.md` §2.5). The run has two stages:
+
+1. **Shape, 12 epochs.** Remeshed, nothing perturbed. On the samples this was
+   the one setting that learned to match pieces meshed on their own.
+2. **The planned mix, 28 epochs, from stage 1's weights.** 48 of every 128
+   scenes unperturbed and 80 perturbed, 3 and 5 of every 8 in each optimizer
+   step. The split is exact in every step, not just on average: the sampler
+   deals each scene its share (`docs/SIM2REAL.md` §2.3).
+
+"Perturbed" means every setting of §6.3:
 
 - opened (`--remesh_gap`);
 - worn smooth (`--remesh_smooth`);
@@ -117,36 +125,96 @@ per step (`docs/SIM2REAL.md` §2.3). "Perturbed" means every setting of §6.3:
 - rippled (`--remesh_noise`);
 - bent (`--remesh_deform`).
 
+From the first step, those scenes barely moved the network on the samples.
+Hence the first stage.
+
 ```bash
-TRAIN="--root_dir $BB --data_subsets everyday_compressed --max_fragments 20 \
-  --checkpoint_dir $OUT/checkpoint-v8 \
+COMMON="--root_dir $BB --data_subsets everyday_compressed --max_fragments 20 \
   --schedule intra intra intra intra segment global cross intra cross intra cross intra \
   --hidden_channels 128 \
   --contact_radius 0.015 \
   --remesh_edge 0.012 0.018 --remesh_gap 0.03 --remesh_smooth 3 --remesh_jitter 0.0005 \
-  --remesh_noise 0.001 --remesh_deform 0.003 \
-  --remesh_probability 0.625 --augment_probability 0.625 \
-  --w_consistency 0.5 \
-  --num_gpus 1 --batch_size 8 --micro_batch_scenes 4 --steps_per_epoch 400 --epochs 40 \
+  --remesh_noise 0.001 --remesh_deform 0.003 --remesh_probability 1 --val_remesh True \
+  --num_gpus 1 --batch_size 8 --micro_batch_scenes 4 --steps_per_epoch 400 \
   --val_steps 160 --num_workers 4 --time_budget_hours 11"
 
-python -m scripts.train $TRAIN --preflight     # memory, losses at init, time per step, sessions
-python -m scripts.train $TRAIN                 # train
+# Stage 1: shape
+STAGE1="$COMMON --checkpoint_dir $OUT/checkpoint-v8-shape --augment_probability 0 --epochs 12"
+python -m scripts.train $STAGE1 --preflight   # memory, losses at init, time per step, sessions
+python -m scripts.train $STAGE1
+
+# Stage 2: the mix, from stage 1's last epoch
+STAGE2="$COMMON --checkpoint_dir $OUT/checkpoint-v8c --augment_probability 0.625 \
+  --w_consistency 0.5 --epochs 28 --init_from $OUT/checkpoint-v8-shape/last.pt"
+python -m scripts.train $STAGE2
 ```
 
-- **The banner states the split:** `of each optimizer step's 8 scenes per GPU, 5
-  remeshed and 5 perturbed, the rest as stored (dealt by the sampler)`. On two
-  GPUs, keep `--batch_size 8` (per GPU) and halve `--steps_per_epoch` to 200.
+- **The banners state the split.** Stage 1 prints `8 remeshed, 0 of them
+  perturbed, none as stored` and `validation remeshed too, every scene, 0.0% of
+  them perturbed`. Stage 2 prints `8 remeshed, 5 of them perturbed, none as
+  stored (dealt by the sampler)` and `62.5% of them perturbed`. On two GPUs,
+  keep `--batch_size 8` (per GPU) and halve `--steps_per_epoch` to 200.
+- **What to watch in stage 1.** The training `embedding` term should fall from
+  its first value and validation `match@1` should rise above ~0.005 within the
+  first epochs. If neither moves by epoch 5, stop and read "If the curves stay
+  flat" below before going on.
+- **Stage 2 starts fresh** from the weights only: new optimizer, new schedule
+  and warmup, new history (`--init_from`). It takes `last.pt`, because
+  `best.pt` stays at its first epoch for as long as validation acc@5 reads 0.
+  It is untested; on the samples the first stage alone learned fastest. If
+  stage 2 loses what stage 1 learned (validation `match@1` falling for several
+  epochs), stage 1's checkpoint is the better model for the scans.
 - **Small steps, many of them.** An epoch is 400 steps of 8 scenes, 3,200 scenes,
-  about one pass over Everyday's training split. So 40 epochs is 16,000
-  optimizer steps; v7's defaults gave 32,000 steps of 4 scenes. A first V8 run
-  with steps of 128 scenes (25 per epoch) stayed flat for 30 epochs: that is 750
-  steps, 2% of v7's. Each scene brings thousands of vertex pairs to the
-  embedding term, so a step of 8 is already a low-noise gradient, and larger
-  steps buy little but cost steps. The learning rate and weight decay stay v7's
+  about one pass over Everyday's training split. So the 40 epochs are 16,000
+  optimizer steps; v7's defaults gave 32,000 steps of 4 scenes. Each scene
+  brings thousands of vertex pairs to the embedding term, so a step of 8 is
+  already a low-noise gradient. The learning rate and weight decay stay v7's
   (`--lr 1e-3`, `--weight_decay 1e-4`, warmup on). `--val_steps 160` is 1,280
   validation scenes (`--val_steps` counts steps of `--batch_size`).
-- **If the curves stay flat**, read the epoch lines before changing anything:
+- **`best.pt` is chosen on the remeshed validation scenes** (`--val_remesh`), so
+  it rewards matching by shape. Score `last.pt` too.
+- **To keep 48 scenes as stored**, as first planned, run one stage with
+  `--remesh_probability 0.625 --augment_probability 0.625 --w_consistency 0.5`
+  and no `--val_remesh`. It will learn Breaking Bad's meshes, which helps on
+  Breaking Bad's own test sets and not on the scans.
+- **Memory.** `--micro_batch_scenes` is the only batch setting peak memory
+  depends on. Raise it if preflight shows the headroom: it is faster and trains
+  the same thing (the embedding term is computed scene by scene).
+- **Across sessions.** Rerun the same command and it resumes from its
+  `--checkpoint_dir`'s `last.pt`. On Kaggle, add the previous session's output
+  as an input and append `--resume /kaggle/input/<that output>/<checkpoint dir>`.
+  An interrupted epoch restarts from its first step.
+- **What each stage writes.** `best.pt` (the epoch with the highest validation
+  acc@5), `last.pt`, and `history.json`.
+
+### Why the first two V8 runs stayed at chance
+
+Both runs, in steps of 128 and then of 8, kept validation at chance (geodesic
+126.6–126.9°, acc@5 0.000, match@1 0.004–0.006) for 30 epochs. Measured on the
+Breaking Bad samples (`docs/PROJECT-STATE.md` §22), two things held them there:
+
+1. **A fault in the embedding term, now fixed.** It drew its 1,024 anchors per
+   forward pass, not per scene, and an anchor trains only if one of its
+   positives is drawn with it. With four scenes a pass (`--micro_batch_scenes
+   4`) that left a fifth to a seventh of the anchors that train (643 against
+   3,176 on the samples as stored), and three quarters of each anchor's
+   negatives were other objects' vertices, which matching never compares. Each
+   scene now draws its own anchors and its own negatives; a pass of four trains
+   as four passes of one.
+2. **The stored scenes teach the mesh, not the shape.** Their two sides share
+   every break vertex and triangle. Trained on them, the network matched them
+   by tessellation, and matched the same scenes meshed on their own worse than
+   untrained. That is also why v7 is at chance on the scans. Remeshed and
+   unperturbed, the scenes taught matching by shape (match@1 on independently
+   meshed copies 0.004 → 0.034–0.040 in 400 steps). Remeshed and perturbed
+   from the first step, they barely moved it. Hence every scene remeshed, and
+   shape first, the perturbations after.
+
+The old logs cannot be compared with new ones: per scene, the logged embedding
+term reads lower and match@1 higher for the same model.
+
+- **If the curves stay flat anyway**, read the epoch lines before changing
+  anything:
   - Whether the training `embedding` loss falls. If it does not, the
     optimization is the problem.
   - What `fracture head: precision … recall …` reads. Stage two matches what the
@@ -160,15 +228,6 @@ python -m scripts.train $TRAIN                 # train
   acc@10 0.56–1.00), against 21–91° (median 68°) for v7's schedule on dihedral
   labels. A head weighted ten times more (`--w_segment 10`) segmented far better
   (AUC 0.89–0.98) but matched worse (80–110°), so leave `--w_segment` at 1.
-- **Memory.** `--micro_batch_scenes` is the only batch setting peak memory
-  depends on. Raise it if preflight shows the headroom, which is faster, with
-  the same steps.
-- **Across sessions.** Rerun the same command and it resumes from
-  `$OUT/checkpoint-v8/last.pt`. On Kaggle, add the previous session's output as
-  an input and append `--resume /kaggle/input/<that output>/checkpoint-v8`.
-  An interrupted epoch restarts from its first step.
-- **What the run writes.** `best.pt` (the epoch with the highest validation
-  acc@5), `last.pt`, and `history.json`.
 
 ## 3. Test on every Breaking Bad object the training did not see
 
@@ -177,7 +236,7 @@ the unseen objects are Everyday's val split and every object of the subsets not
 trained on. Every break pattern of 2–20 pieces is scored (`--modes_per_scene 0`).
 
 ```bash
-CKPT=$OUT/checkpoint-v8/best.pt
+CKPT=$OUT/checkpoint-v8c/best.pt
 TEST="--root_dir $BB --evaluate --checkpoint $CKPT --modes_per_scene 0 --max_fragments 20"
 
 python -m scripts.train $TEST --data_subsets everyday_compressed --split val \
@@ -219,7 +278,7 @@ Optional:
 ## 4. Figures per object category
 
 ```bash
-python -m scripts.make_figures --out $OUT/figures/v8-training --history V8=$OUT/checkpoint-v8/history.json
+python -m scripts.make_figures --out $OUT/figures/v8-training --history V8=$OUT/checkpoint-v8c/history.json
 python -m scripts.make_figures --out $OUT/figures/breaking_bad \
     --eval "Everyday val=$OUT/eval/everyday-val/val_metrics.json" \
     --eval "Artifact=$OUT/eval/artifact/all_metrics.json" \

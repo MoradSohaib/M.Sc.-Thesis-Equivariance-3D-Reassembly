@@ -32,6 +32,7 @@ implementing anything from it.
 | Above the benchmark range | `--min_fragments 21 --max_fragments 0` scores the patterns 2–20 leaves out; the two runs score every pattern once — see §19 |
 | Other datasets | Fractura and Fantastic Breaks converted into Breaking Bad's layout — cleaned, scaled, thinned to the training density unless the pieces share their breaks — and evaluated unchanged — see §20 |
 | Breaks that share no vertex | the embedding term's positives by distance (`--contact_radius`), each training piece remeshed on its own (`--remesh`) and its breaks opened as the scans' are (`--remesh_gap`), a new run from a checkpoint's weights (`--init_from`), `--evaluate --remesh`; one fine-tune, before the jitter's labels were fixed: `fractura_real` still at chance; the opening not yet trained — see §21 |
+| Sim to real (V8) | true breaks and the oracle, isotropic remeshing, worn/rippled/bent breaks, a fracture head, consistency, fragment context; the first two V8 runs stayed at chance: the embedding term drew its anchors per pass (fixed: per scene), and the stored scenes taught matching by mesh (now every training scene is remeshed, `--val_remesh`) — see §22 |
 
 ---
 
@@ -1969,3 +1970,131 @@ the whole suite, slow tests included, pass on CPU, and `--preflight` runs clean
 with every change on the tests' fixture. No model has been trained or scored on
 Breaking Bad or on the scans with these changes yet; the first numbers come from
 the run in `docs/V8-RUN.md`.
+
+### Why V8's runs stayed at chance (Oct 22)
+
+**The run** (reported by the user): V8's flags in steps of 8 (`--batch_size 8
+--micro_batch_scenes 4 --steps_per_epoch 400`, learning rate 1e-3), from
+scratch, on one GPU. After 32 epochs, 12,800 steps:
+
+- validation geodesic 126.6–126.9° in every epoch (chance 126.5°), acc@5 0.000,
+  match@1 0.004–0.006;
+- the training embedding term 6.41 → 5.88, the validation one 6.37 → 5.76;
+- the fracture head precision 0.26 → 0.30–0.59, recall 0.62–0.99 (the dihedral
+  labels: 0.35 and 1.00).
+
+The first run, in steps of 128, was as flat. Sixteen times the steps did not
+move it, so the steps were not what held it.
+
+**Ruled out, on the Breaking Bad samples.** Four of the five have 2–20 pieces
+(Bottle 15, Bowl 10, Cup 7, Mug 2).
+
+- **The positives.** An embedding made from the true assembled positions
+  scores match@1 1.00 on each scene, stored and remeshed. With four scenes in
+  one pass it scores 0.97–0.99.
+- **The other terms crowding out the embedding.** Untrained, the embedding
+  term's gradient has norm 16–58, the head's 1–5 and the consistency term's
+  0–2.4.
+- **V8's schedule.** Trained on the four scenes as stored, two a step, it
+  reached match@1 0.039 at step 175. v7's schedule reached 0.040 with the
+  coincidence term and 0.034 with positives by distance.
+
+**Cause 1: the anchors were drawn per pass, not per scene.** The contrastive
+term drew 1,024 anchors from the whole forward pass. Every other anchor of the
+pass was a negative. v7's runs had one scene a pass; V8's plan put four in each.
+An anchor trains only if one of its positives is drawn with it, so four scenes
+sharing a budget lost more than three quarters of what trains (SIM2REAL §2.4):
+
+| | anchors with a drawn positive |
+|---|---|
+| one scene a pass, as stored | 3,176 |
+| four in one pass, as stored | 643 (Bowl 38, Mug 15) |
+| one scene a pass, remeshed | 2,971 |
+| four in one pass, remeshed | 427 |
+
+Three quarters of each anchor's negatives were also other objects' vertices,
+which matching never compares. **Fixed:** both terms are computed scene by
+scene. Each scene draws its own anchors, its anchors' negatives are its own
+vertices, and its mean is weighted by its scored fragments. A pass of several
+scenes now gives the step that one pass of each gives: the relative difference
+is 5e-7, float32 round-off. `test_one_pass_of_two_scenes_steps_as_two_passes_of_one`
+checks it; its predecessor asserted that the two differ, calling that "the
+better behaviour". A pass of one scene is unchanged, its draw included, so
+v7's runs and checkpoints are unaffected. With several scenes a pass, the
+logged embedding term and match@1 now read per scene. Without other scenes'
+negatives, the same model reads a lower term and a higher match@1 than
+before, so the old logs cannot be compared with the new ones.
+
+**Cause 2: what the stored scenes teach.** The same harness shows what each
+training mix learns:
+
+- V8's schedule at 32 channels, 512 tokens, two scenes a step, learning rate
+  1e-3 on a cosine over 400 steps;
+- scored every 25 steps at the 0.015 radius, on the four scenes as stored, on
+  one fixed remeshed and perturbed draw of them, and on one fixed remeshed
+  draw. Neither draw is ever trained on.
+
+Chance is about 0.002–0.006.
+
+| trained on (two scenes a step) | step | as stored | remeshed and perturbed | remeshed, unperturbed |
+|---|---|---|---|---|
+| as stored only | 200 | 0.055 (term 5.54 → 4.21) | 0.002 (term 6.14 → 8.20) | |
+| 3 as stored, 5 remeshed and perturbed in 8 | 225 | 0.013–0.025 | 0.004 (term 5.75) | |
+| all remeshed and perturbed | 200 | 0.005 | 0.005 (term 5.64) | |
+| the same, positives within 0.03 | 125 | 0.005 | 0.002 | 0.001 |
+| all remeshed, none perturbed | 400 | 0.016 | | 0.034–0.040 (term 6.10 → 4.92) |
+| all remeshed, 5 in 8 perturbed | 150 | 0.005 | 0.004–0.008 | 0.002–0.008 (term 5.75) |
+
+- **Stored scenes teach the mesh.** Their two sides share every break vertex
+  and triangle, so a network can match them by tessellation alone, with no
+  notion of shape. Trained on them only, it matched them better and better
+  while it matched the same scenes meshed on their own worse than untrained:
+  the term rose from 6.14 to 8.20. This is v7's record: match@1 0.53–0.68 on
+  Breaking Bad and `bone_synthetic`, 0.012–0.017 on the scans (§21).
+- **A new tessellation alone is learnable.** Remeshed and nothing else, the
+  network learned to match pieces meshed on their own. On those, match@1 rose
+  0.004 → 0.034–0.040 in 400 steps, and the scenes as stored rose with it
+  (0.016), stored being just another mesh.
+- **Every perturbation from the first step is not, yet.** Remeshed and
+  perturbed, the scenes barely moved it in 200 steps. With V8's 3 stored in
+  8, the stored ones carried what learning there was, and that was the mesh.
+  Positives within 0.03 instead of 0.015 did not help.
+
+**The new setting: every training scene remeshed, shape first.** Two stages
+(`docs/V8-RUN.md` §2):
+
+1. 12 epochs remeshed with nothing perturbed (`--remesh_probability 1
+   --augment_probability 0`).
+2. 28 epochs of the planned mix from stage 1's weights (`--augment_probability
+   0.625 --w_consistency 0.5 --init_from`). That is 48 unperturbed and 80
+   perturbed of every 128, with no stored scene among them.
+
+`--val_remesh` validates both on the validation scenes remeshed the same way,
+with one draw per scene repeated every epoch, so `best.pt` rewards matching by
+shape (SIM2REAL §2.5).
+
+The mix alone, from scratch, was slow. By step 150 it had barely moved its term
+on the remeshed copies (5.83 → 5.75), with match@1 at noise level, while
+remeshing alone had lowered its term from 6.10 to 5.30 and went on to 0.034–0.040
+by step 400 (the mix was not run that far). Hence shape first. Stage 2 itself
+is untested. The harness only
+showed that stored-first is no start: stored-only weights carried into the mix
+lost their stored match@1 within 25 steps (0.055 → 0.012), since they were the
+mesh.
+
+**Not measured here.** These are memorization checks on four scenes, a 32-channel
+model and a few hundred steps. They rank the settings by how fast each starts
+learning. They say nothing of what a full run reaches on unseen objects or on
+the scans.
+
+**Checked here.** 630 tests pass, slow ones included, and 162 version markers.
+The new tests:
+
+- one pass of two scenes steps as two passes of one (`tests/test_training.py`);
+- another scene's vertices are neither positive nor negative, each scene keeps
+  its own anchors, and the scene weights weight each scene's mean
+  (`tests/test_contact.py`);
+- `--val_remesh` remeshes every validation scene by one draw that every epoch
+  repeats (`tests/test_sim2real.py`).
+
+The harness scripts are not in the repository.

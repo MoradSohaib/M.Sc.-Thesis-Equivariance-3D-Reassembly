@@ -293,7 +293,24 @@ class Config:
     remeshed and perturbed (48 of 128); with ``remesh_probability 1`` every
     scene is remeshed and 62.5% of them perturbed -- which keeps the stored
     scenes' shared vertices and mirror-image tessellation, which no scan has,
-    out of training. Validation is never augmented.
+    out of training. Validation is never augmented, unless ``val_remesh``.
+    """
+    val_remesh: bool = False
+    """
+    Validate on the validation scenes remeshed by the training settings --
+    every scene, ``augment_probability`` of them perturbed too, one draw per
+    scene, the same every epoch -- instead of as stored. With ``--remesh`` or
+    ``--remesh_edge``.
+
+    For a run meant for scans. Stored Breaking Bad scenes share their break
+    vertices, and a network can match them by their mesh alone: trained on
+    stored scenes only (the samples, V8's schedule), match@1 on them rose
+    0.006 -> 0.043 in 150 steps while on the same scenes remeshed the
+    embedding term rose above its untrained value (6.14 -> 7.99) and match@1
+    went to 0.001. Validated as stored, ``best.pt`` rewards that; validated
+    remeshed, it rewards matching by shape, which is what a scan needs. An
+    evaluation never takes it from a checkpoint: it is remeshed only when
+    asked (``--evaluate --remesh_edge ...``).
     """
     # No translation setting, and that is deliberate rather than an omission.
     # `build_scene` applies rotation only, then centres every fragment at its
@@ -455,11 +472,12 @@ class Config:
     it is ``--batch_size`` (scenes per step per GPU, as in Thesis 1) divided by
     ``--micro_batch_scenes``. The gradients of the passes in a step are summed,
     each weighted by its scored fragments, and divided by their total. The
-    trained term is contrastive and draws its negatives from its own pass, so
-    a step over 8 passes of 1 scene is not quite the step one pass over all 8
-    would take: there each scene's vertices are also negatives for the others.
-    Matching happens within a scene, so those extra negatives -- another
-    object's vertices -- are the ones that teach least.
+    trained term is computed scene by scene, each scene drawing its own anchors
+    and taking its negatives from itself, weighted by its scored fragments
+    (:func:`scene_weights`), so a step over 8 passes of 1 scene is the step one
+    pass over all 8 takes, to round-off and the anchors' draw. Until V8's first
+    runs it was not: one draw of 1024 anchors per pass, shared by its scenes,
+    left four scenes a fifth to a seventh of the anchors that train.
     """
     amp: bool = False
     perturb_on_device: bool = True
@@ -637,6 +655,9 @@ class Config:
             raise ValueError("remesh_jitter, remesh_gap, remesh_smooth, remesh_noise and "
                              "remesh_deform apply to remeshed pieces: give --remesh LOW HIGH "
                              "or --remesh_edge LOW HIGH (--remesh 1 1 keeps every face)")
+        if self.val_remesh and self.remesh is None and self.remesh_edge is None:
+            raise ValueError("val_remesh validates on scenes remeshed by the training "
+                             "settings: give --remesh_edge LOW HIGH (or --remesh LOW HIGH)")
         if self.w_consistency and self.remesh is None and self.remesh_edge is None:
             raise ValueError("w_consistency compares each scene with itself as stored, so it "
                              "needs scenes that are not: give --remesh or --remesh_edge")
@@ -793,14 +814,20 @@ class BreakingBadScenes:
         self.cache_size = cache_size
         # Each piece remeshed on its own (`data/remesh.py`): the training
         # split's augmentation, or what an evaluation asks for (`remesh`, a
-        # `Remesh`). Validation is never remeshed by the training settings.
-        if remesh is None and split == "train" and (config.remesh is not None
-                                                    or config.remesh_edge is not None):
+        # `Remesh`). Validation is remeshed by the training settings only with
+        # `val_remesh`.
+        validating = split == "val" and config.val_remesh
+        if remesh is None and (split == "train" or validating) and (
+                config.remesh is not None or config.remesh_edge is not None):
             low, high = config.remesh if config.remesh is not None else (1.0, 1.0)
+            # Validation (`val_remesh`): every scene remeshed, the training share
+            # of them perturbed, each by its own stream at epoch 0, so every
+            # epoch sees the same scenes.
             remesh = Remesh(low, high, config.remesh_jitter, config.remesh_gap,
                             edge=config.remesh_edge, smooth=config.remesh_smooth,
                             noise=config.remesh_noise, deform=config.remesh_deform,
-                            remesh_probability=config.remesh_probability,
+                            remesh_probability=1.0 if validating
+                            else config.remesh_probability,
                             augment_probability=config.augment_probability)
         if remesh is not None and config.label_method == "coincidence":
             raise ValueError("--label_method coincidence finds a break by its coincident "
@@ -1595,6 +1622,13 @@ def _forward(model, batch, criterion, config, keep=None, score=None, drop=0.0):
         chosen, renumbered, clusters = clustered_vertices(batch.cluster)
         if clusters:
             embeddings, cluster = prediction.vertex_embedding[chosen], renumbered
+            near = dict(scenes=batch.fragment_scene[batch.vertex_fragment[chosen]])
+    if embeddings is not None:
+        # The term is computed scene by scene (`nn/losses.py`), each scene's
+        # mean weighted by its scored fragments -- the weight a pass of that
+        # scene alone gets in the step -- so `--micro_batch_scenes` changes the
+        # memory a step takes, not what it trains.
+        near["scene_weights"] = scene_weights(batch)
 
     R = compared = scored = None
     scored_inputs = {}
@@ -1694,6 +1728,18 @@ def _extra_terms(model, batch, prediction, config, total, report, truth, known, 
         report["consistency"] = float(term.detach())
     report["total"] = float(total.detach())
     return total
+
+
+def scene_weights(batch):
+    """
+    ``(S,)`` each scene's scored fragments -- its fragments less its anchor,
+    :func:`reassembly.nn.anchor.scored_count` scene by scene: the weight a
+    pass of that scene alone carries in the step.
+    """
+    import torch
+
+    counts = torch.bincount(batch.fragment_scene, minlength=int(batch.num_scenes))
+    return (counts - 1).clamp(min=0).to(torch.float32)
 
 
 def _loss_fragments(batch, config) -> int:
@@ -2099,11 +2145,10 @@ def _attempt(model, batch, criterion, config, scaler, weight, forced):
         # scores count (`_loss_fragments`): every one but each scene's anchor.
         # It is the weighting nrhl and W10 were trained with: a scene weighs
         # in by its fragments, not one vote per scene as `loss / accumulate`
-        # would give it, and a scene holds 2 to 35 fragments. (For the
-        # geometric terms the removed head trained on, each a mean over
-        # fragments, it made 2 passes of 1 scene exactly one pass of 2; the
-        # contrastive term draws its negatives from its own pass, so for it no
-        # weighting can -- `test_the_contrastive_term_cannot_match_...`.)
+        # would give it, and a scene holds 2 to 35 fragments. With the
+        # contrastive term computed scene by scene and weighted the same way
+        # (`scene_weights`), 2 passes of 1 scene are one pass of 2 --
+        # `test_one_pass_of_two_scenes_steps_as_two_passes_of_one`.
         scaled = loss * weight
         (scaler.scale(scaled) if scaler else scaled).backward()
     return "ok", report, value
@@ -2631,7 +2676,7 @@ _DATA = ("label_method", "sharp_threshold", "tokens_per_scene", "token_mode",
          # What the embedding term is and what the training scenes look like.
          "contact_radius", "contact_band", "remesh", "remesh_jitter", "remesh_gap",
          "remesh_edge", "remesh_smooth", "remesh_noise", "remesh_deform",
-         "remesh_probability", "augment_probability")
+         "remesh_probability", "augment_probability", "val_remesh")
 # Data fields added after checkpoints were first written, read as what those
 # runs did: a checkpoint without `max_fragments` or `min_fragments` used every
 # break pattern, and one without the rest trained on coincidence clusters,
@@ -2641,12 +2686,13 @@ _DATA_BEFORE_IT_EXISTED = {"max_fragments": None, "min_fragments": None,
                            "remesh": None, "remesh_jitter": 0.0, "remesh_gap": 0.0,
                            "remesh_edge": None, "remesh_smooth": 0, "remesh_noise": 0.0,
                            "remesh_deform": 0.0, "remesh_probability": 1.0,
-                           "augment_probability": 1.0}
+                           "augment_probability": 1.0, "val_remesh": False}
 # Data fields that shape the TRAINING scenes only: a resume onto a change is
 # announced like any other, but an evaluation does not take them from the
 # checkpoint -- it is remeshed only when it is asked to be (`evaluate`).
 _TRAINING_ONLY = ("remesh", "remesh_jitter", "remesh_gap", "remesh_edge", "remesh_smooth",
-                  "remesh_noise", "remesh_deform", "remesh_probability", "augment_probability")
+                  "remesh_noise", "remesh_deform", "remesh_probability", "augment_probability",
+                  "val_remesh")
 
 
 def _resume_path(config: Config, default: Path) -> Optional[Path]:
@@ -2719,12 +2765,13 @@ def _fragment_limit_changed(saved: Dict, config: Config) -> bool:
     """
     Whether validation is a different set of scenes from the one the
     checkpoint's best was measured on, because ``max_fragments`` or
-    ``min_fragments`` differs. A checkpoint from before the settings existed
-    used every break pattern.
+    ``min_fragments`` differs, or ``val_remesh`` (the same scenes, remeshed or
+    not). A checkpoint from before the settings existed used every break
+    pattern, as stored.
     """
     saved = {**_DATA_BEFORE_IT_EXISTED, **saved}
     return any(saved.get(name) != getattr(config, name)
-               for name in ("max_fragments", "min_fragments"))
+               for name in ("max_fragments", "min_fragments", "val_remesh"))
 
 
 def _differs(a, b) -> bool:
@@ -3227,8 +3274,8 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
             # or discard best.pt for no reason.
             best = float("-inf")
             if main:
-                print("[resume] --max_fragments or --min_fragments changed: validation "
-                      "is a different set of scenes, so the best-so-far is reset")
+                print("[resume] --max_fragments, --min_fragments or --val_remesh changed: "
+                      "validation is a different set of scenes, so the best-so-far is reset")
         if main and load_path.resolve() != last_path.resolve():
             # Copy the resume point into *this* run's out_dir straight away.
             # Two failures otherwise break the chain: a session killed during
@@ -3668,7 +3715,10 @@ def _contact_banner(config: Config) -> List[str]:
             (config.remesh_noise, f", rippled by up to {config.remesh_noise:g}"),
             (config.remesh_jitter, f", jitter {config.remesh_jitter:g}")) if value)
         lines.append(f"  remeshed      each training piece on its own: {how}{moves}"
-                     "; validation as stored")
+                     + (f"; validation remeshed too, every scene, "
+                        f"{config.augment_probability:.1%} of them perturbed, the same "
+                        f"draw every epoch (--val_remesh)" if config.val_remesh
+                        else "; validation as stored"))
         if config.remesh_probability < 1 or config.augment_probability < 1:
             step = config.batch_size * config.accumulate
 
@@ -3676,10 +3726,21 @@ def _contact_banner(config: Config) -> List[str]:
                 scenes = step * share
                 return f"{scenes:.0f}" if scenes == round(scenes) else f"~{scenes:.1f}"
 
+            # One number decides both (`_decisions`), so the smaller share's
+            # scenes are among the larger's.
+            remeshed, perturbed = config.remesh_probability, config.augment_probability
+            left = 1.0 - max(remeshed, perturbed)
+            stored = "none as stored" if left <= 0 else f"{count(left)} as stored"
+            if remeshed == perturbed:
+                split = f"{count(remeshed)} remeshed and perturbed, {stored}"
+            elif perturbed < remeshed:
+                split = (f"{count(remeshed)} remeshed, {count(perturbed)} of them perturbed, "
+                         f"{stored}")
+            else:
+                split = (f"{count(perturbed)} perturbed, {count(remeshed)} of them remeshed, "
+                         f"{stored}")
             lines.append(f"                of each optimizer step's {step} scenes per GPU, "
-                         f"{count(config.remesh_probability)} remeshed and "
-                         f"{count(config.augment_probability)} perturbed, the rest as stored "
-                         f"(dealt by the sampler)")
+                         f"{split} (dealt by the sampler)")
     if config.init_from:
         lines.append(f"  init from     {config.init_from} (weights only"
                      + (", where they fit" if config.init_partial else "") + ")")

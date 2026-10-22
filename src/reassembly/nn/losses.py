@@ -287,6 +287,64 @@ def embedding_consistency_loss(
     return segment_mean(per_vertex.unsqueeze(-1), cluster, num_clusters).mean()
 
 
+def _scene_anchors(count: int, scenes: Optional[Tensor], max_anchors: int,
+                   generator: Optional[torch.Generator], device) -> list:
+    """
+    ``[(scene, index), ...]``: per scene, in scene order, the positions among
+    the ``count`` rows that belong to it, at most ``max_anchors`` of them drawn
+    at random (``scenes`` ``None``: all rows are one scene, scene 0).
+
+    The contrastive terms are computed scene by scene over these. Matching only
+    ever happens within a scene, so another scene's vertices are free negatives
+    that teach nothing, and one budget for a whole forward pass divided it
+    among the pass's scenes. An anchor trains only if one of its positives is
+    drawn with it, so the cut is steeper than the share: on four Breaking Bad
+    scenes, 430-640 anchors had a drawn positive in one pass of the four,
+    against about 3,000 in four passes of one (``--micro_batch_scenes 4``
+    against 1). With one scene the draw is the one it always was.
+    """
+    if scenes is None:
+        groups = [(0, torch.arange(count, device=device))]
+    else:
+        groups = [(int(scene), torch.nonzero(scenes == scene).flatten())
+                  for scene in torch.unique(scenes).tolist()]
+    out = []
+    for scene, own in groups:
+        if own.numel() > max_anchors:
+            own = own[torch.randperm(own.numel(), device=device,
+                                     generator=generator)[:max_anchors]]
+        out.append((scene, own))
+    return out
+
+
+def _scene_mean(parts: list, scene_weights: Optional[Tensor], empty: Tensor,
+                return_accuracy: bool):
+    """
+    One value from the per-scene terms ``parts`` (``[(scene, terms, hits)]``,
+    the kept anchors' terms and whether their nearest neighbour was a
+    positive): the mean over every kept anchor, or with ``scene_weights``
+    (indexed by scene) each scene's mean weighted by its weight -- training
+    passes each scene's scored fragments, so a forward pass of several scenes
+    gives the step one pass of each would. ``match@1`` is over every kept
+    anchor either way.
+    """
+    if not parts:
+        return (empty, empty) if return_accuracy else empty
+    if len(parts) == 1 or scene_weights is None:
+        loss = torch.cat([terms for _, terms, _ in parts]).mean()
+    else:
+        means = torch.stack([terms.mean() for _, terms, _ in parts])
+        which = torch.tensor([scene for scene, _, _ in parts], device=means.device)
+        weight = scene_weights.to(means.dtype)[which]
+        total = weight.sum()
+        loss = torch.where(total > 0, (weight * means).sum() / total.clamp(min=EPS),
+                           means.mean())
+    if not return_accuracy:
+        return loss
+    hits = torch.cat([hit for _, _, hit in parts])
+    return loss, hits.to(loss.dtype).mean()
+
+
 def correspondence_loss(
     embeddings: Tensor,
     cluster: Tensor,
@@ -295,6 +353,8 @@ def correspondence_loss(
     max_anchors: int = 1024,
     generator: Optional[torch.Generator] = None,
     return_accuracy: bool = False,
+    scenes: Optional[Tensor] = None,
+    scene_weights: Optional[Tensor] = None,
 ):
     """
     InfoNCE over coincidence clusters: coincident vertices close, others far.
@@ -342,6 +402,13 @@ def correspondence_loss(
     is a 4 MB matrix; the whole set would be gigabytes on the largest scenes,
     which is the same trap the cross-attention layer had.
 
+    Per scene (``scenes``, each row's scene; ``None`` is one scene): each scene
+    draws its own ``max_anchors`` and its anchors' negatives are its own
+    vertices, never another scene's -- matching never compares two scenes, so
+    those negatives taught nothing, and a pass of four scenes left each about
+    a quarter of one budget (:func:`_scene_anchors`). ``scene_weights``
+    weights each scene's mean (:func:`_scene_mean`).
+
     With ``return_accuracy`` it also reports the fraction of anchors whose
     nearest neighbour is a true coincidence partner. That is the number worth
     watching: it is exactly what stage two does at inference, it runs from
@@ -356,38 +423,38 @@ def correspondence_loss(
     anchors = torch.nonzero(cluster >= 0, as_tuple=False).flatten()
     if anchors.numel() < 2:
         return (empty, empty) if return_accuracy else empty
-    if anchors.numel() > max_anchors:
-        pick = torch.randperm(anchors.numel(), device=embeddings.device,
-                              generator=generator)[:max_anchors]
-        anchors = anchors[pick]
 
-    z = torch.nn.functional.normalize(embeddings[anchors], dim=-1)
-    labels = cluster[anchors]
-    similarity = (z @ z.t()) / temperature
+    parts = []
+    for scene, pick in _scene_anchors(anchors.numel(),
+                                      None if scenes is None else scenes[anchors],
+                                      max_anchors, generator, embeddings.device):
+        if pick.numel() < 2:
+            continue
+        chosen = anchors[pick]
+        z = torch.nn.functional.normalize(embeddings[chosen], dim=-1)
+        labels = cluster[chosen]
+        similarity = (z @ z.t()) / temperature
 
-    identity = torch.eye(len(anchors), dtype=torch.bool, device=z.device)
-    positive = (labels[:, None] == labels[None, :]) & ~identity
-    # An anchor whose cluster-mates all fell outside the subsample has no
-    # positive, so its log-ratio is undefined. Dropped rather than given a zero,
-    # which would quietly reward whatever the subsample happened to exclude.
-    keep = positive.any(dim=1)
-    if not bool(keep.any()):
-        return (empty, empty) if return_accuracy else empty
+        identity = torch.eye(len(chosen), dtype=torch.bool, device=z.device)
+        positive = (labels[:, None] == labels[None, :]) & ~identity
+        # An anchor whose cluster-mates all fell outside the subsample has no
+        # positive, so its log-ratio is undefined. Dropped rather than given a
+        # zero, which would quietly reward whatever the subsample happened to
+        # exclude.
+        keep = positive.any(dim=1)
+        if not bool(keep.any()):
+            continue
 
-    similarity = similarity.masked_fill(identity, float("-inf"))
-    denominator = torch.logsumexp(similarity, dim=1)
-    numerator = torch.logsumexp(
-        similarity.masked_fill(~positive, float("-inf")), dim=1
-    )
-    loss = (denominator - numerator)[keep].mean()
-    if not return_accuracy:
-        return loss
-
-    with torch.no_grad():
-        nearest = similarity.argmax(dim=1)
-        hit = positive[torch.arange(len(anchors), device=z.device), nearest]
-        accuracy = hit[keep].to(loss.dtype).mean()
-    return loss, accuracy
+        similarity = similarity.masked_fill(identity, float("-inf"))
+        denominator = torch.logsumexp(similarity, dim=1)
+        numerator = torch.logsumexp(
+            similarity.masked_fill(~positive, float("-inf")), dim=1
+        )
+        with torch.no_grad():
+            nearest = similarity.argmax(dim=1)
+            hit = positive[torch.arange(len(chosen), device=z.device), nearest][keep]
+        parts.append((scene, (denominator - numerator)[keep], hit))
+    return _scene_mean(parts, scene_weights, empty, return_accuracy)
 
 
 def proximity_loss(
@@ -401,6 +468,7 @@ def proximity_loss(
     max_anchors: int = 1024,
     generator: Optional[torch.Generator] = None,
     return_accuracy: bool = False,
+    scene_weights: Optional[Tensor] = None,
 ):
     """
     InfoNCE with the positives by distance -- for breaks whose two sides do
@@ -411,7 +479,8 @@ def proximity_loss(
     positives are the vertices of OTHER fragments of its scene within
     ``radius``; every other vertex of its scene within ``band * radius`` --
     the other side's just beyond the radius, the anchor's own neighbours -- is
-    neither a positive nor a negative; every other anchor is a negative::
+    neither a positive nor a negative; every other anchor of its scene is a
+    negative::
 
         L = -mean_i  log[ sum_{p in pos(i)} exp(s_ip / T)
                           / sum_{k not in ign(i), k != i} exp(s_ik / T) ]
@@ -424,8 +493,10 @@ def proximity_loss(
     beyond it, so the embedding is asked for the scale of the band, not of one
     vertex.
 
-    Anchors are subsampled to ``max_anchors`` as there, and an anchor none of
-    whose positives was drawn is left out. With ``return_accuracy``, also the
+    Anchors are subsampled to ``max_anchors`` per scene as there, the
+    negatives are the anchor's own scene's, and an anchor none of whose
+    positives was drawn is left out; ``scene_weights`` as there. With
+    ``return_accuracy``, also the
     share of anchors whose nearest neighbour in embedding space, the ignored
     ones excluded, is a positive -- stage two's question, read as ``match@1``.
     """
@@ -433,38 +504,33 @@ def proximity_loss(
     count = embeddings.shape[0]
     if count < 2:
         return (empty, empty) if return_accuracy else empty
-    index = torch.arange(count, device=embeddings.device)
-    if count > max_anchors:
-        index = torch.randperm(count, device=embeddings.device,
-                               generator=generator)[:max_anchors]
 
-    with torch.no_grad():
-        where = positions[index].to(torch.float64)
-        distance = (where[:, None, :] - where[None, :, :]).norm(dim=-1)
-        group, scene = groups[index], scenes[index]
-        identity = torch.eye(len(index), dtype=torch.bool, device=embeddings.device)
-        same_scene = scene[:, None] == scene[None, :]
-        positive = (same_scene & (group[:, None] != group[None, :])
-                    & (distance <= radius) & ~identity)
-        excluded = identity | (same_scene & (distance <= band * radius) & ~positive)
-        keep = positive.any(dim=1)
-    if not bool(keep.any()):
-        return (empty, empty) if return_accuracy else empty
+    parts = []
+    for scene, index in _scene_anchors(count, scenes, max_anchors, generator,
+                                       embeddings.device):
+        if index.numel() < 2:
+            continue
+        with torch.no_grad():
+            where = positions[index].to(torch.float64)
+            distance = (where[:, None, :] - where[None, :, :]).norm(dim=-1)
+            group = groups[index]
+            identity = torch.eye(len(index), dtype=torch.bool, device=embeddings.device)
+            positive = (group[:, None] != group[None, :]) & (distance <= radius) & ~identity
+            excluded = identity | ((distance <= band * radius) & ~positive)
+            keep = positive.any(dim=1)
+        if not bool(keep.any()):
+            continue
 
-    z = torch.nn.functional.normalize(embeddings[index], dim=-1)
-    similarity = (z @ z.t()) / temperature
-    candidates = similarity.masked_fill(excluded, float("-inf"))
-    denominator = torch.logsumexp(candidates, dim=1)
-    numerator = torch.logsumexp(similarity.masked_fill(~positive, float("-inf")), dim=1)
-    loss = (denominator - numerator)[keep].mean()
-    if not return_accuracy:
-        return loss
-
-    with torch.no_grad():
-        nearest = candidates.argmax(dim=1)
-        hit = positive[torch.arange(len(index), device=z.device), nearest]
-        accuracy = hit[keep].to(loss.dtype).mean()
-    return loss, accuracy
+        z = torch.nn.functional.normalize(embeddings[index], dim=-1)
+        similarity = (z @ z.t()) / temperature
+        candidates = similarity.masked_fill(excluded, float("-inf"))
+        denominator = torch.logsumexp(candidates, dim=1)
+        numerator = torch.logsumexp(similarity.masked_fill(~positive, float("-inf")), dim=1)
+        with torch.no_grad():
+            nearest = candidates.argmax(dim=1)
+            hit = positive[torch.arange(len(index), device=z.device), nearest][keep]
+        parts.append((scene, (denominator - numerator)[keep], hit))
+    return _scene_mean(parts, scene_weights, empty, return_accuracy)
 
 
 def consistency_loss(embeddings: Tensor, view_embeddings: Tensor, index: Tensor,
@@ -554,6 +620,7 @@ class ReassemblyLoss(torch.nn.Module):
         positions: Optional[Tensor] = None,
         groups: Optional[Tensor] = None,
         scenes: Optional[Tensor] = None,
+        scene_weights: Optional[Tensor] = None,
         keep: Optional[Tensor] = None,
         return_fragments: bool = False,
     ):
@@ -580,7 +647,11 @@ class ReassemblyLoss(torch.nn.Module):
         ``positions``, ``groups`` and ``scenes`` -- the anchors' assembled
         coordinates, fragments and scenes -- make the embedding term
         :func:`proximity_loss` (with ``contact_radius`` set); ``cluster`` and
-        ``num_clusters`` make it :func:`correspondence_loss`.
+        ``num_clusters`` make it :func:`correspondence_loss`, per scene when
+        ``scenes`` is given. Either is computed scene by scene, each scene's
+        mean weighted by ``scene_weights`` (``(S,)``, indexed by scene) when
+        given -- training passes each scene's scored fragments, so a forward
+        pass of several scenes steps as a pass of each would.
         """
         terms, fragments = {}, {}
         with torch.no_grad():
@@ -627,6 +698,7 @@ class ReassemblyLoss(torch.nn.Module):
                 embeddings, positions, groups, scenes, self.contact_radius,
                 band=self.contact_band, temperature=self.temperature,
                 max_anchors=self.max_anchors, return_accuracy=True,
+                scene_weights=scene_weights,
             )
             terms["embedding"] = embedding
             total = self.weights["embedding"] * embedding
@@ -634,7 +706,7 @@ class ReassemblyLoss(torch.nn.Module):
             embedding, match_top1 = correspondence_loss(
                 embeddings, cluster, num_clusters,
                 temperature=self.temperature, max_anchors=self.max_anchors,
-                return_accuracy=True,
+                return_accuracy=True, scenes=scenes, scene_weights=scene_weights,
             )
             terms["embedding"] = embedding
             total = self.weights["embedding"] * embedding

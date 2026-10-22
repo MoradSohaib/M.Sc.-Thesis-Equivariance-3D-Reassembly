@@ -130,6 +130,11 @@ HELP = {
                            "sampler deals every scene one number for both shares, exactly "
                            "per step: 0.625 and 0.625 with --batch_size 128 is 80 remeshed "
                            "and perturbed and 48 as stored in every step",
+    "val_remesh": "validate on the validation scenes remeshed by the training settings "
+                  "(every scene, --augment_probability of them perturbed, the same draw "
+                  "every epoch) instead of as stored, so best.pt rewards matching by "
+                  "shape -- stored scenes share their break vertices and can be matched "
+                  "by mesh alone; needs --remesh_edge",
     "match_metric": "how stage two compares embeddings: euclidean (v7's) or cosine (by "
                     "direction, as the contrastive term trains them); never taken from a "
                     "checkpoint, so one checkpoint can be scored both ways",

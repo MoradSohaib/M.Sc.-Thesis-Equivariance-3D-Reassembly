@@ -375,17 +375,57 @@ def test_the_criterion_takes_its_radius_and_band():
     assert (criterion.contact_radius, criterion.contact_band) == (0.5, 3.0)
 
 
-def test_vertices_of_another_scene_are_never_positives():
-    points = [[0, 0, 0], [0.1, 0, 0], [0, 0, 0], [0.1, 0, 0]]
-    z, p, g, s = _embedded(points, [0, 1, 2, 3], [0, 0, 1, 1])
+def test_another_scene_is_neither_positive_nor_negative():
+    """Two scenes at the very same place, three anchors each: an anchor's one
+    positive is its own scene's other piece, its negative the far vertex of its
+    own scene -- the other scene's vertices, coincident or not, are not in its
+    term at all. Matching never compares two scenes, so they would teach
+    nothing; and the term does not change when its scenes share a pass."""
+    points = [[0, 0, 0], [0.1, 0, 0], [5, 0, 0]] * 2
+    z, p, g, s = _embedded(points, [0, 1, 0, 2, 3, 2], [0, 0, 0, 1, 1, 1])
     loss = proximity_loss(z, p, g, s, radius=0.5)
     unit = torch.nn.functional.normalize(z, dim=-1)
     sim = unit @ unit.t() / 0.1
-    # Each anchor's one positive is its own scene's other piece; the other
-    # scene, at the very same place, is all negatives.
-    terms = [torch.logsumexp(sim[i, [k for k in range(4) if k != i]], 0) - sim[i, j]
-             for i, j in ((0, 1), (1, 0), (2, 3), (3, 2))]
+    terms = [torch.logsumexp(sim[i, others], 0) - sim[i, j]
+             for i, j, others in ((0, 1, [1, 2]), (1, 0, [0, 2]), (3, 4, [4, 5]), (4, 3, [3, 5]))]
     assert torch.isclose(loss, torch.stack(terms).mean())
+    first = proximity_loss(z[:3], p[:3], g[:3], s[:3], radius=0.5)
+    second = proximity_loss(z[3:], p[3:], g[3:], s[3:], radius=0.5)
+    assert torch.isclose(loss, (first + second) / 2)
+
+
+def test_each_scene_of_a_pass_draws_its_own_anchors():
+    """The budget is per scene: a scene sharing a pass with a large one keeps
+    every anchor it would have had alone (here all of them), where one budget
+    for the pass left it a share -- and an anchor trains only when one of its
+    positives is drawn with it."""
+    from reassembly.nn.losses import _scene_anchors
+
+    scenes = torch.tensor([0] * 3000 + [1] * 40)
+    drawn = dict(_scene_anchors(len(scenes), scenes, 1024, None, scenes.device))
+    assert len(drawn[0]) == 1024 and len(drawn[1]) == 40
+    assert bool((scenes[drawn[1]] == 1).all()) and bool((scenes[drawn[0]] == 0).all())
+    # One scene: the draw it always was.
+    torch.manual_seed(3)
+    alone = dict(_scene_anchors(3000, None, 1024, None, scenes.device))[0]
+    torch.manual_seed(3)
+    assert torch.equal(alone, torch.randperm(3000)[:1024])
+
+
+def test_scene_weights_weight_each_scene_s_mean():
+    points = [[0, 0, 0], [0.1, 0, 0], [5, 0, 0]] * 2
+    z, p, g, s = _embedded(points, [0, 1, 0, 2, 3, 2], [0, 0, 0, 1, 1, 1])
+    first = proximity_loss(z[:3], p[:3], g[:3], s[:3], radius=0.5)
+    second = proximity_loss(z[3:], p[3:], g[3:], s[3:], radius=0.5)
+    weighted = proximity_loss(z, p, g, s, radius=0.5,
+                              scene_weights=torch.tensor([1.0, 3.0], dtype=torch.float64))
+    assert torch.isclose(weighted, (first + 3 * second) / 4)
+    cluster = torch.tensor([0, 0, -1, 1, 1, -1])
+    pair = correspondence_loss(z, cluster, 2, scenes=s,
+                               scene_weights=torch.tensor([1.0, 3.0], dtype=torch.float64))
+    alone = [correspondence_loss(z[i:i + 3], cluster[i:i + 3] - (1 if i else 0), 1)
+             for i in (0, 3)]
+    assert torch.isclose(pair, (alone[0] + 3 * alone[1]) / 4)
 
 
 def test_with_exact_twins_and_no_band_it_is_the_coincidence_term():

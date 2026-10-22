@@ -1414,28 +1414,25 @@ def _batched_gradient(scenes, **overrides):
     return _grad_vector(model)
 
 
-def test_the_contrastive_term_cannot_match_a_real_batch_and_that_is_correct():
+def test_one_pass_of_two_scenes_steps_as_two_passes_of_one():
     """
-    The trained term does not decompose, stated so nobody tries to fix it:
-    `--micro_batch_scenes 1` over two passes is not the step one pass of two
-    scenes would take.
+    `--micro_batch_scenes` changes the memory a step takes, not what it trains:
+    one pass of two scenes gives the gradient two passes of one give.
 
-    InfoNCE draws its negatives from whatever is in the batch. Two scenes in one
-    batch see each other's vertices as negatives; the same two scenes forwarded
-    separately do not. No accumulation scheme can reproduce that -- it is a
-    property of contrastive objectives, not a defect. (The geometric terms the
-    removed rotation head trained on were means over fragments, and for them
-    the fragment weighting made the two identical.)
-
-    It is also the better behaviour here. Matching only ever happens *within* a
-    scene, so a scene's own fracture vertices are the real confusion set and
-    another object's are free negatives that teach nothing. Accumulation
-    tightens this term rather than weakening it.
+    It did not always. InfoNCE drew its anchors from the whole pass, so a scene
+    sharing a pass got a share of one budget, and their negatives too, so each
+    scene's vertices were negatives for the other's -- free ones, since
+    matching never compares two scenes. On four Breaking Bad scenes, a pass of
+    the four left 430-640 anchors with a drawn positive against about 3,000 in
+    four passes of one, and a V8 run of four-scene passes stayed at chance.
+    The term is now computed scene by scene, each scene's mean weighted by its
+    scored fragments, as the step weights a pass (`training.scene_weights`).
     """
     scenes = [_scene(1, fragments=2), _scene(2, fragments=8)]
-    cosine = torch.nn.functional.cosine_similarity(
-        _batched_gradient(scenes), _accumulated_gradient(scenes), dim=0)
-    assert cosine < 0.99, (
-        "the contrastive term matched a real batch exactly, which would mean the "
-        "negatives are no longer drawn from the batch — check correspondence_loss"
-    )
+    batched, accumulated = _batched_gradient(scenes), _accumulated_gradient(scenes)
+    cosine = torch.nn.functional.cosine_similarity(batched, accumulated, dim=0)
+    assert cosine > 0.99999, (
+        "a pass of two scenes no longer trains as two passes of one -- are the "
+        "contrastive terms drawing anchors or negatives across scenes again?")
+    # Equal to float32 round-off (5e-7 measured), not merely parallel.
+    assert float((batched - accumulated).norm() / accumulated.norm()) < 1e-5

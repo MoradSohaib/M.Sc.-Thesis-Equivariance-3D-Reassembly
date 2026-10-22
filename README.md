@@ -316,7 +316,7 @@ scripts/
 ├── tune_sharp_threshold.py        pick --sharp-threshold by F1
 └── visualize.py                   render or describe one scene
 
-tests/                             627 tests
+tests/                             630 tests
 ```
 
 Only `reassembly` is packaged; `scripts/` and `tests/` are entry points and
@@ -562,7 +562,9 @@ from there. Preflight checks the things that are:
 **Memory.** Of the batch settings, only `--micro_batch_scenes` (default 1)
 changes the peak: `--batch_size` is how many scenes go into an optimizer step,
 and they go through the GPU `--micro_batch_scenes` at a time with their
-gradients summed — the same step, bit for bit, as one big pass. Watch the
+gradients summed — the same step, to round-off, as one pass per scene (the
+embedding term is computed scene by scene: each scene draws its own anchors and
+its negatives are its own vertices). Watch the
 out-of-memory counts in the first epoch. A batch that runs out of memory is
 retried with gradient checkpointing and skipped only if that fails too, and the
 epoch summary says how many were rescued and how many skipped; more than a
@@ -1018,6 +1020,16 @@ per category, test on the scans.
    toward the same scene's as stored.
 6. **`global` in `--schedule`.** Every vertex hears its whole fragment.
 7. **`--init_partial`** carries a v7 run's weights into such a schedule.
+8. **The embedding term, scene by scene.** Each scene of a forward pass draws
+   its own anchors, and its anchors' negatives are its own vertices. Before,
+   one draw of 1,024 per pass was shared by its scenes; with four a pass
+   (`--micro_batch_scenes 4`) that left a fifth to a seventh of the anchors that
+   train, and V8's first two runs stayed at chance.
+9. **`--val_remesh`** validates on every validation scene remeshed (the
+   training share of them perturbed), the same draw every epoch, so `best.pt`
+   rewards matching by shape. Stored scenes share their break vertices, and a network trained on
+   them learns to match the mesh: on the samples, the better it matched the
+   stored scenes, the worse it matched the same scenes remeshed.
 
 ```bash
 pip install fast-simplification pymeshlab h5py && apt-get install -y libopengl0

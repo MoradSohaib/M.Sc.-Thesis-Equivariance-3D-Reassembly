@@ -468,7 +468,7 @@ def test_the_training_loader_deals_every_step_its_share_of_stored_scenes(tmp_pat
     built, again = scenes[(index, 0.9)], scenes.build(index, share=0.9)
     assert all(np.array_equal(a.target_vertices, b.target_vertices)
                for a, b in zip(built.fragments, again.fragments))
-    assert "of each optimizer step's 8 scenes per GPU, 5 remeshed and 5 perturbed" in \
+    assert "of each optimizer step's 8 scenes per GPU, 5 remeshed and perturbed, 3 as stored" in \
         "\n".join(_contact_banner(config))
     assert not isinstance(_loader(BreakingBadScenes(config, "val"), config, False, 0, 1,
                                   epoch=1).sampler, DealtShares)
@@ -476,6 +476,44 @@ def test_the_training_loader_deals_every_step_its_share_of_stored_scenes(tmp_pat
                     batch_size=2, accumulate=4, steps_per_epoch=12)
     assert not isinstance(_loader(BreakingBadScenes(every, "train"), every, True, 0, 1,
                                   epoch=1).sampler, DealtShares)
+
+
+def test_val_remesh_validates_on_every_scene_remeshed_the_same_way_each_epoch(tmp_path):
+    """
+    ``--val_remesh``: every validation scene remeshed by the training
+    settings, whatever ``--remesh_probability``, and ``--augment_probability``
+    of them perturbed, by one draw per scene that every epoch repeats -- and
+    the positives still found before anything moved. Without it validation is
+    as stored, and an evaluation never takes it from a checkpoint.
+    """
+    from reassembly.training import _TRAINING_ONLY, _contact_banner
+
+    root = _dataset(tmp_path / "data")
+    config = _config(root, remesh=(1.0, 1.0), remesh_gap=0.3, contact_radius=0.35,
+                     remesh_probability=0.625, augment_probability=1.0, val_remesh=True)
+    val = BreakingBadScenes(config, "val")
+    assert val.remesh is not None and val.remesh.remesh_probability == 1.0
+    stored = BreakingBadScenes(dataclasses.replace(config, val_remesh=False), "val")
+    assert stored.remesh is None
+    shared = BreakingBadScenes(dataclasses.replace(config, augment_probability=0.5), "val")
+    decided = [shared._decisions(shared.key(i)) for i in range(len(shared))]
+    assert all(remeshed for remeshed, _ in decided)
+    assert decided == [shared._decisions(shared.key(i)) for i in range(len(shared))]
+    for i in range(len(val)):
+        assert val._decisions(val.key(i)) == (True, True)
+        once, again = val.build(i), BreakingBadScenes(config, "val").build(i)
+        assert all(np.array_equal(a.target_vertices, b.target_vertices)
+                   for a, b in zip(once.fragments, again.fragments))
+        plain = stored.build(i)
+        assert not all(np.array_equal(a.target_vertices, b.target_vertices)
+                       for a, b in zip(once.fragments, plain.fragments))
+        assert once.contact is not None and once.contact.any()
+        assert once.contact_points is not None and once.view is None
+    assert "validation remeshed too, every scene, 100.0% of them perturbed" in \
+        "\n".join(_contact_banner(config))
+    assert "val_remesh" in _TRAINING_ONLY
+    with pytest.raises(ValueError, match="val_remesh"):
+        _config(root, contact_radius=0.35, val_remesh=True)
 
 
 def test_settings_that_cannot_work_are_refused(tmp_path):

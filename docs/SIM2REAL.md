@@ -7,10 +7,15 @@ to attack that gap, in the order they were planned, and then the runs that test
 them.
 
 Every change is **off by default**. With no new flag, training, evaluation and
-`probe_val.py` do exactly what v7 did. The one exception: stage two now spreads
-its matching candidates over the break (§1.2), and that only applies to
-fragments with more than 2,048 candidates. An old checkpoint loads and evaluates
-as before.
+`probe_val.py` do exactly what v7 did. Two exceptions:
+
+- stage two now spreads its matching candidates over the break (§1.2), and that
+  only applies to fragments with more than 2,048 candidates;
+- the embedding term is computed scene by scene (§2.4). That only changes a
+  forward pass of more than one scene (`--micro_batch_scenes` above 1), which
+  v7's runs did not use.
+
+An old checkpoint loads and evaluates as before.
 
 | | What | Flag(s) | Where |
 |---|---|---|---|
@@ -20,6 +25,8 @@ as before.
 | 2 | Isotropic remeshing, in training and conversion | `--remesh_edge LOW HIGH`, `convert_external --isotropic` | `data/remesh.py`, `data/external.py` |
 | 2 | Breaks worn, rippled, bent (plus v7's opening and jitter) | `--remesh_smooth`, `--remesh_noise`, `--remesh_deform` | `data/remesh.py` |
 | 2 | Exact shares per optimizer step: stored, remeshed, or perturbed | `--remesh_probability`, `--augment_probability` | `data/sampling.py`, `training.py` |
+| 2 | The embedding term scene by scene: each scene its own anchors and negatives | (always) | `nn/losses.py`, `training.py` |
+| 2 | Validation remeshed, so `best.pt` rewards matching by shape | `--val_remesh` | `training.py` |
 | 3 | Fracture head: learns the break, picks the tokens and the matched vertices | `segment` in `--schedule`, `--w_segment`, `--segment_gamma`, `--segment_teacher`, `--segment_threshold` | `nn/context.py`, `nn/model.py`, `training.py` |
 | 4 | Consistency between a scene and itself as stored | `--w_consistency` | `nn/losses.py`, `training.py` |
 | 5 | Fragment context for every vertex | `global` in `--schedule` | `nn/context.py` |
@@ -253,16 +260,93 @@ give or take 5.5. Every GPU deals its own steps. An interrupted epoch restarts
 from its first step and is dealt the same again.
 
 - **Both at 0.625:** 3 of every 8 scenes as stored and 5 remeshed and perturbed
-  in every step: 48 and 80 of 128, as originally planned. This is V8's setting,
-  in steps of 8 (`docs/V8-RUN.md`: steps of 128 left too few of them).
+  in every step: 48 and 80 of 128, as originally planned. V8's first runs used
+  it.
 - **`--remesh_probability 1 --augment_probability 0.625`:** every scene is
-  remeshed and 62.5% are perturbed. This keeps the stored scenes' shared
-  vertices and mirror-image tessellation out of training, since no scan has
-  them.
+  remeshed and 62.5% are perturbed: 48 unperturbed and 80 perturbed of 128.
+  This keeps the stored scenes' shared vertices and mirror-image tessellation
+  out of training, since no scan has them. It is V8's second stage now, in
+  steps of 8, after a first stage with `--augment_probability 0`: the stored
+  scenes taught the network to match by mesh, and perturbed scenes from the
+  first step taught it almost nothing (§2.5).
 
 The banner prints the counts per step. A scene rebuilt outside training, by a
 script, draws its own number from its own stream, as before. With both shares at
 1 nothing is dealt, and the remeshing draws what it always drew.
+
+### 2.4 The embedding term, scene by scene
+
+The contrastive term subsamples its anchors, 1,024 at a time, because its
+similarity matrix is quadratic in them. It used to draw them from the whole
+forward pass, and every other anchor of the pass was a negative. v7's runs had
+one scene a pass, so nothing changed for them. V8's first runs put four in each
+(`--micro_batch_scenes 4`), and that cut the term down:
+
+- An anchor trains only if one of its positives is drawn with it. Four scenes
+  sharing one budget each got about a quarter of the anchors, and far fewer
+  than a quarter with a positive drawn too.
+- Three quarters of each anchor's negatives were other objects' vertices.
+  Matching never compares two scenes, so those negatives taught nothing.
+
+On the four Breaking Bad samples with 2–20 pieces, the anchors with a drawn
+positive:
+
+| | Bottle | Bowl | Cup | Mug | All |
+|---|---|---|---|---|---|
+| One scene a pass, as stored | 823 | 1,018 | 1,001 | 335 | 3,176 |
+| Four in one pass, as stored | 472 | 38 | 118 | 15 | 643 |
+| One scene a pass, remeshed | 908 | 743 | 969 | 351 | 2,971 |
+| Four in one pass, remeshed | 97 | 223 | 87 | 20 | 427 |
+
+Both terms (`proximity_loss`, `correspondence_loss`) are now computed scene by
+scene:
+
+- each scene draws its own 1,024 anchors;
+- an anchor's negatives are its own scene's vertices;
+- each scene's mean is weighted by its scored fragments (its fragments less the
+  anchor), the weight a pass of that scene alone carries in the step.
+
+So a pass of several scenes gives the step one pass of each gives, to float32
+round-off and the anchors' draw. `--micro_batch_scenes` changes the memory, not
+what is trained. A pass of one scene is unchanged, its draw included.
+
+`tests/test_training.py::test_one_pass_of_two_scenes_steps_as_two_passes_of_one`
+compares the two steps (relative difference 5e-7; until this change the test
+asserted that they differ). `tests/test_contact.py` checks that another scene's
+vertices are neither positives nor negatives, that each scene keeps its own
+budget, and the weighting.
+
+### 2.5 Validation remeshed (`--val_remesh`)
+
+Stored Breaking Bad scenes share their break vertices, so the two sides of a
+break carry the same triangles. A network can match them by their mesh alone,
+with no notion of shape. Measured on the samples (V8's schedule, the four
+2–20-piece scenes, two a step), trained on the scenes as stored only:
+
+| step | as stored: embedding term, match@1 | the same scenes remeshed: embedding term, match@1 |
+|---|---|---|
+| 0 | 5.54, 0.006 | 6.14, 0.002 |
+| 75 | 4.84, 0.017 | 6.70, 0.003 |
+| 150 | 4.32, 0.043 | 7.99, 0.001 |
+
+The more it learned the stored scenes, the worse it did on the same scenes
+meshed on their own: the term rose well above its untrained value. That is
+v7's record too: match@1 0.53–0.68 on Breaking Bad and `bone_synthetic`,
+0.012–0.017 on the scans (`PROJECT-STATE.md` §21).
+
+Remeshed and nothing else, the scenes did teach it to match by shape: on the
+remeshed copies, match@1 rose 0.004 → 0.034–0.040 in 400 steps. Remeshed and
+perturbed from the first step, they barely moved it (0.005 at step 200). That
+is why V8 trains in two stages, shape first (`docs/V8-RUN.md` §2).
+
+Validation as stored rewards the mesh, and `best.pt` is chosen on it.
+`--val_remesh` validates on every validation scene remeshed by the training
+settings instead, `--augment_probability` of them perturbed too. Each scene
+gets one draw, its own, and every epoch repeats it, so the epochs are compared
+on the same scenes. An evaluation
+never takes it from a checkpoint: it is remeshed only when asked
+(`--evaluate --remesh_edge ...`, §6.4). Changing it on a resume resets the
+best-so-far, as a change of `--max_fragments` does.
 
 ---
 
@@ -429,7 +513,7 @@ S2R="--root_dir data --checkpoint_dir checkpoint-s2r \
   --schedule intra intra intra intra segment global cross intra cross intra cross intra \
   --contact_radius 0.015 \
   --remesh_edge 0.012 0.018 --remesh_gap 0.03 --remesh_smooth 3 --remesh_deform 0.003 \
-  --remesh_noise 0.001 --remesh_jitter 0.0005 --augment_probability 0.625 \
+  --remesh_noise 0.001 --remesh_jitter 0.0005 --augment_probability 0.625 --val_remesh True \
   --w_consistency 0.5 --num_workers 4"
 python -m scripts.train $S2R --preflight      # memory, losses at init, time per step
 python -m scripts.train $S2R                  # plus your usual flags
