@@ -671,7 +671,8 @@ Roughness is §7.2's measure, at each setting's own resolution.
 The recommended settings do three things: they even out the tessellation,
 remove the shared vertices, and open the contact as the scans' is open. V7's
 independent jitter roughens intact surfaces past every scan's (0.00050 against
-at most 0.00037).
+at most 0.00037). These rows were measured with the jitter on every vertex; it
+now moves only the break vertices and leaves intact surfaces as they are.
 
 ### 7.4 The scans as the model gets them
 

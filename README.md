@@ -316,7 +316,7 @@ scripts/
 ├── tune_sharp_threshold.py        pick --sharp-threshold by F1
 └── visualize.py                   render or describe one scene
 
-tests/                             630 tests
+tests/                             631 tests
 ```
 
 Only `reassembly` is packaged; `scripts/` and `tests/` are entry points and
@@ -923,8 +923,9 @@ Three settings, off by default, train for that:
 - `--remesh LOW HIGH`: each piece of every *training* scene is remeshed on its
   own whenever it is loaded — quadric edge collapse keeping a share of its
   faces drawn from `[LOW, HIGH]` (`data/remesh.py`) — and `--remesh_jitter S`
-  then moves every vertex by Gaussian noise of `S`, so no vertex is left where
-  its twin was. Before the noise, `--remesh_gap G` opens the breaks, as
+  then moves every break vertex (the vertices another piece shares) by Gaussian
+  noise of `S`, so no vertex is left where its twin was; the other vertices
+  stay. Before the noise, `--remesh_gap G` opens the breaks, as
   scanned breaks are open: each piece's break vertices move along the break's
   normal by a smooth random amount, inward or outward, around a mean opening
   drawn per scene from `[0, G]`; the vertices beside the break move with it,

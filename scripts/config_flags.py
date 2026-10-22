@@ -96,7 +96,8 @@ HELP = {
               "sides of a break no longer share their vertices; with --evaluate, "
               "score remeshed scenes. Needs fast-simplification",
     "remesh_jitter": "with --remesh: Gaussian noise of this standard deviation on "
-                     "every vertex after remeshing, in world units",
+                     "every break vertex (the vertices another piece shares) after "
+                     "remeshing, in world units; the other vertices stay",
     "remesh_gap": "with --remesh: open every break, as scanned breaks are open -- each "
                   "side moved along the break's normal by a smooth random amount, the "
                   "mean opening drawn per scene from [0, this], in world units",

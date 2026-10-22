@@ -97,29 +97,59 @@ def test_remeshing_is_repeatable_and_draws_each_piece_its_share(fractured_solid)
     # to label the pieces between the two.
     rng = np.random.default_rng(3)
     collapsed, kept = collapse_pieces(vertices, faces, rng, spec)
-    moved = jitter_pieces(collapsed, rng, spec.jitter)
+    moved = jitter_pieces(collapsed, break_masks(vertices, collapsed), rng, spec.jitter)
     assert all(np.array_equal(a, b) for a, b in zip(moved + kept, first[0] + first[1]))
     # With an opening, it comes between the two, on the breaks the pieces share.
     opened = Remesh(0.4, 0.9, jitter=1e-3, gap=0.3)
     rng = np.random.default_rng(3)
     collapsed, kept = collapse_pieces(vertices, faces, rng, opened)
-    moved = jitter_pieces(open_pieces(collapsed, kept, break_masks(vertices, collapsed), rng,
-                                      opened.gap), rng, opened.jitter)
+    breaks = break_masks(vertices, collapsed)
+    moved = jitter_pieces(open_pieces(collapsed, kept, breaks, rng, opened.gap), breaks, rng,
+                          opened.jitter)
     whole = remesh_pieces(vertices, faces, np.random.default_rng(3), opened)
     assert all(np.array_equal(a, b) for a, b in zip(moved + kept, whole[0] + whole[1]))
     assert all(np.array_equal(a, b) for a, b in zip(kept, first[1]))
     assert np.abs(np.concatenate(whole[0]) - np.concatenate(first[0])).max() > 0.01
-    # A piece too small to collapse keeps its faces, and the jitter still moves it.
+    # A piece too small to collapse keeps its faces, and the jitter still moves its
+    # break -- the face it shares with the piece beside it -- and nothing else.
     tiny_v = np.array([[1.0, 0, 0], [0, 1, 0], [0, 0, 1], [0, 0, 0]])
     tiny_f = np.array([[0, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2]])
     v, f = remesh_pieces([tiny_v, vertices[1]], [tiny_f, faces[1]], np.random.default_rng(3),
                          Remesh(0.4, 0.9))
     assert np.array_equal(f[0], tiny_f) and np.array_equal(v[0], tiny_v)
-    moved, _ = remesh_pieces([tiny_v], [tiny_f], np.random.default_rng(3), spec)
-    assert not np.array_equal(moved[0], tiny_v) and np.abs(moved[0] - tiny_v).max() < 0.01
+    beside_v = np.array([[1.0, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 1]])
+    beside_f = np.array([[0, 2, 1], [0, 1, 3], [1, 2, 3], [2, 0, 3]])
+    moved, _ = remesh_pieces([tiny_v, beside_v], [tiny_f, beside_f], np.random.default_rng(3),
+                             spec)
+    assert np.array_equal(moved[0][3], tiny_v[3]) and np.array_equal(moved[1][3], beside_v[3])
+    assert (moved[0][:3] != tiny_v[:3]).all() and np.abs(moved[0] - tiny_v).max() < 0.01
     # ... and the piece after it collapses as it does after a piece of any size.
     plain = remesh_pieces(vertices, faces, np.random.default_rng(3), Remesh(0.4, 0.9))
     assert np.array_equal(f[1], plain[1][1]) and np.array_equal(v[1], plain[0][1])
+
+
+def test_the_jitter_moves_the_break_and_nothing_else(fractured_solid):
+    """
+    ``--remesh_jitter`` moves the vertices another piece shares, so no twin is left, and
+    leaves every other vertex where it was. It draws the numbers it drew when it moved
+    every vertex: the break keeps its share of them.
+    """
+    from reassembly.mesh.fracture import fracture_vertex_masks
+
+    vertices = [np.asarray(m.vertices, float) for m in fractured_solid]
+    faces = [np.asarray(m.faces) for m in fractured_solid]
+    shared = fracture_vertex_masks(vertices)
+    # --remesh 1 1 keeps every face: the pieces as stored, then the jitter.
+    moved, same = remesh_pieces(vertices, faces, np.random.default_rng(3),
+                                Remesh(1.0, 1.0, jitter=1e-3))
+    rng = np.random.default_rng(3)
+    rng.uniform(1.0, 1.0, size=len(vertices))                 # the collapse's draw
+    for v0, f0, v1, f1, mask in zip(vertices, faces, moved, same, shared):
+        noise = rng.normal(0.0, 1e-3, v0.shape)
+        assert np.array_equal(f1, f0) and mask.any() and not mask.all()
+        assert np.array_equal(v1[~mask], v0[~mask])
+        assert np.array_equal(v1[mask], v0[mask] + noise[mask])
+    assert _shared(list(zip(moved, same))) == 0
 
 
 @pytest.mark.usefixtures("thinning")
@@ -492,9 +522,9 @@ def test_the_noise_moves_the_vertices_not_the_fracture_labels(tmp_path):
     """
     The dihedral test reads the jitter as fracture: on seven Breaking Bad
     scenes it flags 13-76% of the vertices as stored, 14-80% after the
-    collapse and 90-99.5% after jitter 0.001 -- the labels that place the
-    cross-attention tokens and bound stage two's matching. So they are
-    computed before the jitter. Here 0.02, about the share of this fixture's
+    collapse and 90-99.5% after jitter 0.001 on every vertex -- the labels
+    that place the cross-attention tokens and bound stage two's matching. So
+    they are computed before the jitter, which now moves the break only. Here 0.02, about the share of this fixture's
     edge (0.3) that 0.001 is of Breaking Bad's.
     """
     root = _dataset(tmp_path / "data")
@@ -506,10 +536,11 @@ def test_the_noise_moves_the_vertices_not_the_fracture_labels(tmp_path):
                for a, b in zip(moved.fragments, still.fragments))
     assert not all(np.allclose(a.target_vertices, b.target_vertices)
                    for a, b in zip(moved.fragments, still.fragments))
-    # Labelled after the jitter, the same pieces would be most of the surface.
+    # Labelled after the jitter, the same pieces would be flagged further: the
+    # jittered break and the faces beside it (23% -> 40% here).
     after = np.concatenate(noisy.labels(noisy.pieces(0)))
     before = np.concatenate([a.fracture for a in moved.fragments])
-    assert after.mean() > before.mean() + 0.2
+    assert after.mean() > before.mean() + 0.1
 
 
 @pytest.mark.usefixtures("thinning")

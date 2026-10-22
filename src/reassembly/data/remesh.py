@@ -17,7 +17,8 @@ keeps a share of its faces drawn uniformly from ``[low, high]`` -- quadric edge
 collapse (:func:`reassembly.mesh.decimate.simplify`), one draw per piece, so
 the two sides of a break collapse differently -- and then, with ``jitter``,
 Gaussian noise of that standard deviation (world units, an object's largest
-side being 1) moves every vertex, so none is left exactly where its twin was.
+side being 1) moves every break vertex (:func:`break_masks`), so none is left
+exactly where its twin was.
 The two steps are also separate functions, :func:`collapse_pieces` and
 :func:`jitter_pieces`, because the fracture labels have to be computed between
 them: the dihedral test reads the noise as fracture. On the seven scenes below
@@ -66,8 +67,8 @@ class Remesh(NamedTuple):
     that many smoothing steps (:func:`smooth_pieces`); with ``deform``, bent
     by a slow field of up to that amplitude (:func:`deform_pieces`); then, after
     the fracture labels are read, with ``noise``, rippled along the normal by
-    a spatially correlated field (:func:`noise_pieces`); and every vertex moved
-    by Gaussian noise of ``jitter``.
+    a spatially correlated field (:func:`noise_pieces`); and every break vertex
+    moved by Gaussian noise of ``jitter``.
 
     ``remesh_probability`` and ``augment_probability`` are the shares of the
     scenes remeshed and perturbed (one number per scene and epoch decides both:
@@ -193,14 +194,20 @@ def collapse_pieces(vertices: Sequence[np.ndarray], faces: Sequence[np.ndarray],
     return out_vertices, out_faces
 
 
-def jitter_pieces(vertices: Sequence[np.ndarray], rng: np.random.Generator,
-                  jitter: float) -> List[np.ndarray]:
-    """Every vertex moved by Gaussian noise of standard deviation ``jitter``,
-    piece by piece in order; 0 leaves them where they are."""
+def jitter_pieces(vertices: Sequence[np.ndarray], breaks: Sequence[np.ndarray],
+                  rng: np.random.Generator, jitter: float) -> List[np.ndarray]:
+    """Every piece's break vertices (``breaks``) moved by Gaussian noise of
+    standard deviation ``jitter``, piece by piece in order; the other vertices
+    stay where they are. Draws the same numbers whatever the masks hold; 0
+    leaves the pieces where they are."""
     vertices = [np.asarray(v, dtype=np.float64) for v in vertices]
     if not jitter:
         return vertices
-    return [v + rng.normal(0.0, jitter, v.shape) for v in vertices]
+    out = []
+    for v, mask in zip(vertices, breaks):
+        noise = rng.normal(0.0, jitter, v.shape)
+        out.append(v + np.asarray(mask, dtype=bool)[:, None] * noise)
+    return out
 
 
 def carry_masks(stored: Sequence[np.ndarray], masks: Sequence[np.ndarray],
@@ -690,7 +697,7 @@ def remesh_scene(vertices: Sequence[np.ndarray], faces: Sequence[np.ndarray],
         return closed, closed, closed, faces
     breaks = None
     surface = closed
-    if spec.gap or spec.smooth:
+    if spec.gap or spec.smooth or spec.jitter:
         breaks = break_masks(vertices, closed)
     if spec.gap:
         surface = open_pieces(surface, faces, breaks, rng, spec.gap)
@@ -699,7 +706,7 @@ def remesh_scene(vertices: Sequence[np.ndarray], faces: Sequence[np.ndarray],
     if spec.deform:
         surface = deform_pieces(surface, rng, spec.deform)
     moved = noise_pieces(surface, faces, rng, spec.noise) if spec.noise else surface
-    return closed, surface, jitter_pieces(moved, rng, spec.jitter), faces
+    return closed, surface, jitter_pieces(moved, breaks, rng, spec.jitter), faces
 
 
 def remesh_pieces(vertices: Sequence[np.ndarray], faces: Sequence[np.ndarray],
@@ -709,9 +716,9 @@ def remesh_pieces(vertices: Sequence[np.ndarray], faces: Sequence[np.ndarray],
     ``(vertices, faces)`` per piece, each remeshed on its own (module
     docstring): :func:`collapse_pieces`; with ``spec.gap``, :func:`open_pieces`
     on the breaks the input pieces share (:func:`break_masks`); then
-    :func:`jitter_pieces` with ``spec.jitter`` -- from the same generator. The
-    opening and the jitter move the vertices, never the faces. The rest of
-    ``spec`` as :func:`remesh_scene` applies it.
+    :func:`jitter_pieces` with ``spec.jitter`` on the same breaks -- from the
+    same generator. The opening and the jitter move the vertices, never the
+    faces. The rest of ``spec`` as :func:`remesh_scene` applies it.
     """
     _closed, _surface, moved, faces = remesh_scene(vertices, faces, rng, spec)
     return moved, faces

@@ -230,10 +230,12 @@ class Config:
     """
     remesh_jitter: float = 0.0
     """With ``remesh``: Gaussian noise of this standard deviation on every
-    vertex after remeshing, in world units, so no vertex is left exactly where
-    its twin was (0.001: none of seven Breaking Bad scenes kept one). 0: none.
-    The fracture labels are computed before it: on those scenes 0.001 made the
-    dihedral test flag 90% to 99.5% of the vertices."""
+    break vertex after remeshing -- the vertices another piece shares, carried
+    over to the remeshed pieces (:func:`reassembly.data.remesh.break_masks`);
+    the other vertices stay -- in world units, so no vertex is left exactly
+    where its twin was (0.001: none of seven Breaking Bad scenes kept one).
+    0: none. The fracture labels are computed before it: on those scenes 0.001
+    on every vertex made the dihedral test flag 90% to 99.5% of the vertices."""
     remesh_gap: float = 0.0
     """
     With ``remesh``: open the breaks of every training scene, as scanned
