@@ -172,7 +172,9 @@ python -m scripts.train $STAGE2
   (`--lr 1e-3`, `--weight_decay 1e-4`, warmup on). `--val_steps 160` is 1,280
   validation scenes (`--val_steps` counts steps of `--batch_size`).
 - **`best.pt` is chosen on the remeshed validation scenes** (`--val_remesh`), so
-  it rewards matching by shape. Score `last.pt` too.
+  it rewards matching by shape. Score `last.pt` too. `--augment_probability`'s
+  share of them is perturbed; `--val_augment_probability 1` perturbs all of them
+  and leaves the training mix as it is.
 - **To keep 48 scenes as stored**, as first planned, run one stage with
   `--remesh_probability 0.625 --augment_probability 0.625 --w_consistency 0.5`
   and no `--val_remesh`. It will learn Breaking Bad's meshes, which helps on

@@ -1027,7 +1027,8 @@ per category, test on the scans.
    (`--micro_batch_scenes 4`) that left a fifth to a seventh of the anchors that
    train, and V8's first two runs stayed at chance.
 9. **`--val_remesh`** validates on every validation scene remeshed (the
-   training share of them perturbed), the same draw every epoch, so `best.pt`
+   training share of them perturbed, or `--val_augment_probability`'s: 1
+   perturbs every one), the same draw every epoch, so `best.pt`
    rewards matching by shape. Stored scenes share their break vertices, and a network trained on
    them learns to match the mesh: on the samples, the better it matched the
    stored scenes, the worse it matched the same scenes remeshed.

@@ -132,10 +132,14 @@ HELP = {
                            "per step: 0.625 and 0.625 with --batch_size 128 is 80 remeshed "
                            "and perturbed and 48 as stored in every step",
     "val_remesh": "validate on the validation scenes remeshed by the training settings "
-                  "(every scene, --augment_probability of them perturbed, the same draw "
-                  "every epoch) instead of as stored, so best.pt rewards matching by "
-                  "shape -- stored scenes share their break vertices and can be matched "
-                  "by mesh alone; needs --remesh_edge",
+                  "(every scene, --augment_probability of them perturbed, or "
+                  "--val_augment_probability of them, the same draw every epoch) instead of "
+                  "as stored, so best.pt rewards matching by shape -- stored scenes share "
+                  "their break vertices and can be matched by mesh alone; needs --remesh_edge",
+    "val_augment_probability": "with --val_remesh: the share of the validation scenes "
+                               "perturbed, in place of --augment_probability's training share "
+                               "(1 = every one; the training mix is unchanged); each scene "
+                               "keeps one draw, the same every epoch",
     "match_metric": "how stage two compares embeddings: euclidean (v7's) or cosine (by "
                     "direction, as the contrastive term trains them); never taken from a "
                     "checkpoint, so one checkpoint can be scored both ways",
@@ -222,6 +226,8 @@ class _Refused(argparse.Action):
 # Integer settings whose default is None, "no limit" -- 0 on the command line.
 _OPTIONAL_INTS = ("modes_per_scene", "limit_train", "max_objects", "max_fragments",
                   "min_fragments")
+# Float settings whose default is None, another setting's value: left out, it applies.
+_OPTIONAL_FLOATS = {"val_augment_probability": "--augment_probability's share"}
 
 
 def add_config_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -251,6 +257,9 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         elif name in CHOICES:
             parser.add_argument(option, dest=name, choices=CHOICES[name], default=None,
                                 help=(text + "; " if text else "") + f"default {current}")
+        elif name in _OPTIONAL_FLOATS:
+            parser.add_argument(option, dest=name, type=float, default=None, metavar=metavar,
+                                help=f"{text}; default {_OPTIONAL_FLOATS[name]}")
         elif name in _OPTIONAL_INTS or isinstance(current, int):
             parser.add_argument(option, dest=name, type=int, default=None, metavar=metavar,
                                 help=(text + "; " if text else "") + f"default {current}")

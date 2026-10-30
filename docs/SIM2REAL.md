@@ -26,7 +26,7 @@ An old checkpoint loads and evaluates as before.
 | 2 | Breaks worn, rippled, bent (plus v7's opening and jitter) | `--remesh_smooth`, `--remesh_noise`, `--remesh_deform` | `data/remesh.py` |
 | 2 | Exact shares per optimizer step: stored, remeshed, or perturbed | `--remesh_probability`, `--augment_probability` | `data/sampling.py`, `training.py` |
 | 2 | The embedding term scene by scene: each scene its own anchors and negatives | (always) | `nn/losses.py`, `training.py` |
-| 2 | Validation remeshed, so `best.pt` rewards matching by shape | `--val_remesh` | `training.py` |
+| 2 | Validation remeshed, so `best.pt` rewards matching by shape; its own share perturbed | `--val_remesh`, `--val_augment_probability` | `training.py` |
 | 3 | Fracture head: learns the break, picks the tokens and the matched vertices | `segment` in `--schedule`, `--w_segment`, `--segment_gamma`, `--segment_teacher`, `--segment_threshold` | `nn/context.py`, `nn/model.py`, `training.py` |
 | 4 | Consistency between a scene and itself as stored | `--w_consistency` | `nn/losses.py`, `training.py` |
 | 5 | Fragment context for every vertex | `global` in `--schedule` | `nn/context.py` |
@@ -347,6 +347,15 @@ on the same scenes. An evaluation
 never takes it from a checkpoint: it is remeshed only when asked
 (`--evaluate --remesh_edge ...`, §6.4). Changing it on a resume resets the
 best-so-far, as a change of `--max_fragments` does.
+
+`--val_augment_probability` sets the perturbed share for validation alone.
+With `--val_augment_probability 1` every validation scene is perturbed, while
+training keeps its mix (with both shares at 0.625, 48 as stored and 80
+perturbed in every step of 128).
+Left out, validation takes `--augment_probability`'s share, as before. Each
+scene keeps its one draw, and the amounts are drawn from zero up to each
+setting, so some scenes are barely perturbed. A resume onto a different share
+also resets the best-so-far.
 
 ---
 

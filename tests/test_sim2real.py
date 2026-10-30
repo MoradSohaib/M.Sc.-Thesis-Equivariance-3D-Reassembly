@@ -516,6 +516,76 @@ def test_val_remesh_validates_on_every_scene_remeshed_the_same_way_each_epoch(tm
         _config(root, contact_radius=0.35, val_remesh=True)
 
 
+def test_val_augment_probability_sets_the_share_of_validation_scenes_perturbed(tmp_path, capsys):
+    """
+    ``--val_augment_probability``: with ``--val_remesh``, the share of the
+    validation scenes perturbed in place of the training share -- 1 perturbs
+    every one while training keeps its mix -- by the same one draw per scene.
+    Left out, validation follows ``--augment_probability`` as before. Refused
+    without ``--val_remesh`` or outside [0, 1]. A resume onto another share is
+    announced and resets the best-so-far; the same share spelled out is no
+    change, and an evaluation never takes it from a checkpoint.
+    """
+    from reassembly.training import (_DATA, _TRAINING_ONLY, _check_resume_compatible,
+                                     _contact_banner, _fragment_limit_changed,
+                                     validation_perturbed)
+    from scripts.config_flags import config_flags
+    from scripts.train import build_parser, config_from_args
+
+    root = _dataset(tmp_path / "data")
+    mix = dict(remesh=(1.0, 1.0), remesh_gap=0.3, contact_radius=0.35,
+               remesh_probability=0.625, augment_probability=0.625, val_remesh=True)
+    follows = _config(root, **mix)
+    every = _config(root, **mix, val_augment_probability=1.0)
+    assert (validation_perturbed(follows), validation_perturbed(every)) == (0.625, 1.0)
+    assert validation_perturbed(dataclasses.replace(every, val_remesh=False,
+                                                    val_augment_probability=None)) is None
+
+    val = BreakingBadScenes(every, "val")
+    assert (val.remesh.remesh_probability, val.remesh.augment_probability) == (1.0, 1.0)
+    assert all(val._decisions(val.key(i)) == (True, True) for i in range(len(val)))
+    train = BreakingBadScenes(every, "train")
+    assert (train.remesh.remesh_probability, train.remesh.augment_probability) == (0.625, 0.625)
+    assert BreakingBadScenes(follows, "val").remesh.augment_probability == 0.625
+    unperturbed = BreakingBadScenes(dataclasses.replace(every, val_augment_probability=0.0), "val")
+    assert all(unperturbed._decisions(unperturbed.key(i)) == (True, False)
+               for i in range(len(unperturbed)))
+    for i in range(len(val)):
+        once, again = val.build(i), BreakingBadScenes(every, "val").build(i)
+        assert all(np.array_equal(a.target_vertices, b.target_vertices)
+                   for a, b in zip(once.fragments, again.fragments))
+        plain = unperturbed.build(i)
+        assert not all(np.array_equal(a.target_vertices, b.target_vertices)
+                       for a, b in zip(once.fragments, plain.fragments))
+    assert ("every scene, 100.0% of them perturbed, the same draw every epoch "
+            "(--val_remesh, --val_augment_probability)") in "\n".join(_contact_banner(every))
+    assert "62.5% of them perturbed, the same draw every epoch (--val_remesh)" in \
+        "\n".join(_contact_banner(follows))
+
+    with pytest.raises(ValueError, match="give --val_remesh True"):
+        _config(root, **{**mix, "val_remesh": False}, val_augment_probability=1.0)
+    with pytest.raises(ValueError, match="a share of the scenes"):
+        _config(root, **mix, val_augment_probability=1.5)
+
+    parse = lambda argv: config_from_args(build_parser().parse_args(argv))  # noqa: E731
+    base = ["--remesh_edge", "0.012", "0.018", "--val_remesh", "True"]
+    assert parse(base).val_augment_probability is None
+    assert parse(base + ["--val_augment_probability", "1"]).val_augment_probability == 1.0
+    written = config_flags(every, fields=("val_augment_probability",))
+    assert written == ["--val_augment_probability", "1.0"]
+    assert parse(base + written).val_augment_probability == 1.0
+
+    assert "val_augment_probability" in _DATA and "val_augment_probability" in _TRAINING_ONLY
+    saved = dataclasses.asdict(follows)
+    assert _fragment_limit_changed(saved, every)
+    assert not _fragment_limit_changed(saved, dataclasses.replace(follows,
+                                                                  val_augment_probability=0.625))
+    before = {k: v for k, v in saved.items() if k != "val_augment_probability"}
+    assert not _fragment_limit_changed(before, follows)        # a checkpoint from before it
+    _check_resume_compatible(every, before, announce=True)
+    assert "val_augment_probability: None -> 1.0" in capsys.readouterr().out
+
+
 def test_settings_that_cannot_work_are_refused(tmp_path):
     root = _dataset(tmp_path / "data")
     with pytest.raises(ValueError, match="after segment"):
