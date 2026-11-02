@@ -37,10 +37,11 @@ from reassembly.data.scene import BREAK_FILE, SceneReader, write_scene  # noqa: 
 from reassembly.data.transforms import random_rotations  # noqa: E402
 from reassembly.mesh.clean import edge_counts  # noqa: E402
 from reassembly.mesh.decimate import edge_lengths  # noqa: E402
-from reassembly.nn.context import (FALLBACK_TOKENS, _allocate, segment_loss,  # noqa: E402
-                                   select_tokens)
+from reassembly.nn.context import (FALLBACK_TOKENS, FractureHead, _allocate,  # noqa: E402
+                                   segment_loss, select_tokens)
 from reassembly.nn.losses import consistency_loss  # noqa: E402
 from reassembly.nn.model import ReassemblyNet  # noqa: E402
+from reassembly.nn.schedule import SEGMENT_HEADS  # noqa: E402
 from reassembly.training import (BreakingBadScenes, Config, _collate_samples,  # noqa: E402
                                  _forward, _start_from, build_criterion, build_model,
                                  save_checkpoint)
@@ -604,8 +605,13 @@ def test_settings_that_cannot_work_are_refused(tmp_path):
         _config(root, remesh=(0.5, 0.9), augment_probability=1.5)
     with pytest.raises(ValueError, match="remesh_edge is two edge lengths"):
         _config(root, remesh_edge=(0.02, 0.01))
+    with pytest.raises(ValueError, match="give a segment layer"):
+        _config(root, segment_head="nonlinear")
+    with pytest.raises(ValueError, match="linear or nonlinear"):
+        _config(root, segment_head="mlp", schedule=("intra", "segment", "cross"))
     _config(root, label_method="marked", remesh_edge=(0.01, 0.02), remesh_smooth=2,
             schedule=("intra", "segment", "global", "cross", "intra"))
+    _config(root, segment_head="nonlinear", schedule=("intra", "segment", "cross"))
 
 
 # --------------------------------------------------------------------------
@@ -615,9 +621,10 @@ def test_settings_that_cannot_work_are_refused(tmp_path):
 SCHEDULE = ("intra", "intra", "segment", "global", "cross", "intra", "cross", "intra", "global")
 
 
-def _net(schedule=SCHEDULE):
+def _net(schedule=SCHEDULE, segment_head="linear"):
     torch.manual_seed(0)
-    return ReassemblyNet(channels=16, heads=4, schedule=schedule).to(DTYPE)
+    return ReassemblyNet(channels=16, heads=4, schedule=schedule,
+                         segment_head=segment_head).to(DTYPE)
 
 
 def _run(net, batch, mask=None, budget=40):
@@ -628,15 +635,18 @@ def _run(net, batch, mask=None, budget=40):
                token_mask=mask, tokens_per_scene=budget)
 
 
-def test_the_fracture_head_and_the_context_keep_the_network_equivariant_per_fragment():
+@pytest.mark.parametrize("segment_head", SEGMENT_HEADS)
+def test_the_fracture_head_and_the_context_keep_the_network_equivariant_per_fragment(
+        segment_head):
     """
     Each fragment tumbled by its own rotation: its features turn with it, its
     embedding and its fracture logits do not move, and the network picks the
     same tokens -- the choice reads the logits and distances within one
     fragment, all invariant. (The spheres here are symmetric, so many
     candidates tie; the ties are broken by vertex order, not by round-off.)
+    With either fracture head.
     """
-    net = _net()
+    net = _net(segment_head=segment_head)
     rotations = random_rotations(3, np.random.default_rng(9))
     identity = np.repeat(np.eye(3)[None], 3, axis=0)
     still = collate([_sample(3, rotations=identity)], dtype=DTYPE)
@@ -651,6 +661,42 @@ def test_the_fracture_head_and_the_context_keep_the_network_equivariant_per_frag
     # Every parameter learns: the head through its own term, the rest through both.
     (b.vertex_embedding.square().sum() + b.fracture_logit.square().sum()).backward()
     assert all(p.grad is not None and p.grad.abs().max() > 0 for p in net.parameters())
+
+
+def test_the_fracture_head_is_linear_or_nonlinear_and_invariant_either_way():
+    """
+    ``--segment_head``: the directions the head reads its invariants against
+    are one ``VNLinear`` (``linear``, under the parameter name every earlier
+    checkpoint has) or ``VNLinear -> VN-LeakyReLU -> VNLinear`` through C/2
+    channels (``nonlinear``). The logit does not move when the vertices turn,
+    and every weight of the head learns, either way.
+    """
+    torch.manual_seed(0)
+    x = torch.randn(64, 16, 3, dtype=DTYPE)
+    Q = torch.as_tensor(random_rotations(1, np.random.default_rng(3))[0], dtype=DTYPE)
+    linear = FractureHead(16).to(DTYPE)
+    nonlinear = FractureHead(16, kind="nonlinear").to(DTYPE)
+    assert {k: tuple(v.shape) for k, v in linear.state_dict().items()
+            if k.startswith("invariant.")} == {"invariant.directions.weight": (4, 16)}
+    assert {k: tuple(v.shape) for k, v in nonlinear.state_dict().items()
+            if k.startswith("invariant.")} == {
+        "invariant.directions.net.0.weight": (8, 16),
+        "invariant.directions.net.1.direction.weight": (8, 8),
+        "invariant.directions.net.2.weight": (4, 8)}
+    for head in (linear, nonlinear):
+        logit = head(x)
+        assert torch.allclose(head(x @ Q.T), logit, atol=1e-12)
+        logit.square().sum().backward()
+        assert all(p.grad is not None and p.grad.abs().max() > 0 for p in head.parameters())
+    # The MLP after the invariants is the same in both: at 128 channels the
+    # directions grow from 4x128 to 64x128 + 64x64 + 4x64, 12,032 more weights.
+    def count(head):
+        return sum(p.numel() for p in head.parameters())
+
+    assert count(FractureHead(128)) == 41_729
+    assert count(FractureHead(128, kind="nonlinear")) == 41_729 + 12_032
+    with pytest.raises(ValueError, match="linear, nonlinear"):
+        FractureHead(16, kind="mlp")
 
 
 def test_one_fragment_turned_leaves_the_others_alone():
@@ -852,14 +898,16 @@ def test_a_run_with_every_change_trains_validates_and_evaluates(tmp_path, capsys
                      schedule=("intra", "intra", "segment", "global", "cross", "intra"),
                      remesh=(0.5, 0.9), remesh_gap=0.3, remesh_smooth=2, remesh_noise=0.01,
                      remesh_deform=0.01, remesh_jitter=1e-3, augment_probability=0.6,
-                     contact_radius=0.35, w_consistency=0.5)
+                     contact_radius=0.35, w_consistency=0.5, segment_head="nonlinear")
     history = training.train(config)
     out = capsys.readouterr().out
     assert len(history) == 1 and (tmp_path / "run" / "best.pt").exists()
     assert "fracture head x1" in out and "consistency x0.5" in out
-    assert "fracture head: precision" in out
+    assert "fracture head: precision" in out and "(nonlinear fracture head)" in out
     summary = training.evaluate(config, checkpoint="last.pt", split="val")
     assert "seg_precision" in summary and summary["evaluation"]["fracture_head"]
+    assert summary["evaluation"]["segment_head"] == "nonlinear"
+    assert "the nonlinear fracture head's prediction" in capsys.readouterr().out
     oracle = dataclasses.replace(config, label_method="marked")
     summary = training.evaluate(oracle, checkpoint="last.pt", split="val",
                                 override=("label_method",))
@@ -888,6 +936,57 @@ def test_a_v7_runs_weights_carry_into_a_schedule_with_a_head(tmp_path, capsys):
             assert torch.equal(value, carried[key]), key
         else:
             assert key.startswith(("fracture_head.", "context."))
+
+
+def test_the_head_kind_is_part_of_the_architecture(tmp_path, capsys):
+    """
+    A checkpoint records ``--segment_head``, and one written before the
+    setting is read as linear -- what every head was then. Loading builds the
+    checkpoint's kind whatever the flags say, a resume onto the other kind is
+    refused, and ``--init_from`` carries a run into the other kind only with
+    ``--init_partial``, the new directions starting fresh.
+    """
+    from reassembly.training import _check_resume_compatible, load_checkpoint
+
+    root = _dataset(tmp_path / "data")
+    schedule = ("intra", "segment", "cross", "intra")
+    linear = _config(root, schedule=schedule)
+    nonlinear = _config(root, schedule=schedule, segment_head="nonlinear")
+    torch.manual_seed(1)
+    trained = build_model(linear)
+    path = tmp_path / "linear.pt"
+    save_checkpoint(path, trained, None, linear, epoch=0, step=1, history=[], best=0.0)
+    state = torch.load(path, weights_only=False)
+    state["config"].pop("segment_head")             # written before the setting
+    torch.save(state, path)
+
+    model, config, _, _ = load_checkpoint(path, nonlinear)
+    assert config.segment_head == "linear" and model.fracture_head.kind == "linear"
+    assert "the checkpoint's --segment_head 'linear'" in capsys.readouterr().out
+    _check_resume_compatible(linear, state["config"], False)
+    with pytest.raises(ValueError, match="segment_head: checkpoint 'linear' vs config"):
+        _check_resume_compatible(nonlinear, state["config"], False)
+
+    start = dataclasses.replace(nonlinear, init_from=str(path))
+    with pytest.raises(ValueError, match="Pass --segment_head linear"):
+        _start_from(build_model(start), start, "cpu", announce=False)
+    partial = dataclasses.replace(start, init_partial=True)
+    model = build_model(partial)
+    _start_from(model, partial, "cpu", announce=True)
+    assert "start fresh -- fracture_head.invariant" in capsys.readouterr().out
+    carried = trained.state_dict()
+    for key, value in model.state_dict().items():
+        if key in carried:
+            assert torch.equal(value, carried[key]), key
+        else:
+            assert key.startswith("fracture_head.invariant.directions.net."), key
+
+    # A nonlinear run's checkpoint builds a nonlinear head, the flags saying linear.
+    path = tmp_path / "nonlinear.pt"
+    save_checkpoint(path, build_model(nonlinear), None, nonlinear, epoch=0, step=1,
+                    history=[], best=0.0)
+    model, config, _, _ = load_checkpoint(path, linear)
+    assert config.segment_head == "nonlinear" and model.fracture_head.kind == "nonlinear"
 
 
 def test_an_old_checkpoint_loads_and_evaluates_as_it_did(tmp_path):

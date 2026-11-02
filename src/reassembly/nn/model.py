@@ -96,6 +96,7 @@ class ReassemblyNet(nn.Module):
         schedule: Sequence[str] = DEFAULT_SCHEDULE,
         negative_slope: float = 0.2,
         grad_checkpointing: bool = False,
+        segment_head: str = "linear",
     ) -> None:
         super().__init__()
         self.channels = channels
@@ -120,8 +121,11 @@ class ReassemblyNet(nn.Module):
             for kind in self.schedule if kind == "cross"
         )
         # Absent, not empty, without the kinds: a checkpoint from before they
-        # existed holds no key for them and loads exactly as it did.
-        self.fracture_head = FractureHead(channels) if "segment" in self.schedule else None
+        # existed holds no key for them and loads exactly as it did. The head's
+        # directions are linear or a VN MLP (`segment_head`, `FractureHead`).
+        self.fracture_head = (FractureHead(channels, kind=segment_head,
+                                           negative_slope=negative_slope)
+                              if "segment" in self.schedule else None)
         if "global" in self.schedule:
             self.context = nn.ModuleList(
                 VNFragmentContext(channels, negative_slope)

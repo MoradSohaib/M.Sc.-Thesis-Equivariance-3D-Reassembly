@@ -28,6 +28,7 @@ An old checkpoint loads and evaluates as before.
 | 2 | The embedding term scene by scene: each scene its own anchors and negatives | (always) | `nn/losses.py`, `training.py` |
 | 2 | Validation remeshed, so `best.pt` rewards matching by shape; its own share perturbed | `--val_remesh`, `--val_augment_probability` | `training.py` |
 | 3 | Fracture head: learns the break, picks the tokens and the matched vertices | `segment` in `--schedule`, `--w_segment`, `--segment_gamma`, `--segment_teacher`, `--segment_threshold` | `nn/context.py`, `nn/model.py`, `training.py` |
+| 3 | The fracture head's directions: one linear map, or a VN MLP | `--segment_head linear\|nonlinear` | `nn/context.py`, `nn/vn.py`, `training.py` |
 | 4 | Consistency between a scene and itself as stored | `--w_consistency` | `nn/losses.py`, `training.py` |
 | 5 | Fragment context for every vertex | `global` in `--schedule` | `nn/context.py` |
 | – | Carry a v7 run's weights into the new schedule | `--init_partial` with `--init_from` | `training.py` |
@@ -372,7 +373,24 @@ break instead:
 
 - **What it reads.** The vector features' invariants (`VNInvariant`), then an
   MLP, then one logit per vertex. Whether a vertex is on a break does not change
-  with the fragment's pose.
+  with the fragment's pose. The invariants are the inner products of the C
+  feature vectors with 4 learned directions, plus their norms (640 numbers at
+  128 channels). The MLP is `Linear 640→64`, LayerNorm, GELU, `Linear 64→1`.
+- **Linear or nonlinear directions (`--segment_head`).** How the 4 directions
+  are made from the features:
+  - `linear`, the default and every checkpoint before the setting: one
+    `VNLinear` C→4;
+  - `nonlinear`: `VNLinear` C→C/2, a VN-LeakyReLU, `VNLinear` C/2→4 (128→64→4
+    at `--hidden_channels 128`). That is 12,032 more weights: the head grows from
+    41,729 to 53,761. The activation is equivariant, so the logit stays
+    invariant.
+
+  The MLP after the invariants is the same in both. The setting is part of the
+  architecture. The checkpoint records it, and one written before it is read
+  as `linear`. `--evaluate` builds the checkpoint's kind whatever the flags say,
+  and a resume onto the other kind is refused, so start the other kind in a
+  fresh `--checkpoint_dir`. `--init_from` with `--init_partial True` carries a
+  run into the other kind; the new directions start fresh.
 - **What it is trained on.** The true break: on Breaking Bad, the vertices a
   piece shares with another, carried over to remeshed pieces. On converted
   scenes it is the marks (§1.3); scenes without known truth are left out of the

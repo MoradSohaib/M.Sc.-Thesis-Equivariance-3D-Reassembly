@@ -185,12 +185,22 @@ class VNInvariant(nn.Module):
 
     Optionally appends the channel norms, which are invariant too and which the
     inner products only recover if ``d`` happens to span ``x``.
+
+    ``hidden`` makes the directions a non-linear function of ``x``:
+    ``d = W_2 act(W_1 x)``, a :class:`VNMLP` through ``hidden`` channels
+    (``VNLinear -> VNLeakyReLU -> VNLinear``), still equivariant, so the inner
+    products are still invariant. ``None``, the default, is the single
+    ``VNLinear`` above, with the same parameter names as before the option.
     """
 
     def __init__(self, in_channels: int, directions: int = 3,
-                 include_norms: bool = True) -> None:
+                 include_norms: bool = True, hidden: Optional[int] = None,
+                 negative_slope: float = 0.2) -> None:
         super().__init__()
-        self.directions = VNLinear(in_channels, directions)
+        if hidden is None:
+            self.directions = VNLinear(in_channels, directions)
+        else:
+            self.directions = VNMLP(in_channels, hidden, directions, negative_slope)
         self.include_norms = include_norms
         self.out_features = in_channels * directions + (in_channels if include_norms else 0)
 

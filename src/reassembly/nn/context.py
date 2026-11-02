@@ -35,16 +35,39 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor, nn
 
+from .schedule import SEGMENT_HEADS
 from .segment import segment_mean
 from .vn import VNInvariant, VNLayerNorm, VNLeakyReLU, VNLinear
 
 
 class FractureHead(nn.Module):
-    """Per-vertex logit of being on a break, from the vector features' invariants."""
+    """
+    Per-vertex logit of being on a break, from the vector features' invariants.
 
-    def __init__(self, channels: int, hidden: int = 64, directions: int = 4) -> None:
+    The invariants are the inner products of the ``C`` feature vectors with
+    ``directions`` (4) learned equivariant directions, and their norms; an MLP
+    (``hidden`` 64, LayerNorm, GELU) reads them. ``kind`` is how the
+    directions are made from the features:
+
+    * ``linear`` -- one ``VNLinear``, ``C -> 4``: every checkpoint before the
+      choice existed, and the default;
+    * ``nonlinear`` -- ``VNLinear C -> C/2``, a VN-LeakyReLU, ``VNLinear
+      C/2 -> 4`` (128 -> 64 -> 4 at 128 channels; 12,032 more weights). The
+      activation is equivariant, so the logit stays invariant.
+
+    The MLP after the invariants is the same in both.
+    """
+
+    def __init__(self, channels: int, hidden: int = 64, directions: int = 4,
+                 kind: str = "linear", negative_slope: float = 0.2) -> None:
         super().__init__()
-        self.invariant = VNInvariant(channels, directions=directions)
+        if kind not in SEGMENT_HEADS:
+            raise ValueError(f"the fracture head is one of {', '.join(SEGMENT_HEADS)}, "
+                             f"got {kind!r}")
+        self.kind = kind
+        self.invariant = VNInvariant(channels, directions=directions,
+                                     hidden=channels // 2 if kind == "nonlinear" else None,
+                                     negative_slope=negative_slope)
         self.mlp = nn.Sequential(
             nn.Linear(self.invariant.out_features, hidden),
             nn.LayerNorm(hidden),

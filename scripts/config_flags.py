@@ -45,6 +45,7 @@ CHOICES = {
     "symmetry_axis": ("x", "y", "z"),
     "label_method": ("dihedral", "coincidence", "marked"),
     "match_metric": ("euclidean", "cosine"),
+    "segment_head": ("linear", "nonlinear"),
     "normalize_mode": ("scene", "fragment"),
     "lr_schedule": ("cosine", "constant"),
 }
@@ -145,6 +146,11 @@ HELP = {
                     "checkpoint, so one checkpoint can be scored both ways",
     "segment_threshold": "with a segment layer: the predicted break probability above "
                          "which a vertex is a token candidate and is matched",
+    "segment_head": "with a segment layer: how the fracture head makes its 4 directions "
+                    "from the features -- linear (one VNLinear C->4, every checkpoint "
+                    "before this setting) or nonlinear (VNLinear C->C/2, VN-LeakyReLU, "
+                    "VNLinear C/2->4: 128->64->4 at --hidden_channels 128); part of the "
+                    "architecture, so --evaluate takes it from the checkpoint",
     "w_segment": "with a segment layer in --schedule: the fracture head's loss weight",
     "segment_gamma": "the fracture head's focal exponent; 0 = class-balanced cross-entropy",
     "segment_teacher": "with a segment layer: the share of training batches whose tokens "

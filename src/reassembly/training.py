@@ -370,6 +370,20 @@ class Config:
     segment_threshold: float = 0.5
     """With a ``segment`` layer: the predicted probability of a break above
     which a vertex is a token candidate and a vertex stage two matches."""
+    segment_head: str = "linear"
+    """
+    With a ``segment`` layer: how the fracture head makes, from the C feature
+    vectors, the four directions whose inner products with them it reads
+    (:class:`~reassembly.nn.context.FractureHead`). ``linear``, the default and
+    every checkpoint before the setting: one ``VNLinear``, C -> 4.
+    ``nonlinear``: ``VNLinear`` C -> C/2, a VN-LeakyReLU (``negative_slope``),
+    ``VNLinear`` C/2 -> 4 -- 128 -> 64 -> 4 at ``--hidden_channels 128``,
+    12,032 more weights. The MLP after the invariants is the same in both.
+    Part of the architecture: the checkpoint records it, ``--evaluate`` takes
+    it from the checkpoint, a resume onto the other kind is refused, and
+    ``--init_from`` with ``--init_partial True`` carries a run of either kind
+    into the other, the new directions starting fresh.
+    """
     match_metric: str = "euclidean"
     """
     How stage two compares embeddings: ``euclidean`` (the default, v7's) or
@@ -610,6 +624,14 @@ class Config:
                              f"{self.match_metric!r}")
         if not 0.0 < self.segment_threshold < 1.0:
             raise ValueError("segment_threshold is a probability: in (0, 1)")
+        from .nn.schedule import SEGMENT_HEADS
+
+        if self.segment_head not in SEGMENT_HEADS:
+            raise ValueError(f"segment_head must be {' or '.join(SEGMENT_HEADS)}, got "
+                             f"{self.segment_head!r}")
+        if self.segment_head != "linear" and "segment" not in tuple(self.schedule):
+            raise ValueError(f"segment_head {self.segment_head} shapes the fracture head: give "
+                             f"a segment layer in --schedule")
         if not 0.0 <= self.segment_teacher <= 1.0:
             raise ValueError("segment_teacher is a share of the batches: in [0, 1]")
         if self.w_segment < 0 or self.w_consistency < 0 or self.segment_gamma < 0:
@@ -2674,7 +2696,11 @@ def write_history(out_dir: Path, history: List[dict]) -> None:
 
 # Architecture fields: a mismatch makes `load_state_dict` fail, but with a shape
 # error that names a tensor rather than the setting that caused it.
-_ARCHITECTURE = ("channels", "heads", "head_dim", "embedding_dim", "schedule")
+_ARCHITECTURE = ("channels", "heads", "head_dim", "embedding_dim", "schedule",
+                 "segment_head")
+# Architecture fields added after checkpoints were first written, read as what
+# those runs built: every fracture head before `segment_head` was linear.
+_ARCHITECTURE_BEFORE_IT_EXISTED = {"segment_head": "linear"}
 # Data fields: a mismatch produces no error at all. The run simply continues on
 # a different problem than the weights were trained for, and the loss curve has
 # a step in it that looks like noise.
@@ -2719,6 +2745,12 @@ _TRAINING_ONLY = ("remesh", "remesh_jitter", "remesh_gap", "remesh_edge", "remes
                   "val_remesh", "val_augment_probability")
 
 
+def _stored_architecture(stored: Dict) -> Dict:
+    """A checkpoint's saved config with the architecture fields it predates
+    filled in as what it built; an empty one (no config saved) stays empty."""
+    return {**_ARCHITECTURE_BEFORE_IT_EXISTED, **stored} if stored else stored
+
+
 def _resume_path(config: Config, default: Path) -> Optional[Path]:
     """
     Where to load from: ``resume_from`` if given, else this run's own ``last.pt``.
@@ -2751,6 +2783,7 @@ def _check_resume_compatible(config: Config, saved: Dict, announce: bool) -> Non
     if not saved:
         return
     current = asdict(config)
+    saved = _stored_architecture(saved)
     architecture = [(k, saved.get(k), current.get(k)) for k in _ARCHITECTURE
                     if k in saved and _differs(saved[k], current[k])]
     if architecture:
@@ -2944,6 +2977,7 @@ def build_model(config: Config):
         embedding_dim=config.embedding_dim, schedule=tuple(config.schedule),
         negative_slope=config.negative_slope,
         grad_checkpointing=config.grad_checkpointing,
+        segment_head=config.segment_head,
     )
 
 
@@ -2972,10 +3006,12 @@ def _start_from(model, config: Config, device, announce: bool) -> None:
     if not path.exists():
         raise FileNotFoundError(f"--init_from {config.init_from}: no checkpoint there")
     state = torch.load(path, map_location=device, weights_only=False)
-    stored, current = state.get("config") or {}, asdict(config)
+    stored, current = _stored_architecture(state.get("config") or {}), asdict(config)
+    # --init_partial carries weights across a change of layers or of head kind;
+    # the weights that do not fit start fresh, and are named.
     different = [(key, stored[key], current[key]) for key in _ARCHITECTURE
                  if key in stored and _differs(stored[key], current[key])
-                 and not (config.init_partial and key == "schedule")]
+                 and not (config.init_partial and key in ("schedule", "segment_head"))]
     if different:
         def spelled(value):
             return " ".join(map(str, value)) if isinstance(value, (list, tuple)) else str(value)
@@ -3675,7 +3711,9 @@ def _banner(config, train_set, val_set, parameters, device, world, per_epoch) ->
         f"  device        {device}" + (f"  x{world} (one process per GPU)" if world > 1 else ""),
         f"  parameters    {parameters:,}",
         f"  channels      {config.channels}  heads {config.heads}  "
-        f"schedule {'+'.join(config.schedule)}",
+        f"schedule {'+'.join(config.schedule)}"
+        + (f"  ({config.segment_head} fracture head)"
+           if "segment" in tuple(config.schedule) else ""),
         f"  objects       {len(train_set.scenes)} train / {len(val_set.scenes)} val"
         + ("  (official split)" if train_set.official else "  (hashed split)"),
         f"  samples       {len(train_set)} train / {len(val_set)} val",
@@ -4025,6 +4063,7 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
         "trained_shapes": _trained_shapes(dataset, state.get("config") or {}, config),
         "labels": config.label_method,
         "fracture_head": segments(model),
+        "segment_head": config.segment_head if segments(model) else None,
     }
     if writer is not None:
         summary["evaluation"]["predictions"] = writer.close()
@@ -4191,8 +4230,9 @@ def format_evaluation(summary: Dict) -> str:
                      "tokens and\n  the vertices matched -- the oracle: nothing at inference "
                      "provides it")
     elif info.get("fracture_head"):
-        lines.append("  labels: the fracture head's prediction, as the tokens and the vertices "
-                     "matched")
+        kind = info.get("segment_head")
+        lines.append(f"  labels: the {kind + ' ' if kind else ''}fracture head's prediction, "
+                     f"as the tokens and the vertices matched")
     if summary.get("rotation_head", True):
         lines.append("  (written before v7 removed the rotation head: the four terms below "
                      "were its losses)")
@@ -4377,6 +4417,7 @@ def _adopt_checkpoint_settings(config: Config, stored: Dict, data: bool,
     import dataclasses
 
     names = {field.name for field in dataclasses.fields(Config)}
+    stored = _stored_architecture(stored)
     keys = _ARCHITECTURE + (tuple(k for k in _DATA if k not in override
                                   and k not in _TRAINING_ONLY) if data else ())
     changes = {key: stored[key] for key in keys

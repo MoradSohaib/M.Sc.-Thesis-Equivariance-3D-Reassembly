@@ -1016,7 +1016,10 @@ per category, test on the scans.
 4. **The fracture head.** `segment` in `--schedule` learns the true break and
    picks the cross-fragment tokens on the GPU from its prediction. Stage two
    matches the vertices it predicts. Each epoch prints its precision and recall
-   beside the dihedral labels'.
+   beside the dihedral labels'. `--segment_head nonlinear` makes the head's 4
+   directions with a VN MLP (C→C/2, VN-LeakyReLU, →4) instead of one linear
+   map (`linear`, the default). It is part of the architecture, so a checkpoint
+   records it and `--evaluate` builds the checkpoint's kind.
 5. **`--w_consistency`.** Each remeshed or perturbed scene's embedding is pulled
    toward the same scene's as stored.
 6. **`global` in `--schedule`.** Every vertex hears its whole fragment.

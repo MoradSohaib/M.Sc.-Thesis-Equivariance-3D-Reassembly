@@ -12,6 +12,11 @@ fragments' tokens (``nn/cross.py``); ``segment``: the fracture head, which picks
 the tokens; ``global``: each fragment's summary handed to its vertices
 (``nn/context.py``)."""
 
+SEGMENT_HEADS = ("linear", "nonlinear")
+"""How the fracture head makes its directions from the features
+(``--segment_head``, :class:`~reassembly.nn.context.FractureHead`): one
+``VNLinear``, or ``VNLinear -> VN-LeakyReLU -> VNLinear``."""
+
 
 def check_schedule(schedule: Sequence[str]) -> None:
     """Refuse a schedule the network cannot build: an unknown kind, two fracture

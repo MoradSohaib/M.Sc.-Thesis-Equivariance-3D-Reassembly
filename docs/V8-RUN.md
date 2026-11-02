@@ -175,6 +175,11 @@ python -m scripts.train $STAGE2
   it rewards matching by shape. Score `last.pt` too. `--augment_probability`'s
   share of them is perturbed; `--val_augment_probability 1` perturbs all of them
   and leaves the training mix as it is.
+- **The fracture head's directions.** `--segment_head nonlinear` makes the
+  head's 4 directions with a VN MLP (128→64, VN-LeakyReLU, →4) instead of one
+  linear map (`linear`, the default, which every earlier run used). It is part
+  of the architecture, so give it a fresh `--checkpoint_dir`: a resume onto a
+  run of the other kind is refused (`docs/SIM2REAL.md` §3).
 - **To keep 48 scenes as stored**, as first planned, run one stage with
   `--remesh_probability 0.625 --augment_probability 0.625 --w_consistency 0.5`
   and no `--val_remesh`. It will learn Breaking Bad's meshes, which helps on
